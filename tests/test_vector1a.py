@@ -1,7 +1,7 @@
 import math
 import unittest
 
-from vector1a.engine import OutputSample, VectorEngine
+from vector1a.engine import VectorEngine
 from vector1a.motion import MotionCalculator, MotionMode, MotionParameters, SegmentState
 from vector1a.tcode import format_command, parse_command, parse_message
 
@@ -257,17 +257,20 @@ class QueueTests(unittest.TestCase):
         self.assertGreater(at_endpoint, after)
         self.assertAlmostEqual(before, after, places=6)
 
-    def test_phase_release_guard_removes_provisional_endpoint_snap(self):
-        engine = VectorEngine(lambda sample: None, rate_hz=50, clock=lambda: 0.0)
-        engine.prostate_phase_degrees = 45.0
-        base = OutputSample(1, 0, 1, .5, .5, 0, .5, .5, .7,
-                            MotionMode.CIRCULAR, 0, 0, 0, 0, .2, .4, .7)
-        engine._released_prostate = (.2, .4)
-        jumped = engine._stabilize_prostate_phase(
-            base.__class__(**{**base.__dict__, "alpha_prostate": .8,
-                              "beta_prostate": .9}))
-        self.assertAlmostEqual(jumped.alpha_prostate, .24)
-        self.assertAlmostEqual(jumped.beta_prostate, .44)
+    def test_phase_shift_preserves_full_prostate_path_extents(self):
+        engine = VectorEngine(lambda sample: None, clock=lambda: 0.0)
+        engine.prostate_arc_depth = 1.0
+        outward = SegmentState(1, 0.0, 1.0, 1.0, 0.0, 100.0)
+        returning = SegmentState(2, 1.0, 2.0, 0.0, 1.0, 100.0)
+        for phase in (-90.0, -45.0, 0.0, 45.0, 90.0):
+            engine.prostate_phase_degrees = phase
+            points = [engine._calculate_prostate(outward, index / 200.0)
+                      for index in range(201)]
+            points += [engine._calculate_prostate(returning, 1.0 + index / 200.0)
+                       for index in range(201)]
+            alpha = [point[0] for point in points]
+            self.assertAlmostEqual(min(alpha), 0.0)
+            self.assertAlmostEqual(max(alpha), 1.0)
 
     def test_prostate_volume_uses_rfp_multiplier_and_rest_level(self):
         engine = VectorEngine(lambda sample: None, volume=0.7, clock=lambda: 0.0)

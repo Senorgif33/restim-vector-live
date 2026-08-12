@@ -4,7 +4,7 @@ Vector 1A is a live bridge from one MultiFunPlayer `L0` T-code stream to one or
 two ReStim instances. It converts streamed 1D motion into synchronized alpha,
 beta, volume, frequency and pulse controls at a stable internal cadence.
 
-Current commissioning build: **1.4.0-alpha23**.
+Current commissioning build: **1.4.0-alpha24**.
 
 > [!CAUTION]
 > Commission with ReStim's graphical display and stimulation hardware
@@ -37,8 +37,8 @@ second after they begin.
 - Live frequency, pulse-frequency, rise-time and pulse-width commissioning.
 - Second ReStim output with tear-shaped prostate alpha/beta and independent
   prostate volume.
-- Prostate alpha/beta timing phase from -90 to +90 degrees without rotating
-  the geometry. A release continuity guard removes provisional endpoint snaps.
+- Prostate alpha/beta timing phase from -90 to +90 degrees without rotating,
+  tilting, or reducing the amplitude of the geometry.
 - Keyboard-mapped Xbox controls and equal-length live range displays.
 - Collapsible panels with live summaries.
 - Persistent user settings and an in-app setup guide.

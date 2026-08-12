@@ -111,7 +111,6 @@ class VectorEngine:
         self.prostate_volume_multiplier = 1.5
         self.prostate_rest_level = 0.7
         self.prostate_phase_degrees = 0.0
-        self._released_prostate: tuple[float, float] | None = None
         self._input_count = 0
         self._output_count = 0
         self._sequence = 0
@@ -284,19 +283,16 @@ class VectorEngine:
     def resume(self) -> None:
         with self._lock:
             self._queue.clear()
-            self._released_prostate = None
             self._state = "Buffering"
 
     def neutral(self) -> None:
         with self._lock:
             self._queue.clear()
-            self._released_prostate = None
             self._state = "Neutral"
 
     def stop(self) -> None:
         with self._lock:
             self._queue.clear()
-            self._released_prostate = None
             self._state = "Stopped"
 
     def diagnostics(self) -> Diagnostics:
@@ -341,7 +337,6 @@ class VectorEngine:
             if due and self._state == "Buffering":
                 self._state = "Running"
         for sample in due:
-            sample = self._stabilize_prostate_phase(sample)
             self.send_sample(sample)
             actual = self.clock() - sample.calculated_at
             with self._lock:
@@ -364,29 +359,6 @@ class VectorEngine:
                     buffer_fill=len(self._queue), lookahead_seconds=self.lookahead_seconds,
                     input_samples=self._input_count, state=self._state,
                 )
-
-    def _stabilize_prostate_phase(self, sample: OutputSample) -> OutputSample:
-        """Slew only discontinuous phase projections at provisional reversals.
-
-        Normal trajectory samples pass unchanged. A phase-shifted sample which
-        jumps farther than physically plausible in one output tick is moved
-        toward its target over subsequent ticks, eliminating visible snaps while
-        retaining the requested lead/lag.
-        """
-        with self._lock:
-            target = (sample.alpha_prostate, sample.beta_prostate)
-            if self.prostate_phase_degrees == 0.0 or self._released_prostate is None:
-                self._released_prostate = target
-                return sample
-            previous = self._released_prostate
-            # At 50 Hz this permits 0.04 axis units per sample. The allowance
-            # scales with rate so its real-time slew remains two units/second.
-            max_step = 2.0 / self.rate_hz
-            def move(current: float, desired: float) -> float:
-                return current + min(max_step, max(-max_step, desired - current))
-            stable = (move(previous[0], target[0]), move(previous[1], target[1]))
-            self._released_prostate = stable
-            return replace(sample, alpha_prostate=stable[0], beta_prostate=stable[1])
 
     def step(self, scheduled_at: float, release_at: float | None = None) -> None:
         """One deterministic scheduler step, also used by tests."""
