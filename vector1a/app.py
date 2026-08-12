@@ -11,7 +11,7 @@ from .network import MFPListener, ReStimClient, ReStimWebSocketClient
 from .settings import load_settings, save_settings, settings_path
 from .controller import (A, B, X, Y, START, LEFT_SHOULDER, DPAD_UP, DPAD_DOWN,
                          DPAD_LEFT, DPAD_RIGHT, XInputController)
-from .variety import rolling_offset, rolling_value
+from .variety import fit_range_for_travel, rolling_offset, rolling_value
 from . import __version__
 
 
@@ -188,6 +188,7 @@ class VectorApp:
         ttk.Button(toolbar, text="Neutral", command=self.neutral).pack(side="left", padx=6)
         ttk.Button(toolbar, text="STOP", command=self.stop).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Setup guide", command=self.show_setup_guide).pack(side="left", padx=(18, 6))
+        ttk.Button(toolbar, text="Rolling Variety", command=self.show_variety_window).pack(side="left", padx=6)
         ttk.Label(toolbar, textvariable=self.diag_vars["state"]).pack(side="right", padx=8)
 
         mfp = self._frame("MultiFunPlayer input", 0, 0)
@@ -398,11 +399,12 @@ class VectorApp:
                     textvariable=self.variety_cycle_minutes, width=7).grid(row=0, column=2)
         for column, (label, variable) in enumerate((
                 ("Frequency 1.0-0.5", self.variety_frequency),
-                ("Pulse frequency +/-0.10", self.variety_pulse_frequency),
-                ("Rise +/-0.10", self.variety_pulse_rise),
-                ("Width +/-0.05", self.variety_pulse_width),
-                ("Phase -30/+30", self.variety_phase)), start=0):
-            ttk.Checkbutton(variety, text=label, variable=variable).grid(row=1, column=column, padx=8)
+                ("Pulse frequency +/-0.20", self.variety_pulse_frequency),
+                ("Rise +/-0.20", self.variety_pulse_rise),
+                ("Width +/-0.20", self.variety_pulse_width),
+                ("Phase -45/+45", self.variety_phase)), start=0):
+            ttk.Checkbutton(variety, text=label, variable=variable,
+                            command=self._variety_toggle).grid(row=1, column=column, padx=8)
         ttk.Label(variety, textvariable=self.variety_status,
                   font=("TkDefaultFont", 10, "bold")).grid(row=0, column=3, columnspan=3, padx=18)
 
@@ -576,6 +578,13 @@ class VectorApp:
 
     def _variety_toggle(self) -> None:
         self._variety_started = time.monotonic()
+        for enabled, variables in (
+                (self.variety_pulse_frequency, (self.pulse_frequency_min, self.pulse_frequency_max)),
+                (self.variety_pulse_rise, (self.pulse_rise_min, self.pulse_rise_max)),
+                (self.variety_pulse_width, (self.pulse_width_min, self.pulse_width_max))):
+            if enabled.get() and self.variety_enabled.get():
+                low, high = fit_range_for_travel(variables[0].get(), variables[1].get())
+                variables[0].set(low); variables[1].set(high)
         self._variety_baseline = {
             "pf": (self.pulse_frequency_min.get(), self.pulse_frequency_max.get()),
             "rise": (self.pulse_rise_min.get(), self.pulse_rise_max.get()),
@@ -583,6 +592,30 @@ class VectorApp:
             "phase": self.prostate_phase_degrees.get(),
         }
         self.variety_status.set("Running" if self.variety_enabled.get() else "Off")
+
+    def show_variety_window(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("Rolling Variety")
+        window.resizable(False, False)
+        body = ttk.Frame(window, padding=16); body.pack(fill="both", expand=True)
+        ttk.Checkbutton(body, text="Enable rolling variety", variable=self.variety_enabled,
+                        command=self._variety_toggle).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(body, text="Cycle duration (minutes)").grid(row=1, column=0, sticky="w", pady=8)
+        ttk.Spinbox(body, from_=0.5, to=30, increment=.5,
+                    textvariable=self.variety_cycle_minutes, width=8).grid(row=1, column=1)
+        options = (("Frequency ramp 1.0 to 0.5", self.variety_frequency),
+                   ("Pulse-frequency range +/-0.20", self.variety_pulse_frequency),
+                   ("Pulse-rise range +/-0.20", self.variety_pulse_rise),
+                   ("Pulse-width range +/-0.20", self.variety_pulse_width),
+                   ("Prostate timing phase +/-45 degrees", self.variety_phase))
+        for row, (label, variable) in enumerate(options, start=2):
+            ttk.Checkbutton(body, text=label, variable=variable,
+                            command=self._variety_toggle).grid(row=row, column=0, columnspan=2,
+                                                               sticky="w", pady=3)
+        ttk.Label(body, textvariable=self.variety_status,
+                  font=("TkDefaultFont", 10, "bold")).grid(row=7, column=0, sticky="w", pady=(12, 0))
+        ttk.Button(body, text="Restart cycle from current settings",
+                   command=self._variety_toggle).grid(row=7, column=1, padx=12, pady=(12, 0))
 
     @staticmethod
     def _bounded_shift(pair: tuple[float, float], offset: float) -> tuple[float, float]:
@@ -601,15 +634,15 @@ class VectorApp:
         if self.variety_frequency.get():
             self.frequency_ramp_level.set(round(rolling_value(elapsed, cycle, .5, 1.0), 4))
         for enabled, key, variables, depth in (
-                (self.variety_pulse_frequency, "pf", (self.pulse_frequency_min, self.pulse_frequency_max), .10),
-                (self.variety_pulse_rise, "rise", (self.pulse_rise_min, self.pulse_rise_max), .10),
-                (self.variety_pulse_width, "width", (self.pulse_width_min, self.pulse_width_max), .05)):
+                (self.variety_pulse_frequency, "pf", (self.pulse_frequency_min, self.pulse_frequency_max), .20),
+                (self.variety_pulse_rise, "rise", (self.pulse_rise_min, self.pulse_rise_max), .20),
+                (self.variety_pulse_width, "width", (self.pulse_width_min, self.pulse_width_max), .20)):
             if enabled.get():
                 low, high = self._bounded_shift(self._variety_baseline[key], offset * depth)
                 variables[0].set(low); variables[1].set(high)
         if self.variety_phase.get():
             baseline = self._variety_baseline["phase"]
-            self.prostate_phase_degrees.set(round(max(-90, min(90, baseline + offset * 30)), 1))
+            self.prostate_phase_degrees.set(round(max(-90, min(90, baseline + offset * 45)), 1))
         self.variety_status.set(f"Running | {elapsed / 60:.1f}/{cycle:.1f} min")
         self.apply_config()
 

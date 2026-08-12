@@ -4,7 +4,7 @@ Vector 1A is a live bridge from one MultiFunPlayer `L0` T-code stream to one or
 two ReStim instances. It converts streamed 1D motion into synchronized alpha,
 beta, volume, frequency and pulse controls at a stable internal cadence.
 
-Current commissioning build: **1.5.0-alpha25**.
+Current commissioning build: **1.5.0-alpha26**.
 
 > [!CAUTION]
 > Commission with ReStim's graphical display and stimulation hardware
@@ -46,6 +46,8 @@ second after they begin.
   focus; keyboard mappings remain available as a fallback.
 - Rolling Variety smoothly modulates selected bounded controls over a
   configurable multi-minute cycle. Manual changes hold the selected target.
+  Its always-visible toolbar button opens the controls; pulse ranges travel by
+  +/-0.20 and prostate phase by +/-45 degrees.
 - Neutral, Resume and Stop controls remain visible at the top of the window.
 
 ## Requirements
