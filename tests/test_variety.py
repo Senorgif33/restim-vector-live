@@ -18,3 +18,9 @@ class VarietyTests(unittest.TestCase):
         self.assertEqual(fit_range_for_travel(.4, .95), (.25, .8))
         self.assertEqual(fit_range_for_travel(.1, .9), (.2, .8))
         self.assertEqual(fit_range_for_travel(.2, .55), (.2, .55))
+
+    def test_independent_cycles_reach_peaks_at_different_times(self):
+        self.assertAlmostEqual(rolling_offset(60, 4), 1.0)
+        self.assertAlmostEqual(rolling_offset(45, 3), 1.0)
+        self.assertAlmostEqual(rolling_offset(30, 2), 1.0)
+        self.assertAlmostEqual(rolling_offset(15, 1), 1.0)
