@@ -4,7 +4,7 @@ Vector 1A is a live bridge from one MultiFunPlayer `L0` T-code stream to one or
 two ReStim instances. It converts streamed 1D motion into synchronized alpha,
 beta, volume, frequency and pulse controls at a stable internal cadence.
 
-Current commissioning build: **1.4.0-alpha24**.
+Current commissioning build: **1.5.0-alpha25**.
 
 > [!CAUTION]
 > Commission with ReStim's graphical display and stimulation hardware
@@ -42,6 +42,10 @@ second after they begin.
 - Keyboard-mapped Xbox controls and equal-length live range displays.
 - Collapsible panels with live summaries.
 - Persistent user settings and an in-app setup guide.
+- Direct Windows Xbox controller input remains active when another window has
+  focus; keyboard mappings remain available as a fallback.
+- Rolling Variety smoothly modulates selected bounded controls over a
+  configurable multi-minute cycle. Manual changes hold the selected target.
 - Neutral, Resume and Stop controls remain visible at the top of the window.
 
 ## Requirements
@@ -85,6 +89,12 @@ The **Setup guide** button repeats these instructions. Settings are saved at
 
 The supplied Xbox profile maps controller buttons to keyboard keys. Vector
 ignores these shortcuts while a text or numeric field has focus.
+
+With **Direct Xbox input** enabled, Vector reads the controller through Windows
+XInput even while MFP or ReStim has focus: D-pad up/down changes frequency;
+D-pad left/right shifts pulse frequency; hold LB for rise (up/down) and width
+(left/right); X/Y changes prostate phase; A resumes; B selects Neutral; and the
+Menu button stops. Disable direct input to use only the keyboard profile.
 
 | Keys | Action |
 |---|---|

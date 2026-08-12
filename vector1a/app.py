@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import tkinter as tk
+import time
+import queue
 from tkinter import messagebox, ttk
 
 from .engine import OutputSample, VectorEngine
 from .motion import MotionMode, MotionParameters
 from .network import MFPListener, ReStimClient, ReStimWebSocketClient
 from .settings import load_settings, save_settings, settings_path
+from .controller import (A, B, X, Y, START, LEFT_SHOULDER, DPAD_UP, DPAD_DOWN,
+                         DPAD_LEFT, DPAD_RIGHT, XInputController)
+from .variety import rolling_offset, rolling_value
 from . import __version__
 
 
@@ -66,7 +71,9 @@ class VectorApp:
         "prostate_narrow_ratio", "prostate_arc_depth", "prostate_threshold",
         "prostate_volume_multiplier", "prostate_rest_level", "prostate_phase_degrees",
         "prostate_phase_step", "controller_enabled", "controller_fine_step", "minimum_radius",
-        "speed_threshold", "direction_probability", "mode",
+        "speed_threshold", "direction_probability", "mode", "direct_controller_enabled",
+        "variety_enabled", "variety_cycle_minutes", "variety_frequency", "variety_pulse_frequency",
+        "variety_pulse_rise", "variety_pulse_width", "variety_phase",
     )
 
     def __init__(self, root: tk.Tk) -> None:
@@ -117,6 +124,18 @@ class VectorApp:
         self.controller_target = tk.IntVar(value=0)
         self.controller_fine_step = tk.DoubleVar(value=0.05)
         self.controller_status = tk.StringVar(value="Disabled")
+        self.direct_controller_enabled = tk.BooleanVar(value=True)
+        self.variety_enabled = tk.BooleanVar(value=False)
+        self.variety_cycle_minutes = tk.DoubleVar(value=4.0)
+        self.variety_frequency = tk.BooleanVar(value=True)
+        self.variety_pulse_frequency = tk.BooleanVar(value=False)
+        self.variety_pulse_rise = tk.BooleanVar(value=False)
+        self.variety_pulse_width = tk.BooleanVar(value=False)
+        self.variety_phase = tk.BooleanVar(value=False)
+        self.variety_status = tk.StringVar(value="Off")
+        self._variety_started = time.monotonic()
+        self._variety_baseline = {}
+        self._controller_events: queue.SimpleQueue[tuple[str, object]] = queue.SimpleQueue()
         self.minimum_radius = tk.DoubleVar(value=0.10)
         self.speed_threshold = tk.DoubleVar(value=50.0)
         self.direction_probability = tk.DoubleVar(value=0.10)
@@ -138,11 +157,13 @@ class VectorApp:
         self.prostate_restim = ReStimWebSocketClient(self._set_prostate_status)
         self.engine = VectorEngine(self._send_sample)
         self.listener = MFPListener(self.engine.receive_l0, self._set_mfp_status)
+        self.xinput = XInputController(self._xinput_buttons_threaded, self._xinput_status_threaded)
         self.sections = {}
         self._first_run = self._load_settings()
         self._build()
         self._bind_controller_keys()
         self._controller_enabled_changed()
+        self.xinput.start()
         self.engine.start()
         self.root.after(100, self._refresh)
         if self._first_run:
@@ -158,7 +179,7 @@ class VectorApp:
     def _build(self) -> None:
         self.root.columnconfigure(0, weight=1)
         self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(11, weight=1)
+        self.root.rowconfigure(12, weight=1)
 
         toolbar = ttk.Frame(self.root, padding=(12, 6))
         toolbar.grid(row=0, column=0, columnspan=2, sticky="ew")
@@ -352,6 +373,8 @@ class VectorApp:
                         command=self._controller_enabled_changed).grid(row=0, column=0, sticky="w", padx=6)
         ttk.Label(controller, textvariable=self.controller_status,
                   font=("TkDefaultFont", 10, "bold"), width=22).grid(row=0, column=1, sticky="w")
+        ttk.Checkbutton(controller, text="Direct Xbox input (works without focus)",
+                        variable=self.direct_controller_enabled).grid(row=0, column=6, padx=12)
         ttk.Label(controller, text="Step").grid(row=0, column=2, padx=(12, 4))
         ttk.Spinbox(controller, from_=0.005, to=.25, increment=.005,
                     textvariable=self.controller_fine_step, width=7).grid(row=0, column=3)
@@ -361,16 +384,35 @@ class VectorApp:
         ttk.Label(controller, text="X / Page Up: prostate phase ahead | Y / Page Down: prostate phase behind") \
             .grid(row=2, column=0, columnspan=6, sticky="w", padx=6, pady=(2, 2))
         ttk.Label(controller,
+                  text="Direct Xbox: D-pad frequency/pulse frequency | LB + D-pad rise/width | X/Y phase | A Resume | B Neutral | Menu Stop") \
+            .grid(row=3, column=0, columnspan=7, sticky="w", padx=6, pady=(2, 2))
+        ttk.Label(controller,
                   text="W/S Frequency ramp ±  •  A/D Pulse frequency range −/+  •  I/K Rise range +/−  •  J/L Width range −/+  •  Enter Resume  •  Space Neutral  •  Esc Stop") \
             .grid(row=1, column=0, columnspan=6, sticky="w", padx=6, pady=(6, 2))
 
-        controls = self._frame("Commissioning controls", 9, 0, 2)
+        variety = self._frame("Rolling Variety", 9, 0, 2)
+        ttk.Checkbutton(variety, text="Enable rolling variety", variable=self.variety_enabled,
+                        command=self._variety_toggle).grid(row=0, column=0, padx=6)
+        ttk.Label(variety, text="Cycle (minutes)").grid(row=0, column=1, padx=(16, 4))
+        ttk.Spinbox(variety, from_=0.5, to=30, increment=.5,
+                    textvariable=self.variety_cycle_minutes, width=7).grid(row=0, column=2)
+        for column, (label, variable) in enumerate((
+                ("Frequency 1.0-0.5", self.variety_frequency),
+                ("Pulse frequency +/-0.10", self.variety_pulse_frequency),
+                ("Rise +/-0.10", self.variety_pulse_rise),
+                ("Width +/-0.05", self.variety_pulse_width),
+                ("Phase -30/+30", self.variety_phase)), start=0):
+            ttk.Checkbutton(variety, text=label, variable=variable).grid(row=1, column=column, padx=8)
+        ttk.Label(variety, textvariable=self.variety_status,
+                  font=("TkDefaultFont", 10, "bold")).grid(row=0, column=3, columnspan=3, padx=18)
+
+        controls = self._frame("Commissioning controls", 10, 0, 2)
         ttk.Button(controls, text="Neutral", command=self.neutral, width=18).pack(side="left", padx=12)
         ttk.Button(controls, text="Resume", command=self.resume, width=18).pack(side="left", padx=12)
         ttk.Button(controls, text="STOP", command=self.stop, width=18).pack(side="left", padx=12)
         ttk.Label(controls, text="Test without FOCstim hardware connected.").pack(side="right", padx=12)
 
-        diagnostics = self._frame("Live diagnostics", 10, 0, 2)
+        diagnostics = self._frame("Live diagnostics", 11, 0, 2)
         diagnostics.columnconfigure(1, weight=1)
         diagnostics.columnconfigure(3, weight=1)
         labels = (
@@ -443,6 +485,8 @@ class VectorApp:
     def _controller_key(self, event, action):
         if not self.controller_enabled.get():
             return None
+        if self.direct_controller_enabled.get() and self.xinput.connected:
+            return "break"
         # Numeric/text editing retains ordinary keyboard behaviour.
         if isinstance(event.widget, (tk.Entry, ttk.Entry, ttk.Spinbox, ttk.Combobox)):
             return None
@@ -451,18 +495,22 @@ class VectorApp:
 
     def _controller_enabled_changed(self) -> None:
         if self.controller_enabled.get():
-            self.controller_status.set("Active — fixed mappings")
+            self.controller_status.set("Controller enabled; detecting Xbox input")
         else:
             self.controller_status.set("Disabled")
         self.apply_config()
 
     def _adjust_frequency_ramp(self, direction: int) -> None:
+        self.variety_frequency.set(False)
         step = self.controller_fine_step.get()
         self.frequency_ramp_level.set(round(min(1.0, max(0.0,
             self.frequency_ramp_level.get() + direction * step)), 4))
         self.apply_config()
 
     def _shift_control_range(self, target: str, direction: int) -> None:
+        {"pulse_frequency": self.variety_pulse_frequency,
+         "pulse_rise": self.variety_pulse_rise,
+         "pulse_width": self.variety_pulse_width}[target].set(False)
         pairs = {
             "pulse_frequency": (self.pulse_frequency_min, self.pulse_frequency_max),
             "pulse_rise": (self.pulse_rise_min, self.pulse_rise_max),
@@ -480,8 +528,89 @@ class VectorApp:
         self.apply_config()
 
     def _adjust_prostate_phase(self, direction: int) -> None:
+        self.variety_phase.set(False)
         phase = self.prostate_phase_degrees.get() + direction * self.prostate_phase_step.get()
         self.prostate_phase_degrees.set(round(min(90.0, max(-90.0, phase)), 1))
+        self.apply_config()
+
+    def _xinput_status_threaded(self, status: str) -> None:
+        self._controller_events.put(("status", status))
+
+    def _set_xinput_status(self, status: str) -> None:
+        if self.controller_enabled.get() and self.direct_controller_enabled.get():
+            self.controller_status.set(status)
+
+    def _xinput_buttons_threaded(self, buttons: int) -> None:
+        self._controller_events.put(("buttons", buttons))
+
+    def _drain_controller_events(self) -> None:
+        while True:
+            try:
+                kind, value = self._controller_events.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "status":
+                self._set_xinput_status(str(value))
+            else:
+                self._handle_xinput_buttons(int(value))
+
+    def _handle_xinput_buttons(self, buttons: int) -> None:
+        if not self.controller_enabled.get() or not self.direct_controller_enabled.get():
+            return
+        modified = bool(buttons & LEFT_SHOULDER)
+        if buttons & A: self.resume()
+        if buttons & B: self.neutral()
+        if buttons & START: self.stop()
+        if buttons & X: self._adjust_prostate_phase(1)
+        if buttons & Y: self._adjust_prostate_phase(-1)
+        if modified:
+            if buttons & DPAD_UP: self._shift_control_range("pulse_rise", 1)
+            if buttons & DPAD_DOWN: self._shift_control_range("pulse_rise", -1)
+            if buttons & DPAD_LEFT: self._shift_control_range("pulse_width", -1)
+            if buttons & DPAD_RIGHT: self._shift_control_range("pulse_width", 1)
+        else:
+            if buttons & DPAD_UP: self._adjust_frequency_ramp(1)
+            if buttons & DPAD_DOWN: self._adjust_frequency_ramp(-1)
+            if buttons & DPAD_LEFT: self._shift_control_range("pulse_frequency", -1)
+            if buttons & DPAD_RIGHT: self._shift_control_range("pulse_frequency", 1)
+
+    def _variety_toggle(self) -> None:
+        self._variety_started = time.monotonic()
+        self._variety_baseline = {
+            "pf": (self.pulse_frequency_min.get(), self.pulse_frequency_max.get()),
+            "rise": (self.pulse_rise_min.get(), self.pulse_rise_max.get()),
+            "width": (self.pulse_width_min.get(), self.pulse_width_max.get()),
+            "phase": self.prostate_phase_degrees.get(),
+        }
+        self.variety_status.set("Running" if self.variety_enabled.get() else "Off")
+
+    @staticmethod
+    def _bounded_shift(pair: tuple[float, float], offset: float) -> tuple[float, float]:
+        low, high = pair
+        offset = max(-low, min(1.0 - high, offset))
+        return round(low + offset, 4), round(high + offset, 4)
+
+    def _update_variety(self) -> None:
+        if not self.variety_enabled.get():
+            return
+        if not self._variety_baseline:
+            self._variety_toggle()
+        elapsed = time.monotonic() - self._variety_started
+        cycle = self.variety_cycle_minutes.get()
+        offset = rolling_offset(elapsed, cycle)
+        if self.variety_frequency.get():
+            self.frequency_ramp_level.set(round(rolling_value(elapsed, cycle, .5, 1.0), 4))
+        for enabled, key, variables, depth in (
+                (self.variety_pulse_frequency, "pf", (self.pulse_frequency_min, self.pulse_frequency_max), .10),
+                (self.variety_pulse_rise, "rise", (self.pulse_rise_min, self.pulse_rise_max), .10),
+                (self.variety_pulse_width, "width", (self.pulse_width_min, self.pulse_width_max), .05)):
+            if enabled.get():
+                low, high = self._bounded_shift(self._variety_baseline[key], offset * depth)
+                variables[0].set(low); variables[1].set(high)
+        if self.variety_phase.get():
+            baseline = self._variety_baseline["phase"]
+            self.prostate_phase_degrees.set(round(max(-90, min(90, baseline + offset * 30)), 1))
+        self.variety_status.set(f"Running | {elapsed / 60:.1f}/{cycle:.1f} min")
         self.apply_config()
 
     def apply_config(self) -> None:
@@ -574,6 +703,8 @@ class VectorApp:
         self.prostate_restim.send_prostate(0.5, 0.5, 0.0, 0.5, 0.5, 0.5, 0.5)
 
     def _refresh(self) -> None:
+        self._drain_controller_events()
+        self._update_variety()
         diag = self.engine.diagnostics()
         values = {
             "raw_l0": f"{diag.raw_l0:.4f}", "output_l0": f"{diag.output_l0:.4f}",
@@ -627,6 +758,7 @@ class VectorApp:
             "Pulse width (Vector 1B commissioning)": f"{diag.pulse_width:.3f} | range {self.pulse_width_min.get():.2f}-{self.pulse_width_max.get():.2f}",
             "Prostate output (second ReStim)": f"alpha {diag.alpha_prostate:.3f} beta {diag.beta_prostate:.3f} volume {diag.volume_prostate * 100:.0f}% | phase {self.prostate_phase_degrees.get():+.0f} degrees",
             "Xbox controller (keyboard-mapped profile)": f"{self.controller_status.get()} | step {self.controller_fine_step.get():.2f}",
+            "Rolling Variety": self.variety_status.get(),
             "Commissioning controls": diag.state,
             "Live diagnostics": (f"{diag.state} | buffer {diag.buffer_fill} | delay {diag.actual_queue_delay:.4f} s"
                                  if diag.output_samples else
@@ -638,6 +770,7 @@ class VectorApp:
 
     def close(self) -> None:
         self._save_settings()
+        self.xinput.close()
         self.engine.close()
         self.listener.stop()
         self.restim.disconnect()
