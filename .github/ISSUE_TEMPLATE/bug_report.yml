@@ -1,0 +1,34 @@
+name: Bug report
+description: Report a reproducible Vector behavior problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Stop output and reproduce with stimulation hardware disconnected before reporting.
+  - type: input
+    id: version
+    attributes:
+      label: Vector version
+      placeholder: 1.4.0-alpha23
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed and expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Relevant settings and connection status
+      description: Do not include private media filenames or public IP addresses.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce visually in ReStim
+    validations:
+      required: true

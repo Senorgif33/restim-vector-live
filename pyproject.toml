@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vector1a"
+version = "1.4.0a23"
+description = "Live MultiFunPlayer L0 to dual-ReStim motion bridge"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+vector1a = "vector1a.app:main"
+
+[tool.setuptools.packages.find]
+include = ["vector1a*"]
