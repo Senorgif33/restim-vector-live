@@ -2,6 +2,35 @@ from __future__ import annotations
 
 import math
 
+ELECTRODE_ORDERS = ("ABCD", "ABDC", "BACD", "ACBD")
+
+
+def pair_swapped_order(order: str) -> str:
+    """Return the discrete destination of a full A/B + C/D pair morph."""
+    if order not in ELECTRODE_ORDERS:
+        order = "ABCD"
+    return order.translate(str.maketrans("ABCD", "BADC"))
+
+
+def map_electrode_order(values: tuple[float, float, float, float], order: str
+                        ) -> tuple[float, float, float, float]:
+    """Map logical A-B-C-D path positions onto a physical electrode order."""
+    if order not in ELECTRODE_ORDERS:
+        order = "ABCD"
+    mapped = [0.0] * 4
+    for logical_index, physical_label in enumerate(order):
+        mapped[ord(physical_label) - ord("A")] = values[logical_index]
+    return tuple(mapped)
+
+
+def pair_morph(values: tuple[float, float, float, float], amount: float
+               ) -> tuple[float, float, float, float]:
+    """Smoothly morph A<->B and C<->D; endpoints are exact permutations."""
+    amount = min(1.0, max(0.0, amount))
+    a, b, c, d = values
+    return (a + (b - a) * amount, b + (a - b) * amount,
+            c + (d - c) * amount, d + (c - d) * amount)
+
 
 def vertical_crossfade(position: float) -> tuple[float, float, float, float]:
     """Visual-only A-to-D equal-power adjacent crossfade for a 0..1 position."""

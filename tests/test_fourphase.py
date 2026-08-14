@@ -1,8 +1,9 @@
 import math
 import unittest
 
-from vector1a.fourphase import (crossover_blend, directed_signed, normalize_signed, potential_roles,
-                                restim_crossfade, vertical_crossfade)
+from vector1a.fourphase import (crossover_blend, directed_signed, map_electrode_order,
+                                normalize_signed, pair_morph, potential_roles,
+                                pair_swapped_order, restim_crossfade, vertical_crossfade)
 
 
 class FourPhaseCommissioningTests(unittest.TestCase):
@@ -104,6 +105,26 @@ class FourPhaseCommissioningTests(unittest.TestCase):
             self.assertEqual(values[0], 0.0)
             self.assertEqual(values[-1], 1.0)
             self.assertTrue(all(a <= b for a, b in zip(values, values[1:])))
+
+    def test_electrode_order_maps_logical_path_to_physical_channels(self):
+        values = (.1, .2, .3, .4)
+        self.assertEqual(map_electrode_order(values, "ABCD"), values)
+        self.assertEqual(map_electrode_order(values, "ABDC"), (.1, .2, .4, .3))
+        self.assertEqual(map_electrode_order(values, "BACD"), (.2, .1, .3, .4))
+        self.assertEqual(map_electrode_order(values, "ACBD"), (.1, .3, .2, .4))
+
+    def test_pair_morph_has_exact_normal_midpoint_and_swapped_endpoints(self):
+        values = (.1, .2, .3, .4)
+        self.assertEqual(pair_morph(values, 0), values)
+        self.assertEqual(pair_morph(values, 1), (.2, .1, .4, .3))
+        for actual, expected in zip(pair_morph(values, .5), (.15, .15, .35, .35)):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_pair_swapped_sequence_names_match_full_morph_destination(self):
+        self.assertEqual(pair_swapped_order("ABCD"), "BADC")
+        self.assertEqual(pair_swapped_order("ABDC"), "BACD")
+        self.assertEqual(pair_swapped_order("BACD"), "ABDC")
+        self.assertEqual(pair_swapped_order("ACBD"), "BDAC")
 
 
 if __name__ == "__main__":

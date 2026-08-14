@@ -10,10 +10,12 @@ from .engine import OutputSample, VectorEngine
 from .motion import MotionMode, MotionParameters
 from .network import MFPListener, ReStimWebSocketClient
 from .settings import load_settings, save_settings, settings_path
-from .controller import (A, B, X, Y, START, LEFT_SHOULDER, DPAD_UP, DPAD_DOWN,
+from .controller import (A, B, X, Y, START, LEFT_SHOULDER, RIGHT_SHOULDER, DPAD_UP, DPAD_DOWN,
                          DPAD_LEFT, DPAD_RIGHT, XInputController)
 from .variety import fit_range_for_travel, rolling_offset, rolling_value
-from .fourphase import directed_signed, potential_roles, restim_crossfade, vertical_crossfade
+from .fourphase import (ELECTRODE_ORDERS, directed_signed, map_electrode_order,
+                        pair_morph, pair_swapped_order, potential_roles,
+                        restim_crossfade, vertical_crossfade)
 from . import __version__
 
 
@@ -78,6 +80,7 @@ class VectorApp:
         "four_phase_volume_headroom", "four_phase_volume_cycle",
         "four_phase_crossover_width", "four_phase_crossover_curve",
         "four_phase_crossover_sharpness",
+        "electrode_order", "variety_electrode_morph", "variety_electrode_morph_cycle",
         "jitter_enabled", "jitter_amplitude", "jitter_cycle_seconds",
         "prostate_phase_step", "controller_enabled", "controller_fine_step", "minimum_radius",
         "speed_threshold", "direction_probability", "mode", "direct_controller_enabled",
@@ -143,6 +146,9 @@ class VectorApp:
         self.four_phase_crossover_width = tk.DoubleVar(value=1.0)
         self.four_phase_crossover_curve = tk.StringVar(value="Cosine")
         self.four_phase_crossover_sharpness = tk.DoubleVar(value=1.0)
+        self.electrode_order = tk.StringVar(value="ABCD")
+        self.variety_electrode_morph = tk.BooleanVar(value=False)
+        self.variety_electrode_morph_cycle = tk.DoubleVar(value=6.0)
         self.jitter_enabled = tk.BooleanVar(value=False)
         self.jitter_amplitude = tk.DoubleVar(value=0.02)
         self.jitter_cycle_seconds = tk.DoubleVar(value=1.0)
@@ -449,6 +455,15 @@ class VectorApp:
         ttk.Label(four_phase, text="Sharpness").grid(row=7, column=0, sticky="w")
         ttk.Spinbox(four_phase, from_=.2, to=5, increment=.1,
                     textvariable=self.four_phase_crossover_sharpness, width=7).grid(row=7, column=1, sticky="w")
+        ttk.Label(four_phase, text="Signalling sequence").grid(row=7, column=2, sticky="e", padx=(8, 4))
+        order_box = ttk.Combobox(four_phase, textvariable=self.electrode_order,
+                                 values=ELECTRODE_ORDERS, state="readonly", width=7)
+        order_box.grid(row=7, column=3, sticky="w")
+        order_box.bind("<<ComboboxSelected>>", lambda _event: self._electrode_order_changed())
+        ttk.Label(four_phase, text="Pair morph").grid(row=7, column=4, sticky="e", padx=(8, 4))
+        self.electrode_morph_bar = ttk.Progressbar(
+            four_phase, orient="horizontal", mode="determinate", maximum=1.0, length=120)
+        self.electrode_morph_bar.grid(row=7, column=5, sticky="w")
         ttk.Separator(four_phase, orient="horizontal").grid(
             row=8, column=0, columnspan=6, sticky="ew", pady=7)
         self.four_phase_signed_values = []
@@ -511,7 +526,7 @@ class VectorApp:
         ttk.Label(controller, text="X / Page Up: prostate phase ahead | Y / Page Down: prostate phase behind") \
             .grid(row=2, column=0, columnspan=6, sticky="w", padx=6, pady=(2, 2))
         ttk.Label(controller,
-                  text="Direct Xbox: D-pad frequency/pulse frequency | LB + D-pad rise/width | X/Y phase | A Resume | B Neutral | Menu Stop") \
+                  text="Direct Xbox: D-pad frequency/pulse frequency | LB + D-pad rise/width | RB cycle signalling sequence | X/Y phase | A Resume | B Neutral | Menu Stop") \
             .grid(row=3, column=0, columnspan=7, sticky="w", padx=6, pady=(2, 2))
         ttk.Label(controller,
                   text="W/S Frequency ramp ±  •  A/D Pulse frequency range −/+  •  I/K Rise range +/−  •  J/L Width range −/+  •  Enter Resume  •  Space Neutral  •  Esc Stop") \
@@ -525,7 +540,9 @@ class VectorApp:
                 ("Pulse frequency +/-0.20", self.variety_pulse_frequency, self.variety_pulse_frequency_cycle),
                 ("Rise +/-0.20", self.variety_pulse_rise, self.variety_pulse_rise_cycle),
                 ("Width +/-0.20", self.variety_pulse_width, self.variety_pulse_width_cycle),
-                ("Phase -45/+45", self.variety_phase, self.variety_phase_cycle)), start=0):
+                ("Phase -45/+45", self.variety_phase, self.variety_phase_cycle),
+                ("Pair-sequence morph", self.variety_electrode_morph,
+                 self.variety_electrode_morph_cycle)), start=0):
             ttk.Checkbutton(variety, text=label, variable=variable,
                             command=self._variety_toggle).grid(row=1, column=column, padx=8)
             ttk.Spinbox(variety, from_=0.5, to=30, increment=.5, textvariable=cycle,
@@ -614,6 +631,7 @@ class VectorApp:
                             ("<k>", lambda: self._shift_control_range("pulse_rise", -1)),
                             ("<j>", lambda: self._shift_control_range("pulse_width", -1)),
                             ("<l>", lambda: self._shift_control_range("pulse_width", 1)),
+                            ("<o>", self._cycle_electrode_order),
                             ("<Prior>", lambda: self._adjust_prostate_phase(1)),
                             ("<Next>", lambda: self._adjust_prostate_phase(-1)),
                             ("<Return>", self.resume), ("<space>", self.neutral),
@@ -671,6 +689,17 @@ class VectorApp:
         self.prostate_phase_degrees.set(round(min(90.0, max(-90.0, phase)), 1))
         self.apply_config()
 
+    def _electrode_order_changed(self) -> None:
+        self.variety_electrode_morph.set(False)
+
+    def _cycle_electrode_order(self) -> None:
+        self.variety_electrode_morph.set(False)
+        try:
+            index = ELECTRODE_ORDERS.index(self.electrode_order.get())
+        except ValueError:
+            index = -1
+        self.electrode_order.set(ELECTRODE_ORDERS[(index + 1) % len(ELECTRODE_ORDERS)])
+
     def _xinput_status_threaded(self, status: str) -> None:
         self._controller_events.put(("status", status))
 
@@ -701,6 +730,7 @@ class VectorApp:
         if buttons & START: self.stop()
         if buttons & X: self._adjust_prostate_phase(1)
         if buttons & Y: self._adjust_prostate_phase(-1)
+        if buttons & RIGHT_SHOULDER: self._cycle_electrode_order()
         if modified:
             if buttons & DPAD_UP: self._shift_control_range("pulse_rise", 1)
             if buttons & DPAD_DOWN: self._shift_control_range("pulse_rise", -1)
@@ -742,16 +772,18 @@ class VectorApp:
                    ("Pulse-frequency range +/-0.20", self.variety_pulse_frequency, self.variety_pulse_frequency_cycle),
                    ("Pulse-rise range +/-0.20", self.variety_pulse_rise, self.variety_pulse_rise_cycle),
                    ("Pulse-width range +/-0.20", self.variety_pulse_width, self.variety_pulse_width_cycle),
-                   ("Prostate timing phase +/-45 degrees", self.variety_phase, self.variety_phase_cycle))
+                   ("Prostate timing phase +/-45 degrees", self.variety_phase, self.variety_phase_cycle),
+                   ("Pair-sequence morph A/B + C/D", self.variety_electrode_morph,
+                    self.variety_electrode_morph_cycle))
         for row, (label, variable, cycle) in enumerate(options, start=2):
             ttk.Checkbutton(body, text=label, variable=variable,
                             command=self._variety_toggle).grid(row=row, column=0, sticky="w", pady=3)
             ttk.Spinbox(body, from_=0.5, to=30, increment=.5, textvariable=cycle,
                         width=8).grid(row=row, column=1, padx=12)
         ttk.Label(body, textvariable=self.variety_status,
-                  font=("TkDefaultFont", 10, "bold")).grid(row=7, column=0, sticky="w", pady=(12, 0))
+                  font=("TkDefaultFont", 10, "bold")).grid(row=8, column=0, sticky="w", pady=(12, 0))
         ttk.Button(body, text="Restart cycle from current settings",
-                   command=self._variety_toggle).grid(row=7, column=1, padx=12, pady=(12, 0))
+                   command=self._variety_toggle).grid(row=8, column=1, padx=12, pady=(12, 0))
 
     @staticmethod
     def _bounded_shift(pair: tuple[float, float], offset: float) -> tuple[float, float]:
@@ -782,6 +814,14 @@ class VectorApp:
             self.prostate_phase_degrees.set(round(max(-90, min(90, baseline + offset * 45)), 1))
         self.variety_status.set(f"Running | {elapsed / 60:.1f} min | independent cycles")
         self.apply_config()
+
+    def _electrode_morph_amount(self, at_time: float | None = None) -> float:
+        if not (self.variety_enabled.get() and self.variety_electrode_morph.get()):
+            return 0.0
+        elapsed = (time.monotonic() if at_time is None else at_time) - self._variety_started
+        period = max(1.0, self.variety_electrode_morph_cycle.get() * 60.0)
+        phase = (elapsed % period) / period
+        return (1.0 - math.cos(phase * math.tau)) / 2.0
 
     def apply_config(self) -> None:
         try:
@@ -860,6 +900,9 @@ class VectorApp:
             self.four_phase_return_depth.get(), self.four_phase_crossover_width.get(),
             self.four_phase_crossover_curve.get(),
             self.four_phase_crossover_sharpness.get())
+        electrodes = map_electrode_order(electrodes, self.electrode_order.get())
+        electrodes = pair_morph(electrodes,
+                                self._electrode_morph_amount(sample.due_at))
         ceiling = min(1.0, max(0.0, self.four_phase_volume_ceiling.get()))
         if self.four_phase_volume_modulation.get():
             cycle = max(.5, self.four_phase_volume_cycle.get()) * 60.0
@@ -952,17 +995,28 @@ class VectorApp:
                                       self.four_phase_crossover_width.get(),
                                       self.four_phase_crossover_curve.get(),
                                       self.four_phase_crossover_sharpness.get())
+        potentials = map_electrode_order(potentials, self.electrode_order.get())
+        morph_amount = self._electrode_morph_amount()
+        potentials = pair_morph(potentials, morph_amount)
+        self.electrode_morph_bar["value"] = morph_amount
         for variable, value in zip(self.four_phase_signed_values, signed):
             variable.set(f"{value:+.4f}")
         for bar, variable, value in zip(self.four_phase_potential_bars,
                                         self.four_phase_potential_values, potentials):
             bar["value"] = value
             variable.set(f"{value:.4f}")
-        primary, preferred_return = potential_roles(
-            potentials, primary_index, return_index)
-        self.four_phase_roles.set(
-            f"{primary}→{preferred_return} | primary {primary} | preferred return "
-            f"{preferred_return}")
+        primary, preferred_return = potential_roles(potentials)
+        base_sequence = self.electrode_order.get()
+        target_sequence = pair_swapped_order(base_sequence)
+        if morph_amount <= .001:
+            sequence_status = f"Current sequence {base_sequence}"
+        elif morph_amount >= .999:
+            sequence_status = (f"Current sequence {target_sequence} | "
+                               f"base {base_sequence} | morph 100%")
+        else:
+            sequence_status = (f"Base sequence {base_sequence} | morphing toward "
+                               f"{target_sequence} | {morph_amount * 100:.0f}%")
+        self.four_phase_roles.set(sequence_status)
         if self.listener.connection_label() in ("Receiving", "Listening"):
             current = self.listener.connection_label()
             if not self.mfp_status.get().startswith("MFP "):
@@ -978,9 +1032,9 @@ class VectorApp:
             "Pulse width": f"{diag.pulse_width:.3f} | range {self.pulse_width_min.get():.2f}-{self.pulse_width_max.get():.2f}",
             "Prostate controls": f"alpha {diag.alpha_prostate:.3f} beta {diag.beta_prostate:.3f} volume {diag.volume_prostate * 100:.0f}% | phase {self.prostate_phase_degrees.get():+.0f} degrees",
             "Four-phase primary controls": (
-                f"L0 {path_l0:.3f} | A {four_phase[0]:.2f} B {four_phase[1]:.2f} "
-                f"C {four_phase[2]:.2f} D {four_phase[3]:.2f} | "
-                f"primary {primary} return {preferred_return}"),
+                f"{sequence_status} | "
+                f"E1 {potentials[0]:.2f} E2 {potentials[1]:.2f} "
+                f"E3 {potentials[2]:.2f} E4 {potentials[3]:.2f}"),
             "Xbox controller": f"{self.controller_status.get()} | step {self.controller_fine_step.get():.2f}",
             "Rolling Variety": self.variety_status.get(),
             "Commissioning controls": diag.state,

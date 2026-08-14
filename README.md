@@ -4,7 +4,7 @@ Vector 1A is a live bridge from one MultiFunPlayer `L0` T-code stream to one or
 two ReStim instances. It converts streamed 1D motion into synchronized alpha,
 beta, volume, frequency and pulse controls at a stable internal cadence.
 
-Current pre-release build: **1.6.0-alpha28**.
+Current development build: **1.6.0-alpha30**.
 
 > [!CAUTION]
 > Commission with ReStim's graphical display and stimulation hardware
@@ -35,6 +35,9 @@ second after they begin.
 - Configurable 1D-to-2D motion parameters and fixed output rate.
 - Primary ReStim receives both 3-phase and 4-phase axes; ReStim uses the axes
   appropriate to its selected interface.
+- Selectable four-phase electrode signalling sequences (`ABCD`, `ABDC`, `BACD`, `ACBD`),
+  cycleable from the Xbox right shoulder button.
+- Optional Rolling Variety morph between the A/B and C/D electrode pairs.
 - Dynamic volume reduction at rest and smooth return during movement.
 - Live frequency, pulse-frequency, rise-time and pulse-width commissioning.
 - Second ReStim output with tear-shaped prostate alpha/beta and independent
