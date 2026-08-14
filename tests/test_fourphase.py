@@ -2,8 +2,9 @@ import math
 import unittest
 
 from vector1a.fourphase import (crossover_blend, directed_signed, map_electrode_order,
-                                normalize_signed, pair_morph, potential_roles,
-                                pair_swapped_order, restim_crossfade, vertical_crossfade)
+                                morph_electrode_order, normalize_signed, pair_morph,
+                                potential_roles, pair_swapped_order, restim_crossfade,
+                                sequence_cycle_stage, vertical_crossfade)
 
 
 class FourPhaseCommissioningTests(unittest.TestCase):
@@ -113,18 +114,60 @@ class FourPhaseCommissioningTests(unittest.TestCase):
         self.assertEqual(map_electrode_order(values, "BACD"), (.2, .1, .3, .4))
         self.assertEqual(map_electrode_order(values, "ACBD"), (.1, .3, .2, .4))
 
-    def test_pair_morph_has_exact_normal_midpoint_and_swapped_endpoints(self):
+    def test_pair_morph_preserves_energy_and_has_exact_swapped_endpoints(self):
         values = (.1, .2, .3, .4)
         self.assertEqual(pair_morph(values, 0), values)
         self.assertEqual(pair_morph(values, 1), (.2, .1, .4, .3))
-        for actual, expected in zip(pair_morph(values, .5), (.15, .15, .35, .35)):
-            self.assertAlmostEqual(actual, expected)
+        midpoint = pair_morph(values, .5)
+        self.assertGreater(max(midpoint) - min(midpoint), 0.0)
+
+    def test_pair_morph_does_not_stop_when_only_one_pair_is_active(self):
+        values = (1.0, 0.0, .5, .5)
+        for step in range(101):
+            morphed = pair_morph(values, step / 100.0)
+            self.assertGreater(max(morphed) - min(morphed), .49)
 
     def test_pair_swapped_sequence_names_match_full_morph_destination(self):
         self.assertEqual(pair_swapped_order("ABCD"), "BADC")
         self.assertEqual(pair_swapped_order("ABDC"), "BACD")
         self.assertEqual(pair_swapped_order("BACD"), "ABDC")
         self.assertEqual(pair_swapped_order("ACBD"), "BDAC")
+
+    def test_automatic_sequence_carousel_uses_requested_order(self):
+        expected = (("ABCD", "ABDC"), ("ABDC", "BACD"),
+                    ("BACD", "ACBD"), ("ACBD", "ABCD"))
+        for index, pair in enumerate(expected):
+            source, destination, amount = sequence_cycle_stage("ABCD", index / 4)
+            self.assertEqual((source, destination), pair)
+            self.assertEqual(amount, 0.0)
+
+    def test_sequence_carousel_holds_then_transitions_briefly(self):
+        source, destination, amount = sequence_cycle_stage("ABCD", .20, .10)
+        self.assertEqual((source, destination), ("ABCD", "ABDC"))
+        self.assertEqual(amount, 0.0)
+        _, _, amount = sequence_cycle_stage("ABCD", .24, .10)
+        self.assertGreater(amount, 0.0)
+        self.assertLess(amount, 1.0)
+
+    def test_sequence_carousel_is_continuous_at_stage_boundaries(self):
+        values = (1.0, .2, .6, 0.0)
+        for boundary in (.25, .5, .75):
+            before_source, before_target, before_amount = sequence_cycle_stage(
+                "ABCD", boundary - 1e-8)
+            after_source, after_target, after_amount = sequence_cycle_stage(
+                "ABCD", boundary + 1e-8)
+            before = morph_electrode_order(
+                values, before_source, before_target, before_amount)
+            after = morph_electrode_order(
+                values, after_source, after_target, after_amount)
+            self.assertLess(max(abs(a - b) for a, b in zip(before, after)), 1e-5)
+
+    def test_sequence_carousel_preserves_differential(self):
+        values = (1.0, 0.0, .5, .5)
+        for step in range(401):
+            source, destination, amount = sequence_cycle_stage("ABCD", step / 401)
+            morphed = morph_electrode_order(values, source, destination, amount)
+            self.assertGreater(max(morphed) - min(morphed), .49)
 
 
 if __name__ == "__main__":

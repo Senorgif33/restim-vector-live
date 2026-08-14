@@ -4,7 +4,7 @@ Vector 1A is a live bridge from one MultiFunPlayer `L0` T-code stream to one or
 two ReStim instances. It converts streamed 1D motion into synchronized alpha,
 beta, volume, frequency and pulse controls at a stable internal cadence.
 
-Current development build: **1.6.0-alpha30**.
+Current development build: **1.6.0-alpha31**.
 
 > [!CAUTION]
 > Commission with ReStim's graphical display and stimulation hardware

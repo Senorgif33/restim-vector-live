@@ -12,6 +12,31 @@ def pair_swapped_order(order: str) -> str:
     return order.translate(str.maketrans("ABCD", "BADC"))
 
 
+def sequence_cycle_stage(base_order: str, cycle_position: float,
+                         transition_fraction: float = 1.0
+                         ) -> tuple[str, str, float]:
+    """Return source, destination and eased progress for the order carousel.
+
+    Each stage holds its source sequence before using the final
+    ``transition_fraction`` of the stage to morph to the destination.
+    """
+    if base_order not in ELECTRODE_ORDERS:
+        base_order = ELECTRODE_ORDERS[0]
+    cycle_position = cycle_position % 1.0
+    scaled = cycle_position * len(ELECTRODE_ORDERS)
+    stage = min(len(ELECTRODE_ORDERS) - 1, int(scaled))
+    local = scaled - stage
+    start_index = (ELECTRODE_ORDERS.index(base_order) + stage) % len(ELECTRODE_ORDERS)
+    source = ELECTRODE_ORDERS[start_index]
+    destination = ELECTRODE_ORDERS[(start_index + 1) % len(ELECTRODE_ORDERS)]
+    transition_fraction = min(1.0, max(1e-6, transition_fraction))
+    transition_start = 1.0 - transition_fraction
+    transition_progress = min(1.0, max(0.0,
+        (local - transition_start) / transition_fraction))
+    eased = (1.0 - math.cos(transition_progress * math.pi)) / 2.0
+    return source, destination, eased
+
+
 def map_electrode_order(values: tuple[float, float, float, float], order: str
                         ) -> tuple[float, float, float, float]:
     """Map logical A-B-C-D path positions onto a physical electrode order."""
@@ -23,13 +48,98 @@ def map_electrode_order(values: tuple[float, float, float, float], order: str
     return tuple(mapped)
 
 
+def morph_electrode_order(values: tuple[float, float, float, float], source: str,
+                          destination: str, amount: float
+                          ) -> tuple[float, float, float, float]:
+    """Constant-energy morph between two signalling-sequence mappings."""
+    amount = min(1.0, max(0.0, amount))
+    start = map_electrode_order(values, source)
+    end = map_electrode_order(values, destination)
+    if amount == 0.0:
+        return start
+    if amount == 1.0:
+        return end
+
+    start_mean, end_mean = sum(start) / 4.0, sum(end) / 4.0
+    start_vector = tuple(value - start_mean for value in start)
+    end_vector = tuple(value - end_mean for value in end)
+    start_norm = math.sqrt(sum(value * value for value in start_vector))
+    end_norm = math.sqrt(sum(value * value for value in end_vector))
+    if start_norm <= 1e-12 or end_norm <= 1e-12:
+        return tuple(a + (b - a) * amount for a, b in zip(start, end))
+
+    unit_start = tuple(value / start_norm for value in start_vector)
+    unit_end = tuple(value / end_norm for value in end_vector)
+    dot = min(1.0, max(-1.0, sum(a * b for a, b in zip(unit_start, unit_end))))
+    if dot < -.999999:
+        candidates = ((1.0, -1.0, 0.0, 0.0), (1.0, 0.0, -1.0, 0.0),
+                      (1.0, 0.0, 0.0, -1.0))
+        candidate = min(candidates,
+                        key=lambda item: abs(sum(a * b for a, b in zip(unit_start, item))))
+        projection = sum(a * b for a, b in zip(unit_start, candidate))
+        orthogonal = tuple(value - projection * axis
+                           for value, axis in zip(candidate, unit_start))
+        orthogonal_norm = math.sqrt(sum(value * value for value in orthogonal))
+        orthogonal = tuple(value / orthogonal_norm for value in orthogonal)
+        direction = tuple(axis * math.cos(amount * math.pi)
+                          + other * math.sin(amount * math.pi)
+                          for axis, other in zip(unit_start, orthogonal))
+    else:
+        angle = math.acos(dot)
+        if angle <= 1e-9:
+            direction = unit_start
+        else:
+            denominator = math.sin(angle)
+            start_weight = math.sin((1.0 - amount) * angle) / denominator
+            end_weight = math.sin(amount * angle) / denominator
+            direction = tuple(start_weight * a + end_weight * b
+                              for a, b in zip(unit_start, unit_end))
+    magnitude = start_norm + (end_norm - start_norm) * amount
+    mean = start_mean + (end_mean - start_mean) * amount
+    result = tuple(mean + magnitude * value for value in direction)
+    low, high = min(result), max(result)
+    if low < 0.0 or high > 1.0:
+        span = high - low
+        result = tuple((value - low) / span for value in result)
+    return result
+
+
 def pair_morph(values: tuple[float, float, float, float], amount: float
                ) -> tuple[float, float, float, float]:
-    """Smoothly morph A<->B and C<->D; endpoints are exact permutations."""
+    """Morph A<->B and C<->D without collapsing the differential midway.
+
+    A straight interpolation makes both pairs equal at 50%, which can briefly
+    remove the four-phase sensation.  Rotating the two pair differentials by
+    180 degrees transfers their energy between pairs and preserves exact
+    swapped endpoints.
+    """
     amount = min(1.0, max(0.0, amount))
     a, b, c, d = values
-    return (a + (b - a) * amount, b + (a - b) * amount,
-            c + (d - c) * amount, d + (c - d) * amount)
+    if amount == 0.0:
+        return values
+    if amount == 1.0:
+        return (b, a, d, c)
+    ab_mean, cd_mean = (a + b) / 2.0, (c + d) / 2.0
+    ab_diff, cd_diff = (a - b) / 2.0, (c - d) / 2.0
+    angle = amount * math.pi
+    cosine, sine = math.cos(angle), math.sin(angle)
+    rotated_ab = ab_diff * cosine - cd_diff * sine
+    rotated_cd = ab_diff * sine + cd_diff * cosine
+
+    # Retain the pair means and uniformly fit the rotated differential into
+    # ReStim's 0..1 command range.  Uniform scaling preserves its direction.
+    scale = 1.0
+    for mean, difference in ((ab_mean, rotated_ab), (cd_mean, rotated_cd)):
+        if difference > 0.0:
+            scale = min(scale, (1.0 - mean) / difference, mean / difference)
+        elif difference < 0.0:
+            magnitude = -difference
+            scale = min(scale, mean / magnitude, (1.0 - mean) / magnitude)
+    scale = max(0.0, scale)
+    rotated_ab *= scale
+    rotated_cd *= scale
+    return (ab_mean + rotated_ab, ab_mean - rotated_ab,
+            cd_mean + rotated_cd, cd_mean - rotated_cd)
 
 
 def vertical_crossfade(position: float) -> tuple[float, float, float, float]:
