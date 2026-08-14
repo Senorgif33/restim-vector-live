@@ -1,0 +1,87 @@
+import base64
+import hashlib
+import socket
+import threading
+import time
+import unittest
+
+from vector1a.network import MFPListener, ReStimWebSocketClient
+
+
+class NetworkTests(unittest.TestCase):
+    def test_dependency_free_websocket_handshake_and_masked_text(self):
+        server = socket.socket(); server.bind(("127.0.0.1", 0)); server.listen(1)
+        port = server.getsockname()[1]; received = []
+
+        def serve():
+            conn, _ = server.accept(); request = b""
+            while b"\r\n\r\n" not in request:
+                request += conn.recv(4096)
+            key = next(line.split(b":", 1)[1].strip() for line in request.split(b"\r\n")
+                       if line.lower().startswith(b"sec-websocket-key:"))
+            accept = base64.b64encode(hashlib.sha1(
+                key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+            conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                         b"Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+            frame = conn.recv(4096); size = frame[1] & 0x7f; index = 2
+            if size == 126: size = int.from_bytes(frame[2:4], "big"); index = 4
+            mask, payload = frame[index:index+4], frame[index+4:index+4+size]
+            received.append(bytes(b ^ mask[i % 4] for i, b in enumerate(payload)).decode())
+            conn.close(); server.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        client = ReStimWebSocketClient(lambda _: None); client.connect("127.0.0.1", port)
+        client.send_prostate(.1, .2, .3, .4, .5, .6, .7)
+        time.sleep(.05); client.disconnect()
+        self.assertIn("L01000 L12000 V03000 F04000 P05000 P16000 P37000", received)
+
+    def test_listener_accepts_a_new_tcp_client_after_disconnect(self):
+        values = []
+        probe = socket.socket(); probe.bind(("127.0.0.1", 0)); port = probe.getsockname()[1]; probe.close()
+        listener = MFPListener(lambda value, *_: values.append(value), lambda _: None)
+        listener.start("127.0.0.1", port)
+        try:
+            for command in (b"L01000\n", b"L09000\n"):
+                with socket.create_connection(("127.0.0.1", port), timeout=1) as client:
+                    client.sendall(command)
+                time.sleep(.05)
+            self.assertEqual(values, [.1, .9])
+        finally:
+            listener.stop()
+
+    def test_four_phase_uses_restim_e_axes(self):
+        client = ReStimWebSocketClient(lambda _: None)
+        messages = []
+        client._socket = type("Socket", (), {"sendall": lambda _, value: messages.append(value)})()
+        client.send_four_phase((1.0, 0.0, .25, .5))
+        frame = messages[0]; size = frame[1] & 0x7f; index = 2
+        mask, payload = frame[index:index+4], frame[index+4:index+4+size]
+        text = bytes(value ^ mask[i % 4] for i, value in enumerate(payload)).decode()
+        self.assertEqual(text, "E19999 E20000 E32500 E45000")
+
+    def test_four_phase_can_include_volume(self):
+        client = ReStimWebSocketClient(lambda _: None)
+        messages = []
+        client._socket = type("Socket", (), {"sendall": lambda _, value: messages.append(value)})()
+        client.send_four_phase((1.0, 0.0, .25, .5), .4)
+        frame = messages[0]; size = frame[1] & 0x7f; index = 2
+        mask, payload = frame[index:index+4], frame[index+4:index+4+size]
+        text = bytes(value ^ mask[i % 4] for i, value in enumerate(payload)).decode()
+        self.assertEqual(text, "E19999 E20000 E32500 E45000 V04000")
+
+    def test_primary_websocket_sends_three_and_four_phase_axes_together(self):
+        client = ReStimWebSocketClient(lambda _: None)
+        messages = []
+        client._socket = type("Socket", (), {"sendall": lambda _, value: messages.append(value)})()
+        client.send_primary(.1, .2, (1.0, 0.0, .25, .5), .6, .7, .8, .9, .4)
+        frame = messages[0]; size = frame[1] & 0x7f; index = 2
+        if size == 126: size = int.from_bytes(frame[2:4], "big"); index = 4
+        mask, payload = frame[index:index+4], frame[index+4:index+4+size]
+        text = bytes(value ^ mask[i % 4] for i, value in enumerate(payload)).decode()
+        self.assertEqual(
+            text, "L01000 L12000 E19999 E20000 E32500 E45000 V06000 "
+                  "C07000 P08000 P39000 P14000")
+
+
+if __name__ == "__main__":
+    unittest.main()

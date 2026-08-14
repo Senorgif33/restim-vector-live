@@ -111,6 +111,9 @@ class VectorEngine:
         self.prostate_volume_multiplier = 1.5
         self.prostate_rest_level = 0.7
         self.prostate_phase_degrees = 0.0
+        self.jitter_enabled = False
+        self.jitter_amplitude = 0.02
+        self.jitter_cycle_seconds = 1.0
         self._input_count = 0
         self._output_count = 0
         self._sequence = 0
@@ -141,7 +144,9 @@ class VectorEngine:
                   prostate_stroke_threshold: float = 0.25,
                   prostate_volume_multiplier: float = 1.5,
                   prostate_rest_level: float = 0.7,
-                  prostate_phase_degrees: float = 0.0) -> None:
+                  prostate_phase_degrees: float = 0.0,
+                  jitter_enabled: bool = False, jitter_amplitude: float = 0.02,
+                  jitter_cycle_seconds: float = 1.0) -> None:
         with self._lock:
             mode_changed = mode != self.mode
             self.rate_hz = max(1, min(200, int(rate_hz)))
@@ -173,6 +178,9 @@ class VectorEngine:
             self.prostate_volume_multiplier = min(3.0, max(1.0, float(prostate_volume_multiplier)))
             self.prostate_rest_level = min(1.0, max(0.0, float(prostate_rest_level)))
             self.prostate_phase_degrees = min(90.0, max(-90.0, float(prostate_phase_degrees)))
+            self.jitter_enabled = bool(jitter_enabled)
+            self.jitter_amplitude = min(.20, max(0.0, float(jitter_amplitude)))
+            self.jitter_cycle_seconds = min(30.0, max(.05, float(jitter_cycle_seconds)))
             if mode_changed and self._state in ("Buffering", "Running"):
                 # Never release samples calculated by a previously selected
                 # geometry under a newly-labelled UI state.
@@ -246,12 +254,14 @@ class VectorEngine:
             if (sample.mode == MotionMode.RESTIM_ORIGINAL
                     and stroke.start_time <= sample.calculated_at <= stroke.end_time):
                 alpha, beta, position, speed = self.calculator.calculate(
-                    MotionMode.RESTIM_ORIGINAL, stroke, sample.calculated_at, self.params
+                    MotionMode.RESTIM_ORIGINAL, self._jitter_segment(stroke),
+                    sample.calculated_at, self.params
                 )
                 sample = replace(sample, output_l0=position, speed_percent=speed,
                                  alpha=alpha, beta=beta)
             if stroke.start_time <= sample.calculated_at <= stroke.end_time:
-                pa, pb = self._calculate_prostate(stroke, sample.calculated_at)
+                pa, pb = self._calculate_prostate(
+                    self._jitter_segment(stroke), sample.calculated_at)
                 sample = replace(sample, alpha_prostate=pa, beta_prostate=pb)
             rewritten.append((due_at, sequence, sample))
         self._queue = rewritten
@@ -306,6 +316,7 @@ class VectorEngine:
             calculation_segment = (self._stroke_for_time(scheduled_at)
                                    if self.mode == MotionMode.RESTIM_ORIGINAL
                                    else self._segment)
+            calculation_segment = self._jitter_segment(calculation_segment)
             alpha, beta, output_l0, speed = self.calculator.calculate(
                 self.mode, calculation_segment, scheduled_at, self.params)
             output_volume = self._calculate_volume(scheduled_at, speed)
@@ -313,7 +324,7 @@ class VectorEngine:
             pulse_frequency = self._calculate_pulse_frequency(scheduled_at, speed, alpha)
             pulse_rise_time = self._calculate_pulse_rise_time(speed)
             pulse_width = self._calculate_pulse_width(scheduled_at, speed, output_l0)
-            prostate_segment = self._stroke_for_time(scheduled_at)
+            prostate_segment = self._jitter_segment(self._stroke_for_time(scheduled_at))
             alpha_prostate, beta_prostate = self._calculate_prostate(
                 prostate_segment, scheduled_at)
             volume_prostate = self._calculate_prostate_volume(scheduled_at, speed)
@@ -328,6 +339,23 @@ class VectorEngine:
                 alpha_prostate, beta_prostate, volume_prostate,
             )
             heapq.heappush(self._queue, (sample.due_at, sample.sequence, sample))
+
+    def _jitter_offset(self, at_time: float) -> float:
+        """Deterministic band-limited texture; never alters input stroke detection."""
+        if not self.jitter_enabled or self.jitter_amplitude <= 0.0:
+            return 0.0
+        phase = 2.0 * math.pi * at_time / self.jitter_cycle_seconds
+        wave = .65 * math.sin(phase) + .35 * math.sin(phase / .57 + 1.7)
+        return self.jitter_amplitude * wave
+
+    def _jitter_segment(self, segment: SegmentState) -> SegmentState:
+        if not self.jitter_enabled or self.jitter_amplitude <= 0.0:
+            return segment
+        start = min(1.0, max(0.0, segment.start_position
+                             + self._jitter_offset(segment.start_time)))
+        end = min(1.0, max(0.0, segment.end_position
+                           + self._jitter_offset(segment.end_time)))
+        return replace(segment, start_position=start, end_position=end)
 
     def _release_due(self, now: float) -> None:
         due: list[OutputSample] = []

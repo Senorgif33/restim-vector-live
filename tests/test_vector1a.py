@@ -63,6 +63,21 @@ class MotionTests(unittest.TestCase):
 
 
 class QueueTests(unittest.TestCase):
+    def test_jitter_is_optional_bounded_and_does_not_change_raw_l0(self):
+        sent = []
+        engine = VectorEngine(sent.append, rate_hz=50, lookahead_seconds=.1,
+                              clock=lambda: 0.0)
+        engine.configure(rate_hz=50, lookahead_seconds=.1, volume=.7,
+                         mode=MotionMode.CIRCULAR, params=MotionParameters(),
+                         jitter_enabled=True, jitter_amplitude=.03,
+                         jitter_cycle_seconds=1.0)
+        engine.resume()
+        engine.receive_l0(.5, received_at=0.0)
+        engine.step(0.0, .1)
+        self.assertEqual(len(sent), 1)
+        self.assertAlmostEqual(sent[0].raw_l0, .5)
+        self.assertLessEqual(abs(sent[0].output_l0 - .5), .03)
+
     def test_reversal_rewrites_buffered_restim_original_as_one_stroke(self):
         engine = VectorEngine(lambda sample: None, lookahead_seconds=1.0, clock=lambda: 0.0)
         engine.mode = MotionMode.RESTIM_ORIGINAL

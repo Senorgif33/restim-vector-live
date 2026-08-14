@@ -4,7 +4,7 @@ Vector 1A is a live bridge from one MultiFunPlayer `L0` T-code stream to one or
 two ReStim instances. It converts streamed 1D motion into synchronized alpha,
 beta, volume, frequency and pulse controls at a stable internal cadence.
 
-Current commissioning build: **1.5.0-alpha27**.
+Current pre-release build: **1.6.0-alpha28**.
 
 > [!CAUTION]
 > Commission with ReStim's graphical display and stimulation hardware
@@ -16,7 +16,7 @@ Current commissioning build: **1.5.0-alpha27**.
 ```mermaid
 flowchart LR
     MFP["MultiFunPlayer<br/>L0 stream<br/>offset -2.00 s"] -->|"TCP or UDP :12345"| V["Vector 1A<br/>50 Hz calculation<br/>2.00 s deterministic queue"]
-    V -->|"TCP :12347<br/>L0 L1 V0 C0 P0 P1 P3"| R1["Primary ReStim"]
+    V -->|"WebSocket /tcode<br/>L0 L1 E1 E2 E3 E4 V0 C0 P0 P1 P3"| R1["Primary ReStim<br/>3-phase or 4-phase"]
     V -->|"WebSocket :12350/tcode<br/>L0 L1 V0 F0 P0 P1 P3"| R2["Prostate ReStim"]
 ```
 
@@ -33,6 +33,8 @@ second after they begin.
   - Top-Right to Bottom-Left 0-270
   - ReStim Original 0-360
 - Configurable 1D-to-2D motion parameters and fixed output rate.
+- Primary ReStim receives both 3-phase and 4-phase axes; ReStim uses the axes
+  appropriate to its selected interface.
 - Dynamic volume reduction at rest and smooth return during movement.
 - Live frequency, pulse-frequency, rise-time and pulse-width commissioning.
 - Second ReStim output with tear-shaped prostate alpha/beta and independent
@@ -67,7 +69,7 @@ Vector itself has no third-party Python package dependencies.
 3. Leave stimulation hardware disconnected.
 4. In MFP, add a T-code TCP or UDP output to `127.0.0.1:12345`, carrying `L0`.
 5. Set the MFP script offset to **-2.00 seconds**.
-6. In primary ReStim, enable its TCP server on port `12347`.
+6. In primary ReStim, enable its WebSocket server and enter that port in Vector.
 7. Optionally run a second ReStim WebSocket server on port `12350` for prostate
    output.
 8. In Vector, start the listener, connect the output(s), then choose
@@ -83,6 +85,7 @@ The **Setup guide** button repeats these instructions. Settings are saved at
 | Destination | Axis | Meaning |
 |---|---|---|
 | Primary ReStim | L0 / L1 / V0 | Alpha / beta / volume |
+| Primary ReStim | E1 / E2 / E3 / E4 | Four-phase electrode potentials |
 | Primary ReStim | C0 | Frequency |
 | Primary ReStim | P0 / P1 / P3 | Pulse frequency / width / rise time |
 | Prostate ReStim | L0 / L1 / V0 | Alpha-prostate / beta-prostate / volume-prostate |

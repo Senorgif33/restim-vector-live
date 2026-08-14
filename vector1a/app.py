@@ -3,15 +3,17 @@ from __future__ import annotations
 import tkinter as tk
 import time
 import queue
+import math
 from tkinter import messagebox, ttk
 
 from .engine import OutputSample, VectorEngine
 from .motion import MotionMode, MotionParameters
-from .network import MFPListener, ReStimClient, ReStimWebSocketClient
+from .network import MFPListener, ReStimWebSocketClient
 from .settings import load_settings, save_settings, settings_path
 from .controller import (A, B, X, Y, START, LEFT_SHOULDER, DPAD_UP, DPAD_DOWN,
                          DPAD_LEFT, DPAD_RIGHT, XInputController)
 from .variety import fit_range_for_travel, rolling_offset, rolling_value
+from .fourphase import directed_signed, potential_roles, restim_crossfade, vertical_crossfade
 from . import __version__
 
 
@@ -63,6 +65,7 @@ class CollapsibleSection(ttk.Frame):
 class VectorApp:
     SETTINGS_FIELDS = (
         "mfp_host", "mfp_port", "restim_host", "restim_port", "prostate_host", "prostate_port",
+        "four_phase_host", "four_phase_port",
         "rate", "lookahead", "volume", "dynamic_volume", "volume_rest_level", "volume_ratio",
         "volume_ramp_up", "frequency_ramp_level", "frequency_ratio", "send_frequency",
         "pulse_frequency_ratio", "pulse_frequency_min", "pulse_frequency_max", "send_pulse_frequency",
@@ -70,6 +73,12 @@ class VectorApp:
         "pulse_width_ratio", "pulse_width_min", "pulse_width_max", "send_pulse_width",
         "prostate_narrow_ratio", "prostate_arc_depth", "prostate_threshold",
         "prostate_volume_multiplier", "prostate_rest_level", "prostate_phase_degrees",
+        "four_phase_return_depth",
+        "four_phase_invert", "four_phase_volume_ceiling", "four_phase_volume_modulation",
+        "four_phase_volume_headroom", "four_phase_volume_cycle",
+        "four_phase_crossover_width", "four_phase_crossover_curve",
+        "four_phase_crossover_sharpness",
+        "jitter_enabled", "jitter_amplitude", "jitter_cycle_seconds",
         "prostate_phase_step", "controller_enabled", "controller_fine_step", "minimum_radius",
         "speed_threshold", "direction_probability", "mode", "direct_controller_enabled",
         "variety_enabled", "variety_frequency_cycle", "variety_pulse_frequency_cycle",
@@ -87,12 +96,15 @@ class VectorApp:
         self.mfp_status = tk.StringVar(value="Disconnected")
         self.restim_status = tk.StringVar(value="Disconnected")
         self.prostate_status = tk.StringVar(value="Disconnected")
+        self.four_phase_status = tk.StringVar(value="Disconnected")
         self.mfp_host = tk.StringVar(value="127.0.0.1")
         self.mfp_port = tk.IntVar(value=12345)
         self.restim_host = tk.StringVar(value="127.0.0.1")
-        self.restim_port = tk.IntVar(value=12347)
+        self.restim_port = tk.IntVar(value=12346)
         self.prostate_host = tk.StringVar(value="127.0.0.1")
         self.prostate_port = tk.IntVar(value=12350)
+        self.four_phase_host = tk.StringVar(value="127.0.0.1")
+        self.four_phase_port = tk.IntVar(value=12351)
         self.rate = tk.IntVar(value=50)
         self.lookahead = tk.DoubleVar(value=2.0)
         self.volume = tk.DoubleVar(value=0.70)
@@ -122,6 +134,19 @@ class VectorApp:
         self.prostate_rest_level = tk.DoubleVar(value=0.7)
         self.prostate_phase_degrees = tk.DoubleVar(value=0.0)
         self.prostate_phase_step = tk.DoubleVar(value=15.0)
+        self.four_phase_return_depth = tk.DoubleVar(value=0.30)
+        self.four_phase_invert = tk.BooleanVar(value=False)
+        self.four_phase_volume_ceiling = tk.DoubleVar(value=0.85)
+        self.four_phase_volume_modulation = tk.BooleanVar(value=False)
+        self.four_phase_volume_headroom = tk.DoubleVar(value=0.15)
+        self.four_phase_volume_cycle = tk.DoubleVar(value=4.0)
+        self.four_phase_crossover_width = tk.DoubleVar(value=1.0)
+        self.four_phase_crossover_curve = tk.StringVar(value="Cosine")
+        self.four_phase_crossover_sharpness = tk.DoubleVar(value=1.0)
+        self.jitter_enabled = tk.BooleanVar(value=False)
+        self.jitter_amplitude = tk.DoubleVar(value=0.02)
+        self.jitter_cycle_seconds = tk.DoubleVar(value=1.0)
+        self.send_four_phase_visual = tk.BooleanVar(value=False)
         self.controller_enabled = tk.BooleanVar(value=True)
         self.controller_target = tk.IntVar(value=0)
         self.controller_fine_step = tk.DoubleVar(value=0.05)
@@ -159,9 +184,13 @@ class VectorApp:
             "alpha_prostate", "beta_prostate", "volume_prostate",
         )}
 
-        self.restim = ReStimClient(self._set_restim_status)
+        self.restim = ReStimWebSocketClient(self._set_restim_status)
         self.prostate_restim = ReStimWebSocketClient(self._set_prostate_status)
         self.engine = VectorEngine(self._send_sample)
+        self._four_phase_last_l0 = 0.5
+        self._four_phase_direction = 1
+        self._four_phase_send_last_l0 = 0.5
+        self._four_phase_send_direction = 1
         self.listener = MFPListener(self.engine.receive_l0, self._set_mfp_status)
         self.xinput = XInputController(self._xinput_buttons_threaded, self._xinput_status_threaded)
         self.sections = {}
@@ -177,7 +206,12 @@ class VectorApp:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
     def _frame(self, title: str, row: int, column: int = 0, span: int = 1) -> ttk.Frame:
-        section = CollapsibleSection(self.root, title, collapsed=(title == "Live diagnostics"))
+        collapsed_titles = {
+            "Frequency", "Pulse frequency", "Pulse rise time", "Pulse width",
+            "Prostate controls", "Four-phase primary controls",
+            "Xbox controller", "Rolling Variety", "Live diagnostics",
+        }
+        section = CollapsibleSection(self.root, title, collapsed=(title in collapsed_titles))
         section.grid(row=row + 1, column=column, columnspan=span, sticky="nsew", padx=10, pady=3)
         self.sections[title] = section
         return section.body
@@ -189,7 +223,7 @@ class VectorApp:
 
         toolbar = ttk.Frame(self.root, padding=(12, 6))
         toolbar.grid(row=0, column=0, columnspan=2, sticky="ew")
-        ttk.Label(toolbar, text="Vector commissioning", font=("TkDefaultFont", 10, "bold")).pack(side="left")
+        ttk.Label(toolbar, text="ReStim Vector Live", font=("TkDefaultFont", 10, "bold")).pack(side="left")
         ttk.Button(toolbar, text="START / RESUME", command=self.resume).pack(side="left", padx=(24, 6))
         ttk.Button(toolbar, text="Neutral", command=self.neutral).pack(side="left", padx=6)
         ttk.Button(toolbar, text="STOP", command=self.stop).pack(side="left", padx=6)
@@ -207,21 +241,20 @@ class VectorApp:
         ttk.Label(mfp, textvariable=self.mfp_status).grid(row=1, column=2, columnspan=2, sticky="w")
 
         restim = self._frame("ReStim output", 0, 1)
-        ttk.Label(restim, text="Host").grid(row=0, column=0, sticky="w")
+        ttk.Label(restim, text="Primary WS").grid(row=0, column=0, sticky="w")
         ttk.Entry(restim, textvariable=self.restim_host, width=16).grid(row=0, column=1, padx=5)
         ttk.Label(restim, text="Port").grid(row=0, column=2)
         ttk.Spinbox(restim, from_=1, to=65535, textvariable=self.restim_port, width=7).grid(row=0, column=3, padx=5)
         ttk.Button(restim, text="Connect", command=self.connect_restim).grid(row=1, column=0, pady=8)
         ttk.Button(restim, text="Disconnect", command=self.restim.disconnect).grid(row=1, column=1, pady=8)
-        ttk.Label(restim, textvariable=self.restim_status).grid(row=1, column=2, columnspan=2, sticky="w")
-        ttk.Button(restim, text="START / RESUME", command=self.resume).grid(row=0, column=4, padx=12)
-        ttk.Button(restim, text="STOP", command=self.stop).grid(row=1, column=4, padx=12)
-        ttk.Label(restim, text="Prostate WS").grid(row=2, column=0, sticky="w")
+        ttk.Label(restim, textvariable=self.restim_status).grid(row=1, column=2, columnspan=3, sticky="w")
+        ttk.Label(restim, text="Prostate").grid(row=2, column=0, sticky="w")
         ttk.Entry(restim, textvariable=self.prostate_host, width=16).grid(row=2, column=1, padx=5)
-        ttk.Spinbox(restim, from_=1, to=65535, textvariable=self.prostate_port, width=7).grid(row=2, column=2, padx=5)
+        ttk.Label(restim, text="Port").grid(row=2, column=2, sticky="e")
+        ttk.Spinbox(restim, from_=1, to=65535, textvariable=self.prostate_port, width=7).grid(row=2, column=3, padx=5)
         ttk.Button(restim, text="Connect", command=self.connect_prostate).grid(row=3, column=0, pady=6)
         ttk.Button(restim, text="Disconnect", command=self.prostate_restim.disconnect).grid(row=3, column=1, pady=6)
-        ttk.Label(restim, textvariable=self.prostate_status).grid(row=3, column=2, columnspan=2, sticky="w")
+        ttk.Label(restim, textvariable=self.prostate_status).grid(row=3, column=2, columnspan=4, sticky="w")
 
         motion = self._frame("Motion", 1, 0, 2)
         ttk.Label(motion, text="Mode").grid(row=0, column=0, sticky="w")
@@ -244,6 +277,16 @@ class VectorApp:
             ttk.Spinbox(motion, from_=low, to=high, increment=step, textvariable=variable,
                         width=10, command=self.apply_config).grid(row=row, column=col + 1, padx=6, sticky="w")
         ttk.Button(motion, text="Apply", command=self.apply_config).grid(row=3, column=5, sticky="e")
+        ttk.Checkbutton(motion, text="Add smooth L0 jitter", variable=self.jitter_enabled,
+                        command=self.apply_config).grid(row=3, column=0, sticky="w", pady=(5, 2))
+        ttk.Label(motion, text="Amplitude").grid(row=3, column=1, sticky="e")
+        ttk.Spinbox(motion, from_=0, to=.20, increment=.005,
+                    textvariable=self.jitter_amplitude, width=8,
+                    command=self.apply_config).grid(row=3, column=2, sticky="w")
+        ttk.Label(motion, text="Variation cycle (s)").grid(row=3, column=3, sticky="e")
+        ttk.Spinbox(motion, from_=.05, to=30, increment=.05,
+                    textvariable=self.jitter_cycle_seconds, width=8,
+                    command=self.apply_config).grid(row=3, column=4, sticky="w")
 
         volume_frame = self._frame("Volume response", 2, 0, 2)
         ttk.Checkbutton(volume_frame, text="Reduce volume when motion stops",
@@ -257,7 +300,7 @@ class VectorApp:
             ttk.Spinbox(volume_frame, from_=low, to=high, increment=step,
                         textvariable=variable, width=8, command=self.apply_config).grid(row=0, column=col + 1)
 
-        frequency_frame = self._frame("Frequency (Vector 1B commissioning)", 3, 0, 2)
+        frequency_frame = self._frame("Frequency", 3, 0, 2)
         ttk.Label(frequency_frame, text="0").grid(row=0, column=0)
         self.frequency_bar = ttk.Progressbar(frequency_frame, orient="horizontal", mode="determinate",
                                              maximum=1.0, length=520)
@@ -274,10 +317,8 @@ class VectorApp:
         ttk.Spinbox(frequency_frame, from_=1, to=10, increment=1,
                     textvariable=self.frequency_ratio, width=7,
                     command=self.apply_config).grid(row=0, column=7)
-        ttk.Checkbutton(frequency_frame, text="Send C0 to ReStim",
-                        variable=self.send_frequency).grid(row=0, column=8, padx=16)
 
-        pulse_frame = self._frame("Pulse frequency (Vector 1B commissioning)", 4, 0, 2)
+        pulse_frame = self._frame("Pulse frequency", 4, 0, 2)
         ttk.Label(pulse_frame, text="0").grid(row=0, column=0)
         self.pulse_frequency_bar = RangeBar(pulse_frame)
         self.pulse_frequency_bar.grid(row=0, column=1, padx=8)
@@ -295,10 +336,8 @@ class VectorApp:
                         to=1 if index < 2 else 10, increment=0.05 if index < 2 else 1,
                         textvariable=variable, width=7,
                         command=self.apply_config).grid(row=0, column=col + 1)
-        ttk.Checkbutton(pulse_frame, text="Send P0 to ReStim",
-                        variable=self.send_pulse_frequency).grid(row=0, column=10, padx=14)
 
-        rise_frame = self._frame("Pulse rise time (Vector 1B commissioning)", 5, 0, 2)
+        rise_frame = self._frame("Pulse rise time", 5, 0, 2)
         ttk.Label(rise_frame, text="0 sharp").grid(row=0, column=0)
         self.pulse_rise_bar = RangeBar(rise_frame)
         self.pulse_rise_bar.grid(row=0, column=1, padx=8)
@@ -315,9 +354,7 @@ class VectorApp:
                         to=1 if index < 2 else 10, increment=0.05 if index < 2 else 1,
                         textvariable=variable, width=7,
                         command=self.apply_config).grid(row=0, column=col + 1)
-        ttk.Checkbutton(rise_frame, text="Send P3 to ReStim",
-                        variable=self.send_pulse_rise).grid(row=0, column=10, padx=14)
-        width_frame = self._frame("Pulse width (Vector 1B commissioning)", 6, 0, 2)
+        width_frame = self._frame("Pulse width", 6, 0, 2)
         ttk.Label(width_frame, text="0 narrow").grid(row=0, column=0)
         self.pulse_width_bar = RangeBar(width_frame)
         self.pulse_width_bar.grid(row=0, column=1, padx=8)
@@ -334,10 +371,8 @@ class VectorApp:
                         to=1 if index < 2 else 10, increment=0.05 if index < 2 else 1,
                         textvariable=variable, width=7,
                         command=self.apply_config).grid(row=0, column=col + 1)
-        ttk.Checkbutton(width_frame, text="Send P1 to ReStim",
-                        variable=self.send_pulse_width).grid(row=0, column=10, padx=14)
 
-        prostate = self._frame("Prostate output (second ReStim)", 7, 0, 2)
+        prostate = self._frame("Prostate controls", 7, 0, 2)
         self.prostate_bars = {}
         self.prostate_values = {}
         for row, (label, key) in enumerate((("Alpha-prostate", "alpha_prostate"),
@@ -374,7 +409,92 @@ class VectorApp:
                     textvariable=self.prostate_phase_degrees, width=7,
                     command=self.apply_config).grid(row=2, column=8)
 
-        controller = self._frame("Xbox controller (keyboard-mapped profile)", 8, 0, 2)
+        four_phase = self._frame("Four-phase primary controls", 8, 0, 2)
+        self.four_phase_bars, self.four_phase_values = [], []
+        for row, label in enumerate(("A — top", "B", "C", "D — bottom")):
+            ttk.Label(four_phase, text=label, width=18).grid(row=row, column=0, sticky="w")
+            ttk.Label(four_phase, text="0").grid(row=row, column=1)
+            bar = ttk.Progressbar(four_phase, orient="horizontal", mode="determinate",
+                                  maximum=1.0, length=520)
+            bar.grid(row=row, column=2, padx=8)
+            ttk.Label(four_phase, text="1").grid(row=row, column=3)
+            value = tk.StringVar(value="0.0000")
+            ttk.Label(four_phase, textvariable=value, width=8,
+                      font=("TkDefaultFont", 10, "bold")).grid(row=row, column=4, padx=8)
+            self.four_phase_bars.append(bar); self.four_phase_values.append(value)
+        ttk.Label(four_phase,
+                  text="A→B→C→D follows buffered L0; adjacent equal-power crossfade. NOT sent to ReStim.",
+                  foreground="#9b4b00").grid(row=0, column=5, rowspan=4, sticky="w", padx=18)
+        ttk.Label(four_phase, text="Return depth").grid(row=4, column=0, sticky="w")
+        ttk.Spinbox(four_phase, from_=0, to=1, increment=.05,
+                    textvariable=self.four_phase_return_depth, width=7).grid(
+                        row=4, column=1, sticky="w")
+        ttk.Label(four_phase, text="Signed: primary +1.00 | return −depth | unused 0.00") \
+            .grid(row=4, column=2, columnspan=4, sticky="w", padx=8)
+        ttk.Checkbutton(four_phase, text="Invert path", variable=self.four_phase_invert).grid(row=5, column=0, sticky="w")
+        ttk.Label(four_phase, text="Volume ceiling").grid(row=5, column=1, sticky="e")
+        ttk.Spinbox(four_phase, from_=0, to=1, increment=.05, textvariable=self.four_phase_volume_ceiling, width=7).grid(row=5, column=2, sticky="w")
+        ttk.Checkbutton(four_phase, text="Slow volume overlay", variable=self.four_phase_volume_modulation).grid(row=5, column=3, sticky="w")
+        ttk.Label(four_phase, text="Headroom").grid(row=5, column=4, sticky="e")
+        ttk.Spinbox(four_phase, from_=0, to=1, increment=.05, textvariable=self.four_phase_volume_headroom, width=7).grid(row=5, column=5, sticky="w")
+        ttk.Label(four_phase, text="Overlay cycle (min)").grid(row=6, column=4, sticky="e")
+        ttk.Spinbox(four_phase, from_=.5, to=30, increment=.5, textvariable=self.four_phase_volume_cycle, width=7).grid(row=6, column=5, sticky="w")
+        ttk.Label(four_phase, text="Crossover width").grid(row=6, column=0, sticky="w")
+        ttk.Spinbox(four_phase, from_=.05, to=1, increment=.05,
+                    textvariable=self.four_phase_crossover_width, width=7).grid(row=6, column=1, sticky="w")
+        ttk.Label(four_phase, text="Curve").grid(row=6, column=2, sticky="e", padx=(8, 4))
+        ttk.Combobox(four_phase, textvariable=self.four_phase_crossover_curve,
+                     values=("Cosine", "Linear", "Ease In", "Ease Out", "S-curve"),
+                     state="readonly", width=10).grid(row=6, column=3, sticky="w")
+        ttk.Label(four_phase, text="Sharpness").grid(row=7, column=0, sticky="w")
+        ttk.Spinbox(four_phase, from_=.2, to=5, increment=.1,
+                    textvariable=self.four_phase_crossover_sharpness, width=7).grid(row=7, column=1, sticky="w")
+        ttk.Separator(four_phase, orient="horizontal").grid(
+            row=8, column=0, columnspan=6, sticky="ew", pady=7)
+        self.four_phase_signed_values = []
+        for offset, label in enumerate(("A signed", "B signed", "C signed", "D signed")):
+            row = offset + 9
+            ttk.Label(four_phase, text=label, width=18).grid(row=row, column=0, sticky="w")
+            value = tk.StringVar(value="+0.0000")
+            ttk.Label(four_phase, textvariable=value, width=10,
+                      font=("TkDefaultFont", 10, "bold")).grid(row=row, column=1, sticky="w")
+            self.four_phase_signed_values.append(value)
+        ttk.Label(four_phase, text="Conceptual relative potentials (−1 to +1); not T-code") \
+            .grid(row=9, column=2, columnspan=4, sticky="w", padx=8)
+        ttk.Separator(four_phase, orient="horizontal").grid(
+            row=13, column=0, columnspan=6, sticky="ew", pady=7)
+        self.four_phase_potential_bars, self.four_phase_potential_values = [], []
+        for offset, label in enumerate(("E1 / A potential", "E2 / B potential",
+                                        "E3 / C potential", "E4 / D potential")):
+            row = offset + 14
+            ttk.Label(four_phase, text=label, width=18).grid(row=row, column=0, sticky="w")
+            ttk.Label(four_phase, text="0").grid(row=row, column=1)
+            bar = ttk.Progressbar(four_phase, orient="horizontal", mode="determinate",
+                                  maximum=1.0, length=520)
+            bar.grid(row=row, column=2, padx=8)
+            ttk.Label(four_phase, text="1").grid(row=row, column=3)
+            value = tk.StringVar(value="0.0000")
+            ttk.Label(four_phase, textvariable=value, width=8,
+                      font=("TkDefaultFont", 10, "bold")).grid(row=row, column=4, padx=8)
+            self.four_phase_potential_bars.append(bar)
+            self.four_phase_potential_values.append(value)
+        self.four_phase_roles = tk.StringVar(value="Primary -- | preferred return --")
+        ttk.Label(four_phase, textvariable=self.four_phase_roles,
+                  foreground="#9b4b00").grid(row=14, column=5, rowspan=4, sticky="w", padx=18)
+        ttk.Checkbutton(four_phase,
+                        text="Send E1–E4 visual test (FOC-Stim hardware MUST be disconnected)",
+                        variable=self.send_four_phase_visual,
+                        command=self._four_phase_send_toggle).grid(
+                            row=18, column=0, columnspan=4, sticky="w", pady=(8, 2))
+        ttk.Label(four_phase, textvariable=self.four_phase_status).grid(
+            row=18, column=4, columnspan=2, sticky="w", padx=8)
+        # The internal commissioning plots remain available to the refresh code,
+        # but are intentionally hidden in the publication UI.
+        for hidden_row in (*range(0, 5), *range(8, 14), 18):
+            for widget in four_phase.grid_slaves(row=hidden_row):
+                widget.grid_remove()
+
+        controller = self._frame("Xbox controller", 9, 0, 2)
         ttk.Checkbutton(controller, text="Enable controller controls",
                         variable=self.controller_enabled,
                         command=self._controller_enabled_changed).grid(row=0, column=0, sticky="w", padx=6)
@@ -397,7 +517,7 @@ class VectorApp:
                   text="W/S Frequency ramp ±  •  A/D Pulse frequency range −/+  •  I/K Rise range +/−  •  J/L Width range −/+  •  Enter Resume  •  Space Neutral  •  Esc Stop") \
             .grid(row=1, column=0, columnspan=6, sticky="w", padx=6, pady=(6, 2))
 
-        variety = self._frame("Rolling Variety", 9, 0, 2)
+        variety = self._frame("Rolling Variety", 10, 0, 2)
         ttk.Checkbutton(variety, text="Enable rolling variety", variable=self.variety_enabled,
                         command=self._variety_toggle).grid(row=0, column=0, padx=6)
         for column, (label, variable, cycle) in enumerate((
@@ -413,13 +533,14 @@ class VectorApp:
         ttk.Label(variety, textvariable=self.variety_status,
                   font=("TkDefaultFont", 10, "bold")).grid(row=0, column=3, columnspan=3, padx=18)
 
-        controls = self._frame("Commissioning controls", 10, 0, 2)
+        controls = self._frame("Commissioning controls", 11, 0, 2)
         ttk.Button(controls, text="Neutral", command=self.neutral, width=18).pack(side="left", padx=12)
         ttk.Button(controls, text="Resume", command=self.resume, width=18).pack(side="left", padx=12)
         ttk.Button(controls, text="STOP", command=self.stop, width=18).pack(side="left", padx=12)
         ttk.Label(controls, text="Test without FOCstim hardware connected.").pack(side="right", padx=12)
+        self.sections["Commissioning controls"].grid_remove()
 
-        diagnostics = self._frame("Live diagnostics", 11, 0, 2)
+        diagnostics = self._frame("Live diagnostics", 12, 0, 2)
         diagnostics.columnconfigure(1, weight=1)
         diagnostics.columnconfigure(3, weight=1)
         labels = (
@@ -473,6 +594,16 @@ class VectorApp:
             self.prostate_restim.connect(self.prostate_host.get().strip(), self.prostate_port.get())
         except OSError as exc:
             self._set_prostate_status(f"Connection failed: {exc}")
+
+    def _four_phase_send_toggle(self) -> None:
+        if not self.send_four_phase_visual.get():
+            return
+        if not messagebox.askyesno(
+                "Enable four-phase visual test",
+                "Confirm FOC-Stim stimulation hardware is disconnected.\n\n"
+                "Vector will send E1–E4 commands to the connected four-phase ReStim "
+                "instance for visual commissioning only."):
+            self.send_four_phase_visual.set(False)
 
     def _bind_controller_keys(self) -> None:
         for key, action in (("<w>", lambda: self._adjust_frequency_ramp(1)),
@@ -682,7 +813,10 @@ class VectorApp:
                                   prostate_stroke_threshold=self.prostate_threshold.get(),
                                   prostate_volume_multiplier=self.prostate_volume_multiplier.get(),
                                   prostate_rest_level=self.prostate_rest_level.get(),
-                                  prostate_phase_degrees=self.prostate_phase_degrees.get())
+                                  prostate_phase_degrees=self.prostate_phase_degrees.get(),
+                                  jitter_enabled=self.jitter_enabled.get(),
+                                  jitter_amplitude=self.jitter_amplitude.get(),
+                                  jitter_cycle_seconds=self.jitter_cycle_seconds.get())
         except (tk.TclError, ValueError) as exc:
             messagebox.showerror("Invalid settings", str(exc))
 
@@ -708,7 +842,7 @@ class VectorApp:
             "1. Leave stimulation hardware disconnected.\n"
             "2. In MFP, send L0 by UDP or TCP to 127.0.0.1:12345.\n"
             "3. Set the MFP script offset to -2.00 seconds.\n"
-            "4. Enable ReStim TCP on port 12347.\n"
+            "4. Enable the primary ReStim WebSocket server and enter its port in Vector.\n"
             "5. For prostate output, run a second ReStim WebSocket server on port 12350.\n"
             "6. Start the listener, connect both outputs, then select Start / Resume.\n\n"
             "Fine-tune MFP around -2.00 seconds while leaving Vector's delay at 2.00 seconds.\n\n"
@@ -716,11 +850,27 @@ class VectorApp:
         )
 
     def _send_sample(self, sample: OutputSample) -> None:
-        self.restim.send(sample.alpha, sample.beta, sample.volume,
-                         sample.frequency if self.send_frequency.get() else None,
-                         sample.pulse_frequency if self.send_pulse_frequency.get() else None,
-                         sample.pulse_rise_time if self.send_pulse_rise.get() else None,
-                         sample.pulse_width if self.send_pulse_width.get() else None)
+        path_l0 = 1.0 - sample.output_l0 if self.four_phase_invert.get() else sample.output_l0
+        delta = path_l0 - self._four_phase_send_last_l0
+        if abs(delta) > 0.0005:
+            self._four_phase_send_direction = 1 if delta > 0 else -1
+        self._four_phase_send_last_l0 = path_l0
+        electrodes = restim_crossfade(
+            path_l0, self._four_phase_send_direction,
+            self.four_phase_return_depth.get(), self.four_phase_crossover_width.get(),
+            self.four_phase_crossover_curve.get(),
+            self.four_phase_crossover_sharpness.get())
+        ceiling = min(1.0, max(0.0, self.four_phase_volume_ceiling.get()))
+        if self.four_phase_volume_modulation.get():
+            cycle = max(.5, self.four_phase_volume_cycle.get()) * 60.0
+            wave = (1.0 - math.cos((sample.calculated_at % cycle)
+                                   * 2.0 * math.pi / cycle)) / 2.0
+            ceiling = min(1.0, ceiling + self.four_phase_volume_headroom.get() * wave)
+        primary_volume = min(1.0, max(0.0,
+            ceiling * sample.volume / max(self.volume.get(), 1e-9)))
+        self.restim.send_primary(
+            sample.alpha, sample.beta, electrodes, primary_volume, sample.frequency,
+            sample.pulse_frequency, sample.pulse_rise_time, sample.pulse_width)
         self.prostate_restim.send_prostate(
             sample.alpha_prostate, sample.beta_prostate, sample.volume_prostate,
             sample.frequency, sample.pulse_frequency, sample.pulse_width,
@@ -729,7 +879,8 @@ class VectorApp:
     def neutral(self) -> None:
         self.apply_config()
         self.engine.neutral()
-        self.restim.send(0.5, 0.5, self.volume.get())
+        self.restim.send_primary(0.5, 0.5, (0.5, 0.5, 0.5, 0.5),
+                                 self.volume.get(), 0.5, 0.5, 0.5, 0.5)
         self.prostate_restim.send_prostate(0.5, 0.5, self.volume.get(), 0.5, 0.5, 0.5, 0.5)
 
     def resume(self) -> None:
@@ -738,7 +889,8 @@ class VectorApp:
 
     def stop(self) -> None:
         self.engine.stop()
-        self.restim.send(0.5, 0.5, 0.0)
+        self.restim.send_primary(0.5, 0.5, (0.5, 0.5, 0.5, 0.5),
+                                 0.0, 0.5, 0.5, 0.5, 0.5)
         self.prostate_restim.send_prostate(0.5, 0.5, 0.0, 0.5, 0.5, 0.5, 0.5)
 
     def _refresh(self) -> None:
@@ -782,6 +934,35 @@ class VectorApp:
                            ("volume_prostate", diag.volume_prostate)):
             self.prostate_bars[key]["value"] = value
             self.prostate_values[key].set(f"{value:.4f}")
+        path_l0 = 1.0 - diag.output_l0 if self.four_phase_invert.get() else diag.output_l0
+        four_phase = vertical_crossfade(path_l0)
+        for bar, variable, value in zip(self.four_phase_bars, self.four_phase_values,
+                                        four_phase):
+            bar["value"] = value
+            variable.set(f"{value:.4f}")
+        delta = path_l0 - self._four_phase_last_l0
+        if abs(delta) > 0.0005:
+            self._four_phase_direction = 1 if delta > 0 else -1
+        self._four_phase_last_l0 = path_l0
+        signed, primary_index, return_index = directed_signed(
+            path_l0, self._four_phase_direction,
+            self.four_phase_return_depth.get())
+        potentials = restim_crossfade(path_l0, self._four_phase_direction,
+                                      self.four_phase_return_depth.get(),
+                                      self.four_phase_crossover_width.get(),
+                                      self.four_phase_crossover_curve.get(),
+                                      self.four_phase_crossover_sharpness.get())
+        for variable, value in zip(self.four_phase_signed_values, signed):
+            variable.set(f"{value:+.4f}")
+        for bar, variable, value in zip(self.four_phase_potential_bars,
+                                        self.four_phase_potential_values, potentials):
+            bar["value"] = value
+            variable.set(f"{value:.4f}")
+        primary, preferred_return = potential_roles(
+            potentials, primary_index, return_index)
+        self.four_phase_roles.set(
+            f"{primary}→{preferred_return} | primary {primary} | preferred return "
+            f"{preferred_return}")
         if self.listener.connection_label() in ("Receiving", "Listening"):
             current = self.listener.connection_label()
             if not self.mfp_status.get().startswith("MFP "):
@@ -791,12 +972,16 @@ class VectorApp:
             "ReStim output": f"Primary: {self.restim_status.get()} | Prostate: {self.prostate_status.get()}",
             "Motion": f"{self.mode.get()} | {self.rate.get()} Hz | {self.lookahead.get():.2f} s delay",
             "Volume response": f"Ceiling {self.volume.get() * 100:.0f}% | rest {self.volume_rest_level.get() * 100:.0f}%",
-            "Frequency (Vector 1B commissioning)": f"{diag.frequency:.3f} | ramp {self.frequency_ramp_level.get():.2f}",
-            "Pulse frequency (Vector 1B commissioning)": f"{diag.pulse_frequency:.3f} | range {self.pulse_frequency_min.get():.2f}-{self.pulse_frequency_max.get():.2f}",
-            "Pulse rise time (Vector 1B commissioning)": f"{diag.pulse_rise_time:.3f} | range {self.pulse_rise_min.get():.2f}-{self.pulse_rise_max.get():.2f}",
-            "Pulse width (Vector 1B commissioning)": f"{diag.pulse_width:.3f} | range {self.pulse_width_min.get():.2f}-{self.pulse_width_max.get():.2f}",
-            "Prostate output (second ReStim)": f"alpha {diag.alpha_prostate:.3f} beta {diag.beta_prostate:.3f} volume {diag.volume_prostate * 100:.0f}% | phase {self.prostate_phase_degrees.get():+.0f} degrees",
-            "Xbox controller (keyboard-mapped profile)": f"{self.controller_status.get()} | step {self.controller_fine_step.get():.2f}",
+            "Frequency": f"{diag.frequency:.3f} | ramp {self.frequency_ramp_level.get():.2f}",
+            "Pulse frequency": f"{diag.pulse_frequency:.3f} | range {self.pulse_frequency_min.get():.2f}-{self.pulse_frequency_max.get():.2f}",
+            "Pulse rise time": f"{diag.pulse_rise_time:.3f} | range {self.pulse_rise_min.get():.2f}-{self.pulse_rise_max.get():.2f}",
+            "Pulse width": f"{diag.pulse_width:.3f} | range {self.pulse_width_min.get():.2f}-{self.pulse_width_max.get():.2f}",
+            "Prostate controls": f"alpha {diag.alpha_prostate:.3f} beta {diag.beta_prostate:.3f} volume {diag.volume_prostate * 100:.0f}% | phase {self.prostate_phase_degrees.get():+.0f} degrees",
+            "Four-phase primary controls": (
+                f"L0 {path_l0:.3f} | A {four_phase[0]:.2f} B {four_phase[1]:.2f} "
+                f"C {four_phase[2]:.2f} D {four_phase[3]:.2f} | "
+                f"primary {primary} return {preferred_return}"),
+            "Xbox controller": f"{self.controller_status.get()} | step {self.controller_fine_step.get():.2f}",
             "Rolling Variety": self.variety_status.get(),
             "Commissioning controls": diag.state,
             "Live diagnostics": (f"{diag.state} | buffer {diag.buffer_fill} | delay {diag.actual_queue_delay:.4f} s"
