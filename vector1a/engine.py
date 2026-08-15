@@ -9,6 +9,7 @@ import time
 from typing import Callable
 
 from .motion import MotionCalculator, MotionMode, MotionParameters, SegmentState
+from .variety import speed_linked_depth
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class OutputSample:
     volume_prostate: float
     reversal_distance_seconds: float = math.inf
     stroke_progress: float = 0.5
+    variation_depth: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,7 @@ class Diagnostics:
     volume_prostate: float = 0.0
     reversal_distance_seconds: float = math.inf
     stroke_progress: float = 0.5
+    variation_depth: float = 0.0
 
 
 class VectorEngine:
@@ -118,6 +121,11 @@ class VectorEngine:
         self.jitter_enabled = False
         self.jitter_amplitude = 0.02
         self.jitter_cycle_seconds = 1.0
+        self.speed_linked_variation = True
+        self.variation_full_speed_percent = 35.0
+        self.variation_fade_seconds = 0.75
+        self._variation_depth = 0.0
+        self._variation_updated_at = now
         self._input_count = 0
         self._output_count = 0
         self._sequence = 0
@@ -150,7 +158,10 @@ class VectorEngine:
                   prostate_rest_level: float = 0.7,
                   prostate_phase_degrees: float = 0.0,
                   jitter_enabled: bool = False, jitter_amplitude: float = 0.02,
-                  jitter_cycle_seconds: float = 1.0) -> None:
+                  jitter_cycle_seconds: float = 1.0,
+                  speed_linked_variation: bool = True,
+                  variation_full_speed_percent: float = 35.0,
+                  variation_fade_seconds: float = .75) -> None:
         with self._lock:
             mode_changed = mode != self.mode
             self.rate_hz = max(1, min(200, int(rate_hz)))
@@ -185,6 +196,10 @@ class VectorEngine:
             self.jitter_enabled = bool(jitter_enabled)
             self.jitter_amplitude = min(.20, max(0.0, float(jitter_amplitude)))
             self.jitter_cycle_seconds = min(30.0, max(.05, float(jitter_cycle_seconds)))
+            self.speed_linked_variation = bool(speed_linked_variation)
+            self.variation_full_speed_percent = min(
+                100.0, max(1.0, float(variation_full_speed_percent)))
+            self.variation_fade_seconds = min(10.0, max(.05, float(variation_fade_seconds)))
             if mode_changed and self._state in ("Buffering", "Running"):
                 # Never release samples calculated by a previously selected
                 # geometry under a newly-labelled UI state.
@@ -270,14 +285,16 @@ class VectorEngine:
             if (sample.mode == MotionMode.RESTIM_ORIGINAL
                     and stroke.start_time <= sample.calculated_at <= stroke.end_time):
                 alpha, beta, position, speed = self.calculator.calculate(
-                    MotionMode.RESTIM_ORIGINAL, self._jitter_segment(stroke),
+                    MotionMode.RESTIM_ORIGINAL,
+                    self._jitter_segment(stroke, sample.variation_depth),
                     sample.calculated_at, self.params
                 )
                 sample = replace(sample, output_l0=position, speed_percent=speed,
                                  alpha=alpha, beta=beta)
             if stroke.start_time <= sample.calculated_at <= stroke.end_time:
                 pa, pb = self._calculate_prostate(
-                    self._jitter_segment(stroke), sample.calculated_at)
+                    self._jitter_segment(stroke, sample.variation_depth),
+                    sample.calculated_at)
                 sample = replace(sample, alpha_prostate=pa, beta_prostate=pb)
             rewritten.append((due_at, sequence, sample))
         self._queue = rewritten
@@ -343,7 +360,9 @@ class VectorEngine:
             calculation_segment = (self._stroke_for_time(scheduled_at)
                                    if self.mode == MotionMode.RESTIM_ORIGINAL
                                    else self._segment)
-            calculation_segment = self._jitter_segment(calculation_segment)
+            variation_depth = self._update_variation_depth(
+                scheduled_at, calculation_segment.speed_percent)
+            calculation_segment = self._jitter_segment(calculation_segment, variation_depth)
             alpha, beta, output_l0, speed = self.calculator.calculate(
                 self.mode, calculation_segment, scheduled_at, self.params)
             output_volume = self._calculate_volume(scheduled_at, speed)
@@ -351,7 +370,8 @@ class VectorEngine:
             pulse_frequency = self._calculate_pulse_frequency(scheduled_at, speed, alpha)
             pulse_rise_time = self._calculate_pulse_rise_time(speed)
             pulse_width = self._calculate_pulse_width(scheduled_at, speed, output_l0)
-            prostate_segment = self._jitter_segment(self._stroke_for_time(scheduled_at))
+            prostate_segment = self._jitter_segment(
+                self._stroke_for_time(scheduled_at), variation_depth)
             alpha_prostate, beta_prostate = self._calculate_prostate(
                 prostate_segment, scheduled_at)
             volume_prostate = self._calculate_prostate_volume(scheduled_at, speed)
@@ -366,24 +386,40 @@ class VectorEngine:
                 alpha_prostate, beta_prostate, volume_prostate,
                 self._nearest_reversal_distance(scheduled_at),
                 self._stroke_progress(prostate_segment, scheduled_at),
+                variation_depth,
             )
             heapq.heappush(self._queue, (sample.due_at, sample.sequence, sample))
 
-    def _jitter_offset(self, at_time: float) -> float:
+    def _update_variation_depth(self, at_time: float, speed_percent: float) -> float:
+        target = (speed_linked_depth(speed_percent, self.variation_full_speed_percent)
+                  if self.speed_linked_variation else 1.0)
+        elapsed = max(0.0, at_time - self._variation_updated_at)
+        self._variation_updated_at = at_time
+        blend = 1.0 - math.exp(-elapsed / self.variation_fade_seconds)
+        self._variation_depth += (target - self._variation_depth) * blend
+        if target <= 1e-9 and self._variation_depth < 1e-4:
+            self._variation_depth = 0.0
+        return min(1.0, max(0.0, self._variation_depth))
+
+    def _jitter_offset(self, at_time: float, depth: float = 1.0) -> float:
         """Deterministic band-limited texture; never alters input stroke detection."""
         if not self.jitter_enabled or self.jitter_amplitude <= 0.0:
             return 0.0
         phase = 2.0 * math.pi * at_time / self.jitter_cycle_seconds
         wave = .65 * math.sin(phase) + .35 * math.sin(phase / .57 + 1.7)
-        return self.jitter_amplitude * wave
+        return self.jitter_amplitude * min(1.0, max(0.0, depth)) * wave
 
-    def _jitter_segment(self, segment: SegmentState) -> SegmentState:
+    def _jitter_segment(self, segment: SegmentState, depth: float | None = None) -> SegmentState:
         if not self.jitter_enabled or self.jitter_amplitude <= 0.0:
             return segment
+        if depth is None:
+            depth = (speed_linked_depth(segment.speed_percent,
+                                        self.variation_full_speed_percent)
+                     if self.speed_linked_variation else 1.0)
         start = min(1.0, max(0.0, segment.start_position
-                             + self._jitter_offset(segment.start_time)))
+                             + self._jitter_offset(segment.start_time, depth)))
         end = min(1.0, max(0.0, segment.end_position
-                           + self._jitter_offset(segment.end_time)))
+                           + self._jitter_offset(segment.end_time, depth)))
         return replace(segment, start_position=start, end_position=end)
 
     def _release_due(self, now: float) -> None:
@@ -410,6 +446,7 @@ class VectorEngine:
                     sample.alpha_prostate, sample.beta_prostate, sample.volume_prostate,
                     sample.reversal_distance_seconds,
                     sample.stroke_progress,
+                    sample.variation_depth,
                 )
         with self._lock:
             if not due:

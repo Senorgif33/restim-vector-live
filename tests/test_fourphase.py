@@ -1,16 +1,57 @@
 import math
 import unittest
 
-from vector1a.fourphase import (adaptive_crossover_width, crossover_blend,
+from vector1a.fourphase import (adaptive_crossover_width, apply_group_delay, crossover_blend,
                                 directed_signed, directional_crossover_profile,
                                 map_electrode_order,
-                                morph_electrode_order, normalize_signed, pair_morph,
+                                interpolate_electrodes, morph_electrode_order, moving_sequence_window,
+                                normalize_signed, pair_morph,
                                 potential_roles, pair_swapped_order, restim_crossfade,
                                 reversal_emphasis_envelope, sequence_cycle_stage, spatial_response,
                                 stroke_phase_crossover, vertical_crossfade)
 
 
 class FourPhaseCommissioningTests(unittest.TestCase):
+    def test_moving_sequence_window_returns_to_base_at_endpoints(self):
+        for progress in (0.0, 1.0):
+            source, target, amount = moving_sequence_window("ABDC", 1, progress, .8, 1.0)
+            self.assertEqual((source, target), ("ABDC", "BACD"))
+            self.assertEqual(amount, 0.0)
+
+    def test_moving_sequence_window_peaks_at_midstroke(self):
+        source, target, amount = moving_sequence_window("ABDC", 1, .5, .6, .8)
+        self.assertEqual((source, target), ("ABDC", "BACD"))
+        self.assertAlmostEqual(amount, .6)
+
+    def test_moving_sequence_window_reverses_neighbour_by_direction(self):
+        self.assertEqual(moving_sequence_window("ABDC", 1, .5)[:2], ("ABDC", "BACD"))
+        self.assertEqual(moving_sequence_window("ABDC", -1, .5)[:2], ("ABDC", "ABCD"))
+
+    def test_moving_sequence_window_is_continuous_and_bounded(self):
+        amounts = [moving_sequence_window("ABCD", 1, step / 100, .75, .6)[2]
+                   for step in range(101)]
+        self.assertTrue(all(0.0 <= amount <= .75 for amount in amounts))
+        self.assertLess(max(abs(a - b) for a, b in zip(amounts, amounts[1:])), .05)
+
+    def test_electrode_history_interpolates_and_clamps(self):
+        history = [(0.0, (0.0, .1, .2, .3)),
+                   (1.0, (1.0, .9, .8, .7))]
+        self.assertEqual(interpolate_electrodes(history, -1), history[0][1])
+        self.assertEqual(interpolate_electrodes(history, 2), history[-1][1])
+        self.assertEqual(interpolate_electrodes(history, .5), (.5, .5, .5, .5))
+
+    def test_positive_group_delay_delays_only_ab(self):
+        history = [(0.0, (0.0, 0.0, 0.0, 0.0)),
+                   (1.0, (1.0, 1.0, 1.0, 1.0))]
+        self.assertEqual(apply_group_delay((1.0, 1.0, 1.0, 1.0), history, 1.0, .5),
+                         (.5, .5, 1.0, 1.0))
+
+    def test_negative_group_delay_delays_only_cd(self):
+        history = [(0.0, (0.0, 0.0, 0.0, 0.0)),
+                   (1.0, (1.0, 1.0, 1.0, 1.0))]
+        self.assertEqual(apply_group_delay((1.0, 1.0, 1.0, 1.0), history, 1.0, -.5),
+                         (1.0, 1.0, .5, .5))
+
     def test_stroke_phase_crossover_blends_smoothly_and_is_bounded(self):
         self.assertEqual(stroke_phase_crossover(.5, 0, False, .5, 1.5), (.5, "off"))
         start, start_name = stroke_phase_crossover(.5, 0, True, .5, 1.5)

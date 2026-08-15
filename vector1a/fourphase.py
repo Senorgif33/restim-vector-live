@@ -109,6 +109,25 @@ def sequence_cycle_stage(base_order: str, cycle_position: float,
     return source, destination, eased
 
 
+def moving_sequence_window(base_order: str, direction: int, stroke_progress: float,
+                           depth: float = .5, width: float = 1.0
+                           ) -> tuple[str, str, float]:
+    """Return a smooth per-stroke morph into the neighbouring sequence."""
+    if base_order not in ELECTRODE_ORDERS:
+        base_order = ELECTRODE_ORDERS[0]
+    index = ELECTRODE_ORDERS.index(base_order)
+    target = ELECTRODE_ORDERS[(index + (1 if direction >= 0 else -1))
+                              % len(ELECTRODE_ORDERS)]
+    progress = min(1.0, max(0.0, stroke_progress))
+    width = min(1.0, max(.1, width))
+    distance = abs(progress - .5)
+    if distance >= width / 2.0:
+        envelope = 0.0
+    else:
+        envelope = (1.0 + math.cos(distance / (width / 2.0) * math.pi)) / 2.0
+    return base_order, target, min(1.0, max(0.0, depth)) * envelope
+
+
 def map_electrode_order(values: tuple[float, float, float, float], order: str
                         ) -> tuple[float, float, float, float]:
     """Map logical A-B-C-D path positions onto a physical electrode order."""
@@ -357,3 +376,35 @@ def potential_roles(values: tuple[float, float, float, float], primary: int | No
     labels = "ABCD"
     return (labels[primary if primary is not None else values.index(max(values))],
             labels[preferred_return if preferred_return is not None else values.index(min(values))])
+
+
+def interpolate_electrodes(
+        history: list[tuple[float, tuple[float, float, float, float]]],
+        target_time: float) -> tuple[float, float, float, float]:
+    """Interpolate a four-electrode history without extrapolating its endpoints."""
+    if not history:
+        return (.5, .5, .5, .5)
+    if target_time <= history[0][0]:
+        return history[0][1]
+    if target_time >= history[-1][0]:
+        return history[-1][1]
+    for (left_time, left), (right_time, right) in zip(history, history[1:]):
+        if target_time <= right_time:
+            span = right_time - left_time
+            amount = 0.0 if span <= 1e-12 else (target_time - left_time) / span
+            return tuple(a + (b - a) * amount for a, b in zip(left, right))
+    return history[-1][1]
+
+
+def apply_group_delay(
+        current: tuple[float, float, float, float],
+        history: list[tuple[float, tuple[float, float, float, float]]],
+        at_time: float, signed_delay_seconds: float
+        ) -> tuple[float, float, float, float]:
+    """Delay A/B when positive or C/D when negative, preserving the other group."""
+    if abs(signed_delay_seconds) <= 1e-9 or not history:
+        return current
+    delayed = interpolate_electrodes(history, at_time - abs(signed_delay_seconds))
+    if signed_delay_seconds > 0:
+        return delayed[0], delayed[1], current[2], current[3]
+    return current[0], current[1], delayed[2], delayed[3]

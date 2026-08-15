@@ -4,7 +4,7 @@ Vector 1A is a live bridge from one MultiFunPlayer `L0` T-code stream to one or
 two ReStim instances. It converts streamed 1D motion into synchronized alpha,
 beta, volume, frequency and pulse controls at a stable internal cadence.
 
-Current development build: **1.6.0-alpha32**.
+Current development build: **1.6.0-alpha36**.
 
 > [!CAUTION]
 > Commission with ReStim's graphical display and stimulation hardware
@@ -53,6 +53,20 @@ second after they begin.
 - Optional stroke-phase texture smoothly varies four-phase crossover width
   between independently adjustable acceleration and deceleration responses.
   Buffered stroke progress preserves continuity and output timing.
+- Optional speed-linked variation depth fades jitter, continuous Rolling
+  Variety modulation, spatial-response strength, adaptive/directional crossover,
+  stroke-phase texture, reversal emphasis and slow volume overlay toward zero
+  during pauses. It introduces them smoothly during slow motion and reaches
+  their configured depth at an adjustable active-motion speed.
+- Optional AB/CD timing separation delays physical A/B or C/D by up to 300 ms
+  using interpolated output history. Positive values make A/B later; negative
+  values make C/D later. Changes fade smoothly and can follow the speed-linked
+  variation-depth envelope without changing Vector's synchronization queue.
+- Optional moving sequence window follows each stroke: it begins and ends at
+  the selected signalling sequence, smoothly biases toward the next sequence
+  on forward motion or the previous sequence on reverse motion around
+  mid-stroke, then returns. Depth and window width are adjustable; the slow
+  sequence carousel takes priority when both options are selected.
 - Dynamic volume reduction at rest and smooth return during movement.
 - Live frequency, pulse-frequency, rise-time and pulse-width commissioning.
 - Second ReStim output with tear-shaped prostate alpha/beta and independent
@@ -62,6 +76,13 @@ second after they begin.
 - Keyboard-mapped Xbox controls and equal-length live range displays.
 - Collapsible panels with live summaries.
 - Persistent user settings and an in-app setup guide.
+- Background ReStim connection recovery remains active even while output is
+  stopped. Vector detects silently closed WebSockets, reconnects automatically,
+  sends a zero-volume neutral frame before resuming live output, and records the
+  recovery in a copyable timestamped connection log.
+- MFP diagnostics distinguish a healthy listener with no recent L0 data from a
+  listener transport failure; a quiet or paused script is not restarted merely
+  because its values have stopped changing.
 - Direct Windows Xbox controller input remains active when another window has
   focus; keyboard mappings remain available as a fallback.
 - Rolling Variety smoothly modulates selected bounded controls over a

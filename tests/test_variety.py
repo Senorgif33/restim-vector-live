@@ -1,9 +1,17 @@
 import unittest
 
-from vector1a.variety import fit_range_for_travel, rolling_offset, rolling_value
+from vector1a.variety import (fit_range_for_travel, rolling_offset, rolling_value,
+                              speed_linked_depth)
 
 
 class VarietyTests(unittest.TestCase):
+    def test_speed_linked_depth_is_smooth_bounded_and_reaches_endpoints(self):
+        self.assertEqual(speed_linked_depth(0, 40), 0.0)
+        self.assertAlmostEqual(speed_linked_depth(20, 40), .5)
+        self.assertEqual(speed_linked_depth(40, 40), 1.0)
+        self.assertEqual(speed_linked_depth(100, 40), 1.0)
+        values = [speed_linked_depth(speed, 40) for speed in range(101)]
+        self.assertEqual(values, sorted(values))
     def test_frequency_cycle_has_soft_expected_extents(self):
         self.assertAlmostEqual(rolling_value(0, 4, .5, 1), 1.0)
         self.assertAlmostEqual(rolling_value(120, 4, .5, 1), .5)

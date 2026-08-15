@@ -63,6 +63,18 @@ class MotionTests(unittest.TestCase):
 
 
 class QueueTests(unittest.TestCase):
+    def test_variation_depth_fades_with_speed_and_can_be_disabled(self):
+        engine = VectorEngine(lambda sample: None, clock=lambda: 0.0)
+        engine.variation_fade_seconds = .1
+        self.assertEqual(engine._update_variation_depth(0.0, 0.0), 0.0)
+        active = engine._update_variation_depth(1.0, 100.0)
+        self.assertGreater(active, .99)
+        fading = engine._update_variation_depth(1.1, 0.0)
+        self.assertGreater(fading, 0.0)
+        self.assertLess(fading, active)
+        engine.speed_linked_variation = False
+        self.assertGreater(engine._update_variation_depth(2.0, 0.0), .99)
+
     def test_jitter_is_optional_bounded_and_does_not_change_raw_l0(self):
         sent = []
         engine = VectorEngine(sent.append, rate_hz=50, lookahead_seconds=.1,

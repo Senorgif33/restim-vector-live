@@ -82,6 +82,61 @@ class NetworkTests(unittest.TestCase):
             text, "L01000 L12000 E19999 E20000 E32500 E45000 V06000 "
                   "C07000 P08000 P39000 P14000")
 
+    def test_recovered_websocket_sends_safe_neutral_before_live_sample(self):
+        client = ReStimWebSocketClient(lambda _: None)
+        frames = []
+        client._socket = type("Socket", (), {"sendall": lambda _, value: frames.append(value)})()
+        client._needs_neutral = True
+        client.send_primary(.1, .2, (1.0, 0.0, .25, .5), .6, .7, .8, .9, .4)
+        self.assertEqual(len(frames), 2)
+
+        def decode(frame):
+            size = frame[1] & 0x7f; index = 2
+            if size == 126: size = int.from_bytes(frame[2:4], "big"); index = 4
+            mask, payload = frame[index:index+4], frame[index+4:index+4+size]
+            return bytes(value ^ mask[i % 4] for i, value in enumerate(payload)).decode()
+
+        self.assertEqual(decode(frames[0]),
+                         "L05000 L15000 E15000 E25000 E35000 E45000 V00000")
+        self.assertIn("L01000 L12000 E19999 E20000", decode(frames[1]))
+
+    def test_quiet_listener_is_not_reported_as_failed(self):
+        listener = MFPListener(lambda *_: None, lambda _: None)
+        listener._run.set()
+        listener._last_received = time.monotonic() - 3.25
+        self.assertTrue(listener.connection_label().startswith("Listening; no L0 for"))
+        self.assertTrue(listener.health()["running"])
+        listener._run.clear()
+
+    def test_websocket_reconnects_in_background_while_no_samples_are_sent(self):
+        server = socket.socket(); server.bind(("127.0.0.1", 0)); server.listen(2)
+        port = server.getsockname()[1]
+        reconnected = threading.Event()
+
+        def handshake(conn):
+            request = b""
+            while b"\r\n\r\n" not in request:
+                request += conn.recv(4096)
+            key = next(line.split(b":", 1)[1].strip() for line in request.split(b"\r\n")
+                       if line.lower().startswith(b"sec-websocket-key:"))
+            accept = base64.b64encode(hashlib.sha1(
+                key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+            conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                         b"Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+
+        def serve():
+            first, _ = server.accept(); handshake(first); first.close()
+            second, _ = server.accept(); handshake(second); reconnected.set()
+            reconnected.wait(1.0); second.close(); server.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        client = ReStimWebSocketClient(lambda _: None)
+        try:
+            client.connect("127.0.0.1", port)
+            self.assertTrue(reconnected.wait(3.0))
+        finally:
+            client.close()
+
 
 if __name__ == "__main__":
     unittest.main()

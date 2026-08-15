@@ -3,6 +3,13 @@ from __future__ import annotations
 import math
 
 
+def speed_linked_depth(speed_percent: float, full_depth_speed: float = 35.0) -> float:
+    """Smooth 0..1 variation depth: none at rest, full at configured speed."""
+    full = max(1.0, float(full_depth_speed))
+    progress = min(1.0, max(0.0, float(speed_percent) / full))
+    return progress * progress * (3.0 - 2.0 * progress)
+
+
 def rolling_value(elapsed_seconds: float, cycle_minutes: float,
                   minimum: float, maximum: float) -> float:
     """Cosine cycle: maximum -> minimum -> maximum with soft turnarounds."""

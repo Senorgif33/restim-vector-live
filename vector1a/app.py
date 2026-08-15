@@ -4,6 +4,7 @@ import tkinter as tk
 import time
 import queue
 import math
+from collections import deque
 from tkinter import messagebox, ttk
 
 from .engine import OutputSample, VectorEngine
@@ -13,9 +14,9 @@ from .settings import load_settings, save_settings, settings_path
 from .controller import (A, B, X, Y, START, LEFT_SHOULDER, RIGHT_SHOULDER, DPAD_UP, DPAD_DOWN,
                          DPAD_LEFT, DPAD_RIGHT, XInputController)
 from .variety import fit_range_for_travel, rolling_offset, rolling_value
-from .fourphase import (ELECTRODE_ORDERS, adaptive_crossover_width, directed_signed,
+from .fourphase import (ELECTRODE_ORDERS, adaptive_crossover_width, apply_group_delay, directed_signed,
                         directional_crossover_profile, map_electrode_order,
-                        morph_electrode_order, potential_roles, sequence_cycle_stage,
+                        morph_electrode_order, moving_sequence_window, potential_roles, sequence_cycle_stage,
                         spatial_response, reversal_emphasis_envelope,
                         stroke_phase_crossover, restim_crossfade, vertical_crossfade)
 from . import __version__
@@ -79,7 +80,10 @@ class VectorApp:
         "four_phase_spatial_blend", "four_phase_reversal_emphasis",
         "four_phase_reversal_window", "four_phase_reversal_strength",
         "four_phase_stroke_phase_texture", "four_phase_acceleration_width_scale",
-        "four_phase_deceleration_width_scale", "electrode_order",
+        "four_phase_deceleration_width_scale", "four_phase_group_delay",
+        "four_phase_group_delay_ms", "four_phase_group_delay_transition", "electrode_order",
+        "four_phase_moving_sequence", "four_phase_moving_sequence_depth",
+        "four_phase_moving_sequence_width",
     )
     SETTINGS_FIELDS = (
         "mfp_host", "mfp_port", "restim_host", "restim_port", "prostate_host", "prostate_port",
@@ -103,11 +107,15 @@ class VectorApp:
         "four_phase_reversal_emphasis", "four_phase_reversal_window",
         "four_phase_reversal_strength",
         "four_phase_stroke_phase_texture", "four_phase_acceleration_width_scale",
-        "four_phase_deceleration_width_scale",
+        "four_phase_deceleration_width_scale", "four_phase_group_delay",
+        "four_phase_group_delay_ms", "four_phase_group_delay_transition",
+        "four_phase_moving_sequence", "four_phase_moving_sequence_depth",
+        "four_phase_moving_sequence_width",
         "preset_a_name", "preset_b_name", "preset_transition_seconds",
         "electrode_order", "variety_electrode_morph", "variety_electrode_morph_cycle",
         "variety_electrode_morph_transition_seconds",
         "jitter_enabled", "jitter_amplitude", "jitter_cycle_seconds",
+        "speed_linked_variation", "variation_full_speed_percent", "variation_fade_seconds",
         "prostate_phase_step", "controller_enabled", "controller_fine_step", "minimum_radius",
         "speed_threshold", "direction_probability", "mode", "direct_controller_enabled",
         "variety_enabled", "variety_frequency_cycle", "variety_pulse_frequency_cycle",
@@ -191,6 +199,14 @@ class VectorApp:
         self.four_phase_acceleration_width_scale = tk.DoubleVar(value=.70)
         self.four_phase_deceleration_width_scale = tk.DoubleVar(value=1.20)
         self.four_phase_stroke_phase_live = tk.StringVar(value="off")
+        self.four_phase_group_delay = tk.BooleanVar(value=False)
+        self.four_phase_group_delay_ms = tk.DoubleVar(value=0.0)
+        self.four_phase_group_delay_transition = tk.DoubleVar(value=1.0)
+        self.four_phase_group_delay_live = tk.StringVar(value="live 0 ms")
+        self.four_phase_moving_sequence = tk.BooleanVar(value=False)
+        self.four_phase_moving_sequence_depth = tk.DoubleVar(value=.50)
+        self.four_phase_moving_sequence_width = tk.DoubleVar(value=1.0)
+        self.four_phase_moving_sequence_live = tk.StringVar(value="off")
         self.preset_a_name = tk.StringVar(value="A")
         self.preset_b_name = tk.StringVar(value="B")
         self.preset_transition_seconds = tk.DoubleVar(value=2.5)
@@ -206,6 +222,10 @@ class VectorApp:
         self.jitter_enabled = tk.BooleanVar(value=False)
         self.jitter_amplitude = tk.DoubleVar(value=0.02)
         self.jitter_cycle_seconds = tk.DoubleVar(value=1.0)
+        self.speed_linked_variation = tk.BooleanVar(value=True)
+        self.variation_full_speed_percent = tk.DoubleVar(value=35.0)
+        self.variation_fade_seconds = tk.DoubleVar(value=.75)
+        self.variation_depth_live = tk.StringVar(value="Variation depth 0%")
         self.send_four_phase_visual = tk.BooleanVar(value=False)
         self.controller_enabled = tk.BooleanVar(value=True)
         self.controller_target = tk.IntVar(value=0)
@@ -242,7 +262,11 @@ class VectorApp:
             "pulse_rise_time",
             "pulse_width",
             "alpha_prostate", "beta_prostate", "volume_prostate",
+            "variation_depth",
         )}
+
+        self._connection_events: deque[str] = deque(maxlen=200)
+        self._last_connection_event: dict[str, str] = {}
 
         self.restim = ReStimWebSocketClient(self._set_restim_status)
         self.prostate_restim = ReStimWebSocketClient(self._set_prostate_status)
@@ -251,6 +275,9 @@ class VectorApp:
         self._four_phase_direction = 1
         self._four_phase_send_last_l0 = 0.5
         self._four_phase_send_direction = 1
+        self._four_phase_history = deque(maxlen=128)
+        self._four_phase_effective_group_delay = 0.0
+        self._four_phase_group_delay_last_time = None
         self.listener = MFPListener(self.engine.receive_l0, self._set_mfp_status)
         self.xinput = XInputController(self._xinput_buttons_threaded, self._xinput_status_threaded)
         self.sections = {}
@@ -290,6 +317,7 @@ class VectorApp:
         ttk.Button(toolbar, text="Setup guide", command=self.show_setup_guide).pack(side="left", padx=(18, 6))
         ttk.Button(toolbar, text="Rolling Variety", command=self.show_variety_window).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Presets A/B", command=self.show_preset_window).pack(side="left", padx=6)
+        ttk.Button(toolbar, text="Connection log", command=self.show_connection_log).pack(side="left", padx=6)
         ttk.Label(toolbar, textvariable=self.diag_vars["state"]).pack(side="right", padx=8)
 
         mfp = self._frame("MultiFunPlayer input", 0, 0)
@@ -348,6 +376,19 @@ class VectorApp:
         ttk.Spinbox(motion, from_=.05, to=30, increment=.05,
                     textvariable=self.jitter_cycle_seconds, width=8,
                     command=self.apply_config).grid(row=3, column=4, sticky="w")
+        ttk.Checkbutton(motion, text="Speed-link variation depth",
+                        variable=self.speed_linked_variation,
+                        command=self.apply_config).grid(row=4, column=0, sticky="w", pady=(3, 0))
+        ttk.Label(motion, text="Full depth at speed (%)").grid(row=4, column=1, sticky="e")
+        ttk.Spinbox(motion, from_=1, to=100, increment=1,
+                    textvariable=self.variation_full_speed_percent, width=8,
+                    command=self.apply_config).grid(row=4, column=2, sticky="w")
+        ttk.Label(motion, text="Fade (s)").grid(row=4, column=3, sticky="e")
+        ttk.Spinbox(motion, from_=.05, to=10, increment=.05,
+                    textvariable=self.variation_fade_seconds, width=8,
+                    command=self.apply_config).grid(row=4, column=4, sticky="w")
+        ttk.Label(motion, textvariable=self.variation_depth_live,
+                  foreground="#555").grid(row=4, column=5, sticky="w", padx=8)
 
         volume_frame = self._frame("Volume response", 2, 0, 2)
         ttk.Checkbutton(volume_frame, text="Reduce volume when motion stops",
@@ -582,24 +623,46 @@ class VectorApp:
                     width=7).grid(row=12, column=4, sticky="w")
         ttk.Label(four_phase, textvariable=self.four_phase_stroke_phase_live,
                   width=20).grid(row=12, column=5, sticky="w", padx=8)
-        ttk.Separator(four_phase, orient="horizontal").grid(
-            row=13, column=0, columnspan=6, sticky="ew", pady=7)
+        ttk.Checkbutton(four_phase, text="AB/CD timing separation",
+                        variable=self.four_phase_group_delay).grid(row=13, column=0, sticky="w")
+        ttk.Label(four_phase, text="Delay (ms)").grid(row=13, column=1, sticky="e")
+        ttk.Spinbox(four_phase, from_=-300, to=300, increment=10,
+                    textvariable=self.four_phase_group_delay_ms, width=7).grid(
+                        row=13, column=2, sticky="w")
+        ttk.Label(four_phase, text="Transition (s)").grid(row=13, column=3, sticky="e")
+        ttk.Spinbox(four_phase, from_=.1, to=5, increment=.1,
+                    textvariable=self.four_phase_group_delay_transition, width=7).grid(
+                        row=13, column=4, sticky="w")
+        ttk.Label(four_phase, textvariable=self.four_phase_group_delay_live,
+                  foreground="#555").grid(row=13, column=5, sticky="w")
+        ttk.Checkbutton(four_phase, text="Moving sequence window",
+                        variable=self.four_phase_moving_sequence).grid(row=14, column=0, sticky="w")
+        ttk.Label(four_phase, text="Depth").grid(row=14, column=1, sticky="e")
+        ttk.Spinbox(four_phase, from_=0, to=1, increment=.05,
+                    textvariable=self.four_phase_moving_sequence_depth, width=7).grid(
+                        row=14, column=2, sticky="w")
+        ttk.Label(four_phase, text="Width").grid(row=14, column=3, sticky="e")
+        ttk.Spinbox(four_phase, from_=.1, to=1, increment=.05,
+                    textvariable=self.four_phase_moving_sequence_width, width=7).grid(
+                        row=14, column=4, sticky="w")
+        ttk.Label(four_phase, textvariable=self.four_phase_moving_sequence_live,
+                  foreground="#555").grid(row=14, column=5, sticky="w")
         self.four_phase_signed_values = []
         for offset, label in enumerate(("A signed", "B signed", "C signed", "D signed")):
-            row = offset + 14
+            row = offset + 15
             ttk.Label(four_phase, text=label, width=18).grid(row=row, column=0, sticky="w")
             value = tk.StringVar(value="+0.0000")
             ttk.Label(four_phase, textvariable=value, width=10,
                       font=("TkDefaultFont", 10, "bold")).grid(row=row, column=1, sticky="w")
             self.four_phase_signed_values.append(value)
         ttk.Label(four_phase, text="Conceptual relative potentials (−1 to +1); not T-code") \
-            .grid(row=14, column=2, columnspan=4, sticky="w", padx=8)
+            .grid(row=15, column=2, columnspan=4, sticky="w", padx=8)
         ttk.Separator(four_phase, orient="horizontal").grid(
-            row=18, column=0, columnspan=6, sticky="ew", pady=7)
+            row=19, column=0, columnspan=6, sticky="ew", pady=7)
         self.four_phase_potential_bars, self.four_phase_potential_values = [], []
         for offset, label in enumerate(("E1 / A potential", "E2 / B potential",
                                         "E3 / C potential", "E4 / D potential")):
-            row = offset + 19
+            row = offset + 20
             ttk.Label(four_phase, text=label, width=18).grid(row=row, column=0, sticky="w")
             ttk.Label(four_phase, text="0").grid(row=row, column=1)
             bar = ttk.Progressbar(four_phase, orient="horizontal", mode="determinate",
@@ -613,17 +676,17 @@ class VectorApp:
             self.four_phase_potential_values.append(value)
         self.four_phase_roles = tk.StringVar(value="Primary -- | preferred return --")
         ttk.Label(four_phase, textvariable=self.four_phase_roles,
-                  foreground="#9b4b00").grid(row=19, column=5, rowspan=4, sticky="w", padx=18)
+                  foreground="#9b4b00").grid(row=20, column=5, rowspan=4, sticky="w", padx=18)
         ttk.Checkbutton(four_phase,
                         text="Send E1–E4 visual test (FOC-Stim hardware MUST be disconnected)",
                         variable=self.send_four_phase_visual,
                         command=self._four_phase_send_toggle).grid(
-                            row=23, column=0, columnspan=4, sticky="w", pady=(8, 2))
+                            row=24, column=0, columnspan=4, sticky="w", pady=(8, 2))
         ttk.Label(four_phase, textvariable=self.four_phase_status).grid(
-            row=23, column=4, columnspan=2, sticky="w", padx=8)
+            row=24, column=4, columnspan=2, sticky="w", padx=8)
         # The internal commissioning plots remain available to the refresh code,
         # but are intentionally hidden in the publication UI.
-        for hidden_row in (*range(0, 5), *range(13, 19), 23):
+        for hidden_row in (*range(0, 5), *range(15, 20), 24):
             for widget in four_phase.grid_slaves(row=hidden_row):
                 widget.grid_remove()
 
@@ -708,13 +771,56 @@ class VectorApp:
                 .grid(row=row, column=col + 1, sticky="w", padx=8, pady=5)
 
     def _set_mfp_status(self, text: str) -> None:
+        self._record_connection_event("MFP", text)
         self.root.after(0, self.mfp_status.set, text)
 
     def _set_restim_status(self, text: str) -> None:
+        self._record_connection_event("Primary", text)
         self.root.after(0, self.restim_status.set, text)
 
     def _set_prostate_status(self, text: str) -> None:
+        self._record_connection_event("Prostate", text)
         self.root.after(0, self.prostate_status.set, text)
+
+    def _record_connection_event(self, source: str, text: str) -> None:
+        if self._last_connection_event.get(source) == text:
+            return
+        self._last_connection_event[source] = text
+        stamp = time.strftime("%H:%M:%S")
+        self._connection_events.append(f"{stamp}  {source}: {text}")
+
+    def show_connection_log(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("Connection and recovery log")
+        window.geometry("760x360")
+        window.minsize(560, 260)
+        body = ttk.Frame(window, padding=10)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=(
+            "Recent connection changes. A quiet script is reported separately from a failed listener."
+        )).pack(anchor="w", pady=(0, 8))
+        text_box = tk.Text(body, wrap="word", height=14, state="normal")
+        text_box.pack(fill="both", expand=True)
+        text_box.insert("1.0", "\n".join(self._connection_events) or "No connection events yet.")
+        text_box.configure(state="disabled")
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(8, 0))
+
+        def copy_log() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(self._connection_events))
+
+        def clear_log() -> None:
+            self._connection_events.clear()
+            self._last_connection_event.clear()
+            text_box.configure(state="normal")
+            text_box.delete("1.0", "end")
+            text_box.insert("1.0", "Connection log cleared.")
+            text_box.configure(state="disabled")
+
+        ttk.Button(buttons, text="Copy", command=copy_log).pack(side="left")
+        ttk.Button(buttons, text="Clear", command=clear_log).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
 
     def start_listener(self) -> None:
         try:
@@ -880,6 +986,7 @@ class VectorApp:
                 low, high = fit_range_for_travel(variables[0].get(), variables[1].get())
                 variables[0].set(low); variables[1].set(high)
         self._variety_baseline = {
+            "frequency": self.frequency_ramp_level.get(),
             "pf": (self.pulse_frequency_min.get(), self.pulse_frequency_max.get()),
             "rise": (self.pulse_rise_min.get(), self.pulse_rise_max.get()),
             "width": (self.pulse_width_min.get(), self.pulse_width_max.get()),
@@ -930,22 +1037,28 @@ class VectorApp:
         if not self._variety_baseline:
             self._variety_toggle()
         elapsed = time.monotonic() - self._variety_started
+        depth = (self.engine.diagnostics().variation_depth
+                 if self.speed_linked_variation.get() else 1.0)
         if self.variety_frequency.get():
-            self.frequency_ramp_level.set(round(rolling_value(
-                elapsed, self.variety_frequency_cycle.get(), .5, 1.0), 4))
-        for enabled, key, variables, depth, cycle in (
+            baseline = self._variety_baseline.get("frequency", 1.0)
+            target = rolling_value(elapsed, self.variety_frequency_cycle.get(), .5, 1.0)
+            self.frequency_ramp_level.set(round(baseline + (target - baseline) * depth, 4))
+        for enabled, key, variables, travel, cycle in (
                 (self.variety_pulse_frequency, "pf", (self.pulse_frequency_min, self.pulse_frequency_max), .20, self.variety_pulse_frequency_cycle),
                 (self.variety_pulse_rise, "rise", (self.pulse_rise_min, self.pulse_rise_max), .20, self.variety_pulse_rise_cycle),
                 (self.variety_pulse_width, "width", (self.pulse_width_min, self.pulse_width_max), .20, self.variety_pulse_width_cycle)):
             if enabled.get():
                 offset = rolling_offset(elapsed, cycle.get())
-                low, high = self._bounded_shift(self._variety_baseline[key], offset * depth)
+                low, high = self._bounded_shift(
+                    self._variety_baseline[key], offset * depth * travel)
                 variables[0].set(low); variables[1].set(high)
         if self.variety_phase.get():
             baseline = self._variety_baseline["phase"]
             offset = rolling_offset(elapsed, self.variety_phase_cycle.get())
-            self.prostate_phase_degrees.set(round(max(-90, min(90, baseline + offset * 45)), 1))
-        self.variety_status.set(f"Running | {elapsed / 60:.1f} min | independent cycles")
+            self.prostate_phase_degrees.set(round(
+                max(-90, min(90, baseline + offset * 45 * depth)), 1))
+        self.variety_status.set(
+            f"Running | {elapsed / 60:.1f} min | depth {depth * 100:.0f}% | independent cycles")
         self.apply_config()
 
     def _electrode_morph_state(self, at_time: float | None = None
@@ -962,6 +1075,19 @@ class VectorApp:
             base, (elapsed % full_cycle) / full_cycle,
             transition_seconds / stage_seconds)
 
+    def _sequence_morph_state(self, direction: int, stroke_progress: float,
+                              variation_depth: float, at_time: float | None = None
+                              ) -> tuple[str, str, float, str]:
+        carousel_active = self.variety_enabled.get() and self.variety_electrode_morph.get()
+        if self.four_phase_moving_sequence.get() and not carousel_active:
+            source, target, amount = moving_sequence_window(
+                self.electrode_order.get(), direction, stroke_progress,
+                self.four_phase_moving_sequence_depth.get() * variation_depth,
+                self.four_phase_moving_sequence_width.get())
+            return source, target, amount, "window"
+        source, target, amount = self._electrode_morph_state(at_time)
+        return source, target, amount, ("carousel" if carousel_active else "stable")
+
     def _effective_crossover_width(self, speed_percent: float) -> float:
         if not self.four_phase_adaptive_crossover.get():
             return min(1.0, max(.05, self.four_phase_crossover_width.get()))
@@ -970,28 +1096,38 @@ class VectorApp:
             self.four_phase_fast_crossover_width.get())
 
     def _crossover_profile(self, speed_percent: float, direction: int,
-                           stroke_progress: float = .5
+                           stroke_progress: float = .5, variation_depth: float = 1.0
                            ) -> tuple[float, str, float, str]:
+        variation_depth = min(1.0, max(0.0, variation_depth))
+        base_width = min(1.0, max(.05, self.four_phase_crossover_width.get()))
+        adaptive_width = self._effective_crossover_width(speed_percent)
+        adaptive_width = base_width + (adaptive_width - base_width) * variation_depth
+        reverse_scale = 1.0 + (self.four_phase_reverse_width_scale.get() - 1.0) * variation_depth
         width, curve, sharpness, direction_name = directional_crossover_profile(
-            direction, self._effective_crossover_width(speed_percent),
+            direction, adaptive_width,
             self.four_phase_crossover_curve.get(),
             self.four_phase_crossover_sharpness.get(),
-            self.four_phase_directional_trajectory.get(),
-            self.four_phase_reverse_width_scale.get(),
+            self.four_phase_directional_trajectory.get() and variation_depth > .001,
+            reverse_scale,
             self.four_phase_reverse_curve.get(),
-            self.four_phase_reverse_sharpness.get())
+            (self.four_phase_crossover_sharpness.get() +
+             (self.four_phase_reverse_sharpness.get() -
+              self.four_phase_crossover_sharpness.get()) * variation_depth))
+        acceleration_scale = 1.0 + (
+            self.four_phase_acceleration_width_scale.get() - 1.0) * variation_depth
+        deceleration_scale = 1.0 + (
+            self.four_phase_deceleration_width_scale.get() - 1.0) * variation_depth
         width, phase_name = stroke_phase_crossover(
             width, stroke_progress, self.four_phase_stroke_phase_texture.get(),
-            self.four_phase_acceleration_width_scale.get(),
-            self.four_phase_deceleration_width_scale.get())
+            acceleration_scale, deceleration_scale)
         if self.four_phase_stroke_phase_texture.get():
             direction_name = f"{direction_name} {phase_name}"
         return width, curve, sharpness, direction_name
 
-    def _spatial_path(self, output_l0: float) -> float:
+    def _spatial_path(self, output_l0: float, variation_depth: float = 1.0) -> float:
         path_l0 = 1.0 - output_l0 if self.four_phase_invert.get() else output_l0
         return spatial_response(path_l0, self.four_phase_spatial_curve.get(),
-                                self.four_phase_spatial_blend.get())
+                                self.four_phase_spatial_blend.get() * variation_depth)
 
     def apply_config(self) -> None:
         try:
@@ -1026,7 +1162,10 @@ class VectorApp:
                                   prostate_phase_degrees=self.prostate_phase_degrees.get(),
                                   jitter_enabled=self.jitter_enabled.get(),
                                   jitter_amplitude=self.jitter_amplitude.get(),
-                                  jitter_cycle_seconds=self.jitter_cycle_seconds.get())
+                                  jitter_cycle_seconds=self.jitter_cycle_seconds.get(),
+                                  speed_linked_variation=self.speed_linked_variation.get(),
+                                  variation_full_speed_percent=self.variation_full_speed_percent.get(),
+                                  variation_fade_seconds=self.variation_fade_seconds.get())
         except (tk.TclError, ValueError) as exc:
             messagebox.showerror("Invalid settings", str(exc))
 
@@ -1178,7 +1317,9 @@ class VectorApp:
         )
 
     def _send_sample(self, sample: OutputSample) -> None:
-        path_l0 = self._spatial_path(sample.output_l0)
+        variation_depth = (sample.variation_depth
+                           if self.speed_linked_variation.get() else 1.0)
+        path_l0 = self._spatial_path(sample.output_l0, variation_depth)
         delta = path_l0 - self._four_phase_send_last_l0
         if abs(delta) > 0.0005:
             self._four_phase_send_direction = 1 if delta > 0 else -1
@@ -1186,27 +1327,48 @@ class VectorApp:
         crossover_width, crossover_curve, crossover_sharpness, _ = \
             self._crossover_profile(sample.speed_percent,
                                     self._four_phase_send_direction,
-                                    sample.stroke_progress)
+                                    sample.stroke_progress, variation_depth)
         electrodes = restim_crossfade(
             path_l0, self._four_phase_send_direction,
             self.four_phase_return_depth.get(), crossover_width,
             crossover_curve, crossover_sharpness)
-        morph_source, morph_target, morph_amount = self._electrode_morph_state(sample.due_at)
+        morph_source, morph_target, morph_amount, _ = self._sequence_morph_state(
+            self._four_phase_send_direction, sample.stroke_progress,
+            variation_depth, sample.due_at)
         if morph_source == morph_target:
             electrodes = map_electrode_order(electrodes, morph_source)
         else:
             electrodes = morph_electrode_order(
                 electrodes, morph_source, morph_target, morph_amount)
+        self._four_phase_history.append((sample.due_at, electrodes))
+        target_delay = 0.0
+        if self.four_phase_group_delay.get():
+            target_delay = min(.300, max(-.300,
+                self.four_phase_group_delay_ms.get() / 1000.0)) * variation_depth
+        previous_time = self._four_phase_group_delay_last_time
+        self._four_phase_group_delay_last_time = sample.due_at
+        dt = max(0.0, sample.due_at - previous_time) if previous_time is not None else 0.0
+        transition = max(.1, self.four_phase_group_delay_transition.get())
+        blend = 1.0 - math.exp(-dt / transition) if dt > 0 else 0.0
+        self._four_phase_effective_group_delay += (
+            target_delay - self._four_phase_effective_group_delay) * blend
+        if abs(target_delay) <= 1e-9 and abs(self._four_phase_effective_group_delay) < 1e-5:
+            self._four_phase_effective_group_delay = 0.0
+        electrodes = apply_group_delay(
+            electrodes, list(self._four_phase_history), sample.due_at,
+            self._four_phase_effective_group_delay)
         ceiling = min(1.0, max(0.0, self.four_phase_volume_ceiling.get()))
         if self.four_phase_volume_modulation.get():
             cycle = max(.5, self.four_phase_volume_cycle.get()) * 60.0
             wave = (1.0 - math.cos((sample.calculated_at % cycle)
                                    * 2.0 * math.pi / cycle)) / 2.0
-            ceiling = min(1.0, ceiling + self.four_phase_volume_headroom.get() * wave)
+            ceiling = min(1.0, ceiling +
+                          self.four_phase_volume_headroom.get() * wave * variation_depth)
         if self.four_phase_reversal_emphasis.get():
             reversal = reversal_emphasis_envelope(
                 sample.reversal_distance_seconds, self.four_phase_reversal_window.get())
-            strength = min(1.0, max(0.0, self.four_phase_reversal_strength.get()))
+            strength = min(1.0, max(0.0,
+                self.four_phase_reversal_strength.get() * variation_depth))
             ceiling += (1.0 - ceiling) * strength * reversal
         primary_volume = min(1.0, max(0.0,
             ceiling * sample.volume / max(self.volume.get(), 1e-9)))
@@ -1220,6 +1382,7 @@ class VectorApp:
 
     def neutral(self) -> None:
         self.apply_config()
+        self._reset_four_phase_group_delay()
         self.engine.neutral()
         self.restim.send_primary(0.5, 0.5, (0.5, 0.5, 0.5, 0.5),
                                  self.volume.get(), 0.5, 0.5, 0.5, 0.5)
@@ -1227,13 +1390,20 @@ class VectorApp:
 
     def resume(self) -> None:
         self.apply_config()
+        self._reset_four_phase_group_delay()
         self.engine.resume()
 
     def stop(self) -> None:
+        self._reset_four_phase_group_delay()
         self.engine.stop()
         self.restim.send_primary(0.5, 0.5, (0.5, 0.5, 0.5, 0.5),
                                  0.0, 0.5, 0.5, 0.5, 0.5)
         self.prostate_restim.send_prostate(0.5, 0.5, 0.0, 0.5, 0.5, 0.5, 0.5)
+
+    def _reset_four_phase_group_delay(self) -> None:
+        self._four_phase_history.clear()
+        self._four_phase_effective_group_delay = 0.0
+        self._four_phase_group_delay_last_time = None
 
     def _refresh(self) -> None:
         self._drain_controller_events()
@@ -1267,9 +1437,11 @@ class VectorApp:
             "alpha_prostate": f"{diag.alpha_prostate:.4f}",
             "beta_prostate": f"{diag.beta_prostate:.4f}",
             "volume_prostate": f"{diag.volume_prostate * 100:.1f}%",
+            "variation_depth": f"{diag.variation_depth * 100:.1f}%",
         }
         for key, value in values.items():
             self.diag_vars[key].set(value)
+        self.variation_depth_live.set(f"Variation depth {diag.variation_depth * 100:.0f}%")
         self.frequency_bar["value"] = diag.frequency
         self.frequency_value.set(f"{diag.frequency:.4f}")
         self.pulse_frequency_bar.set(self.pulse_frequency_min.get(),
@@ -1286,12 +1458,18 @@ class VectorApp:
                            ("volume_prostate", diag.volume_prostate)):
             self.prostate_bars[key]["value"] = value
             self.prostate_values[key].set(f"{value:.4f}")
-        path_l0 = self._spatial_path(diag.output_l0)
+        variation_depth = (diag.variation_depth
+                           if self.speed_linked_variation.get() else 1.0)
+        path_l0 = self._spatial_path(diag.output_l0, variation_depth)
         self.four_phase_spatial_live.set(f"live {path_l0:.3f}")
         reversal = (reversal_emphasis_envelope(
             diag.reversal_distance_seconds, self.four_phase_reversal_window.get())
+            * variation_depth
             if self.four_phase_reversal_emphasis.get() else 0.0)
         self.four_phase_reversal_live.set(f"live {reversal:.3f}")
+        delay_ms = self._four_phase_effective_group_delay * 1000.0
+        delayed_group = "A/B later" if delay_ms > .5 else ("C/D later" if delay_ms < -.5 else "aligned")
+        self.four_phase_group_delay_live.set(f"live {delay_ms:+.0f} ms | {delayed_group}")
         four_phase = vertical_crossfade(path_l0)
         for bar, variable, value in zip(self.four_phase_bars, self.four_phase_values,
                                         four_phase):
@@ -1306,7 +1484,7 @@ class VectorApp:
             self.four_phase_return_depth.get())
         effective_crossover, effective_curve, effective_sharpness, direction_name = \
             self._crossover_profile(diag.speed_percent, self._four_phase_direction,
-                                    diag.stroke_progress)
+                                    diag.stroke_progress, variation_depth)
         self.four_phase_effective_crossover_width.set(
             f"{direction_name} {effective_crossover:.3f}")
         if self.four_phase_stroke_phase_texture.get():
@@ -1319,13 +1497,21 @@ class VectorApp:
                                       self.four_phase_return_depth.get(),
                                       effective_crossover,
                                       effective_curve, effective_sharpness)
-        morph_source, morph_target, morph_amount = self._electrode_morph_state()
+        morph_source, morph_target, morph_amount, morph_kind = self._sequence_morph_state(
+            self._four_phase_direction, diag.stroke_progress, variation_depth)
         if morph_source == morph_target:
             potentials = map_electrode_order(potentials, morph_source)
         else:
             potentials = morph_electrode_order(
                 potentials, morph_source, morph_target, morph_amount)
         self.electrode_morph_bar["value"] = morph_amount
+        if morph_kind == "window":
+            self.four_phase_moving_sequence_live.set(
+                f"{morph_source}→{morph_target} | {morph_amount * 100:.0f}%")
+        elif morph_kind == "carousel" and self.four_phase_moving_sequence.get():
+            self.four_phase_moving_sequence_live.set("carousel priority")
+        else:
+            self.four_phase_moving_sequence_live.set("off")
         for variable, value in zip(self.four_phase_signed_values, signed):
             variable.set(f"{value:+.4f}")
         for bar, variable, value in zip(self.four_phase_potential_bars,
@@ -1344,8 +1530,8 @@ class VectorApp:
             sequence_status = (f"{morph_source} morphing toward {morph_target} | "
                                f"{morph_amount * 100:.0f}%")
         self.four_phase_roles.set(sequence_status)
-        if self.listener.connection_label() in ("Receiving", "Listening"):
-            current = self.listener.connection_label()
+        current = self.listener.connection_label()
+        if current.startswith(("Receiving", "Listening")):
             if not self.mfp_status.get().startswith("MFP "):
                 self.mfp_status.set(current)
         summaries = {
@@ -1378,8 +1564,8 @@ class VectorApp:
         self.xinput.close()
         self.engine.close()
         self.listener.stop()
-        self.restim.disconnect()
-        self.prostate_restim.disconnect()
+        self.restim.close()
+        self.prostate_restim.close()
         self.root.destroy()
 
 
