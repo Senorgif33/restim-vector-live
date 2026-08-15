@@ -1,13 +1,81 @@
 import math
 import unittest
 
-from vector1a.fourphase import (crossover_blend, directed_signed, map_electrode_order,
+from vector1a.fourphase import (adaptive_crossover_width, crossover_blend,
+                                directed_signed, directional_crossover_profile,
+                                map_electrode_order,
                                 morph_electrode_order, normalize_signed, pair_morph,
                                 potential_roles, pair_swapped_order, restim_crossfade,
-                                sequence_cycle_stage, vertical_crossfade)
+                                reversal_emphasis_envelope, sequence_cycle_stage, spatial_response,
+                                stroke_phase_crossover, vertical_crossfade)
 
 
 class FourPhaseCommissioningTests(unittest.TestCase):
+    def test_stroke_phase_crossover_blends_smoothly_and_is_bounded(self):
+        self.assertEqual(stroke_phase_crossover(.5, 0, False, .5, 1.5), (.5, "off"))
+        start, start_name = stroke_phase_crossover(.5, 0, True, .5, 1.5)
+        middle, _ = stroke_phase_crossover(.5, .5, True, .5, 1.5)
+        end, end_name = stroke_phase_crossover(.5, 1, True, .5, 1.5)
+        self.assertEqual((start_name, end_name), ("accelerating", "decelerating"))
+        self.assertAlmostEqual(start, .25)
+        self.assertAlmostEqual(middle, .5)
+        self.assertAlmostEqual(end, .75)
+        values = [stroke_phase_crossover(.5, step / 100, True, .5, 1.5)[0]
+                  for step in range(101)]
+        self.assertTrue(all(.05 <= value <= 1 for value in values))
+        self.assertTrue(all(a <= b for a, b in zip(values, values[1:])))
+
+    def test_reversal_emphasis_is_symmetric_bounded_and_local(self):
+        self.assertEqual(reversal_emphasis_envelope(0, .4), 1.0)
+        self.assertEqual(reversal_emphasis_envelope(.4, .4), 0.0)
+        self.assertEqual(reversal_emphasis_envelope(math.inf, .4), 0.0)
+        self.assertAlmostEqual(reversal_emphasis_envelope(-.1, .4),
+                               reversal_emphasis_envelope(.1, .4))
+        values = [reversal_emphasis_envelope(step / 100, .4) for step in range(41)]
+        self.assertTrue(all(0 <= value <= 1 for value in values))
+        self.assertTrue(all(a >= b for a, b in zip(values, values[1:])))
+
+    def test_spatial_curves_preserve_endpoints_and_centre(self):
+        for curve in ("Linear", "S-curve", "Endpoint emphasis", "Centre emphasis"):
+            self.assertEqual(spatial_response(0, curve), 0.0)
+            self.assertEqual(spatial_response(.5, curve), .5)
+            self.assertEqual(spatial_response(1, curve), 1.0)
+
+    def test_spatial_curve_blend_and_character(self):
+        self.assertEqual(spatial_response(.25, "Endpoint emphasis", 0), .25)
+        self.assertLess(spatial_response(.25, "Endpoint emphasis", 1), .25)
+        self.assertGreater(spatial_response(.25, "Centre emphasis", 1), .25)
+
+    def test_spatial_curves_are_monotonic_and_bounded(self):
+        for curve in ("Linear", "S-curve", "Endpoint emphasis", "Centre emphasis"):
+            values = [spatial_response(step / 100, curve, .8) for step in range(101)]
+            self.assertTrue(all(0 <= value <= 1 for value in values))
+            self.assertTrue(all(a <= b for a, b in zip(values, values[1:])))
+
+    def test_adaptive_crossover_uses_slow_and_fast_endpoints(self):
+        self.assertEqual(adaptive_crossover_width(0, .9, .35), .9)
+        self.assertEqual(adaptive_crossover_width(100, .9, .35), .35)
+        self.assertAlmostEqual(adaptive_crossover_width(50, .9, .35), .625)
+
+    def test_adaptive_crossover_is_bounded_and_monotonic(self):
+        values = [adaptive_crossover_width(speed, .9, .35)
+                  for speed in range(101)]
+        self.assertTrue(all(.35 <= value <= .9 for value in values))
+        self.assertTrue(all(a >= b for a, b in zip(values, values[1:])))
+
+    def test_directional_profile_uses_forward_settings_when_disabled(self):
+        profile = directional_crossover_profile(
+            -1, .6, "Cosine", 1.2, False, .5, "Ease Out", .4)
+        self.assertEqual(profile, (.6, "Cosine", 1.2, "forward"))
+
+    def test_directional_profile_selects_reverse_texture(self):
+        profile = directional_crossover_profile(
+            -1, .6, "Cosine", 1.2, True, .5, "Ease Out", .4)
+        self.assertEqual(profile, (.3, "Ease Out", .4, "reverse"))
+        forward = directional_crossover_profile(
+            1, .6, "Cosine", 1.2, True, .5, "Ease Out", .4)
+        self.assertEqual(forward, (.6, "Cosine", 1.2, "forward"))
+
     def test_electrode_centres(self):
         self.assertEqual(vertical_crossfade(0.0), (1.0, 0.0, 0.0, 0.0))
         self.assertAlmostEqual(vertical_crossfade(1 / 3)[1], 1.0)

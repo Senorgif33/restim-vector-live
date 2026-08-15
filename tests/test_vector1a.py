@@ -111,6 +111,46 @@ class QueueTests(unittest.TestCase):
         self.assertEqual((after.alpha, after.beta), (before.alpha, before.beta))
         self.assertEqual(after.mode, MotionMode.TOP_LEFT_BOTTOM_RIGHT)
 
+    def test_reversal_marks_buffered_samples_without_changing_due_times(self):
+        engine = VectorEngine(lambda sample: None, lookahead_seconds=1.0,
+                              clock=lambda: 0.0)
+        engine.resume()
+        engine.receive_l0(0.0, 0, 0.00)
+        engine.receive_l0(0.5, 0, 0.10)
+        engine.step(0.10, 0.10)
+        engine.receive_l0(1.0, 0, 0.20)
+        engine.step(0.20, 0.20)
+        due_before = [item[2].due_at for item in engine._queue]
+        engine.receive_l0(0.9, 0, 0.30)
+        queued = {round(item[2].calculated_at, 2): item[2]
+                  for item in engine._queue}
+        self.assertAlmostEqual(queued[0.20].reversal_distance_seconds, 0.0)
+        self.assertAlmostEqual(queued[0.10].reversal_distance_seconds, 0.1)
+        self.assertAlmostEqual(queued[0.10].stroke_progress, 0.5)
+        self.assertAlmostEqual(queued[0.20].stroke_progress, 1.0)
+        self.assertEqual([item[2].due_at for item in engine._queue], due_before)
+
+    def test_later_reversal_does_not_overwrite_earlier_stroke_progress(self):
+        engine = VectorEngine(lambda sample: None, lookahead_seconds=2.0,
+                              clock=lambda: 0.0)
+        engine.resume()
+        engine.receive_l0(0.0, 0, 0.00)
+        engine.receive_l0(0.5, 0, 0.10)
+        engine.step(0.10, 0.10)
+        engine.receive_l0(1.0, 0, 0.20)
+        engine.step(0.20, 0.20)
+        engine.receive_l0(0.5, 0, 0.30)  # completes the first stroke
+        first_progress = {round(item[2].calculated_at, 2): item[2].stroke_progress
+                          for item in engine._queue}
+        engine.step(0.30, 0.30)
+        engine.receive_l0(0.0, 0, 0.40)
+        engine.receive_l0(0.5, 0, 0.50)  # completes the second stroke
+        queued = {round(item[2].calculated_at, 2): item[2]
+                  for item in engine._queue}
+        self.assertAlmostEqual(queued[0.10].stroke_progress, first_progress[0.10])
+        self.assertAlmostEqual(queued[0.20].stroke_progress, first_progress[0.20])
+        self.assertAlmostEqual(queued[0.30].stroke_progress, 0.5)
+
     def test_interval_free_mfp_samples_produce_normalized_stream_speed(self):
         engine = VectorEngine(lambda sample: None, clock=lambda: 0.0)
         engine.receive_l0(0.6, 0, 0.02)

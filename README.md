@@ -4,7 +4,7 @@ Vector 1A is a live bridge from one MultiFunPlayer `L0` T-code stream to one or
 two ReStim instances. It converts streamed 1D motion into synchronized alpha,
 beta, volume, frequency and pulse controls at a stable internal cadence.
 
-Current development build: **1.6.0-alpha31**.
+Current development build: **1.6.0-alpha32**.
 
 > [!CAUTION]
 > Commission with ReStim's graphical display and stimulation hardware
@@ -37,7 +37,22 @@ second after they begin.
   appropriate to its selected interface.
 - Selectable four-phase electrode signalling sequences (`ABCD`, `ABDC`, `BACD`, `ACBD`),
   cycleable from the Xbox right shoulder button.
-- Optional Rolling Variety morph between the A/B and C/D electrode pairs.
+- Optional Rolling Variety signalling-sequence carousel with stable holds and
+  short constant-energy transitions.
+- Optional speed-adaptive four-phase crossover, with independent slow-motion
+  and fast-motion widths plus a live effective-width display.
+- Optional direction-dependent four-phase trajectory texture: reverse movement
+  can use its own crossover curve, sharpness and width multiplier while
+  retaining continuous stroke endpoints.
+- Four-phase spatial response curves (linear, S-curve, endpoint emphasis and
+  centre emphasis) with adjustable blending and preserved path endpoints;
+  blend 0 is linear and blend 1 applies 100% of the selected response.
+- Optional stroke-reversal emphasis uses buffered reversal points to apply a
+  short, bounded lift from available volume headroom at reversals anywhere in
+  the stroke range. It changes intensity only; sample timing is preserved.
+- Optional stroke-phase texture smoothly varies four-phase crossover width
+  between independently adjustable acceleration and deceleration responses.
+  Buffered stroke progress preserves continuity and output timing.
 - Dynamic volume reduction at rest and smooth return during movement.
 - Live frequency, pulse-frequency, rise-time and pulse-width commissioning.
 - Second ReStim output with tear-shaped prostate alpha/beta and independent
@@ -55,6 +70,10 @@ second after they begin.
   +/-0.20 and prostate phase by +/-45 degrees. Each item has its own persisted
   cycle time, with staggered defaults of 4, 3, 2, 1, and 5 minutes.
 - Neutral, Resume and Stop controls remain visible at the top of the window.
+- Persistent four-phase A/B presets capture the complete transform setup, with
+  editable names, a clean Baseline, modified-state indication and smooth
+  configurable transitions. Use `[` / `]` or hold Xbox LB and press RB to
+  compare A and B without navigating the controls.
 
 ## Requirements
 
@@ -72,7 +91,9 @@ Vector itself has no third-party Python package dependencies.
 3. Leave stimulation hardware disconnected.
 4. In MFP, add a T-code TCP or UDP output to `127.0.0.1:12345`, carrying `L0`.
 5. Set the MFP script offset to **-2.00 seconds**.
-6. In primary ReStim, enable its WebSocket server and enter that port in Vector.
+6. In primary ReStim, enable its **WebSocket server** and enter that port in
+   Vector (normally `12346`). Do not enter ReStim's TCP port (commonly `12347`):
+   Vector's ReStim outputs use WebSocket `/tcode`, not TCP.
 7. Optionally run a second ReStim WebSocket server on port `12350` for prostate
    output.
 8. In Vector, start the listener, connect the output(s), then choose
@@ -82,6 +103,25 @@ Vector itself has no third-party Python package dependencies.
 
 The **Setup guide** button repeats these instructions. Settings are saved at
 `%LOCALAPPDATA%\Vector1A\settings.json`; deleting that file restores defaults.
+
+### Stroke-reversal emphasis
+
+This optional four-phase transform briefly lifts intensity around actual
+buffered stroke reversals without changing motion geometry or sample timing.
+Its live value runs from `0` away from a reversal to `1` at the reversal.
+
+The effect uses only the headroom above **Volume ceiling**. For example, a
+ceiling of `0.90` with **Headroom use** at `0.25` can add at most 2.5 percentage
+points and may be difficult to notice. A clear commissioning test is:
+
+- **Volume ceiling:** `0.70`
+- **Window:** `0.40 s`
+- **Headroom use:** `1.00`
+
+Once confirmed, reduce **Headroom use** or raise **Volume ceiling** to taste.
+As a rough guide, a ceiling near `0.90` is subtle, `0.80` is moderate, and
+`0.70` is pronounced when full headroom is enabled. Commission visually with
+stimulation hardware disconnected before connected use.
 
 ## Output axes
 

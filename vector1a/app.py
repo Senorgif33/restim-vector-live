@@ -13,9 +13,11 @@ from .settings import load_settings, save_settings, settings_path
 from .controller import (A, B, X, Y, START, LEFT_SHOULDER, RIGHT_SHOULDER, DPAD_UP, DPAD_DOWN,
                          DPAD_LEFT, DPAD_RIGHT, XInputController)
 from .variety import fit_range_for_travel, rolling_offset, rolling_value
-from .fourphase import (ELECTRODE_ORDERS, directed_signed, map_electrode_order,
+from .fourphase import (ELECTRODE_ORDERS, adaptive_crossover_width, directed_signed,
+                        directional_crossover_profile, map_electrode_order,
                         morph_electrode_order, potential_roles, sequence_cycle_stage,
-                        restim_crossfade, vertical_crossfade)
+                        spatial_response, reversal_emphasis_envelope,
+                        stroke_phase_crossover, restim_crossfade, vertical_crossfade)
 from . import __version__
 
 
@@ -65,6 +67,20 @@ class CollapsibleSection(ttk.Frame):
 
 
 class VectorApp:
+    FOUR_PHASE_PRESET_FIELDS = (
+        "four_phase_return_depth", "four_phase_invert", "four_phase_volume_ceiling",
+        "four_phase_volume_modulation", "four_phase_volume_headroom",
+        "four_phase_volume_cycle", "four_phase_crossover_width",
+        "four_phase_crossover_curve", "four_phase_crossover_sharpness",
+        "four_phase_adaptive_crossover", "four_phase_slow_crossover_width",
+        "four_phase_fast_crossover_width", "four_phase_directional_trajectory",
+        "four_phase_reverse_width_scale", "four_phase_reverse_curve",
+        "four_phase_reverse_sharpness", "four_phase_spatial_curve",
+        "four_phase_spatial_blend", "four_phase_reversal_emphasis",
+        "four_phase_reversal_window", "four_phase_reversal_strength",
+        "four_phase_stroke_phase_texture", "four_phase_acceleration_width_scale",
+        "four_phase_deceleration_width_scale", "electrode_order",
+    )
     SETTINGS_FIELDS = (
         "mfp_host", "mfp_port", "restim_host", "restim_port", "prostate_host", "prostate_port",
         "four_phase_host", "four_phase_port",
@@ -79,7 +95,16 @@ class VectorApp:
         "four_phase_invert", "four_phase_volume_ceiling", "four_phase_volume_modulation",
         "four_phase_volume_headroom", "four_phase_volume_cycle",
         "four_phase_crossover_width", "four_phase_crossover_curve",
-        "four_phase_crossover_sharpness",
+        "four_phase_crossover_sharpness", "four_phase_adaptive_crossover",
+        "four_phase_slow_crossover_width", "four_phase_fast_crossover_width",
+        "four_phase_directional_trajectory", "four_phase_reverse_width_scale",
+        "four_phase_reverse_curve", "four_phase_reverse_sharpness",
+        "four_phase_spatial_curve", "four_phase_spatial_blend",
+        "four_phase_reversal_emphasis", "four_phase_reversal_window",
+        "four_phase_reversal_strength",
+        "four_phase_stroke_phase_texture", "four_phase_acceleration_width_scale",
+        "four_phase_deceleration_width_scale",
+        "preset_a_name", "preset_b_name", "preset_transition_seconds",
         "electrode_order", "variety_electrode_morph", "variety_electrode_morph_cycle",
         "variety_electrode_morph_transition_seconds",
         "jitter_enabled", "jitter_amplitude", "jitter_cycle_seconds",
@@ -147,6 +172,33 @@ class VectorApp:
         self.four_phase_crossover_width = tk.DoubleVar(value=1.0)
         self.four_phase_crossover_curve = tk.StringVar(value="Cosine")
         self.four_phase_crossover_sharpness = tk.DoubleVar(value=1.0)
+        self.four_phase_adaptive_crossover = tk.BooleanVar(value=False)
+        self.four_phase_slow_crossover_width = tk.DoubleVar(value=.90)
+        self.four_phase_fast_crossover_width = tk.DoubleVar(value=.35)
+        self.four_phase_effective_crossover_width = tk.StringVar(value="1.000")
+        self.four_phase_directional_trajectory = tk.BooleanVar(value=False)
+        self.four_phase_reverse_width_scale = tk.DoubleVar(value=.75)
+        self.four_phase_reverse_curve = tk.StringVar(value="Ease Out")
+        self.four_phase_reverse_sharpness = tk.DoubleVar(value=.6)
+        self.four_phase_spatial_curve = tk.StringVar(value="Linear")
+        self.four_phase_spatial_blend = tk.DoubleVar(value=.5)
+        self.four_phase_spatial_live = tk.StringVar(value="live 0.500")
+        self.four_phase_reversal_emphasis = tk.BooleanVar(value=False)
+        self.four_phase_reversal_window = tk.DoubleVar(value=.35)
+        self.four_phase_reversal_strength = tk.DoubleVar(value=.20)
+        self.four_phase_reversal_live = tk.StringVar(value="live 0.000")
+        self.four_phase_stroke_phase_texture = tk.BooleanVar(value=False)
+        self.four_phase_acceleration_width_scale = tk.DoubleVar(value=.70)
+        self.four_phase_deceleration_width_scale = tk.DoubleVar(value=1.20)
+        self.four_phase_stroke_phase_live = tk.StringVar(value="off")
+        self.preset_a_name = tk.StringVar(value="A")
+        self.preset_b_name = tk.StringVar(value="B")
+        self.preset_transition_seconds = tk.DoubleVar(value=2.5)
+        self.preset_status = tk.StringVar(value="No preset active")
+        self._preset_slots: dict[str, dict] = {}
+        self._preset_active: str | None = None
+        self._preset_transition = None
+        self._preset_window = None
         self.electrode_order = tk.StringVar(value="ABCD")
         self.variety_electrode_morph = tk.BooleanVar(value=False)
         self.variety_electrode_morph_cycle = tk.DoubleVar(value=6.0)
@@ -237,6 +289,7 @@ class VectorApp:
         ttk.Button(toolbar, text="STOP", command=self.stop).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Setup guide", command=self.show_setup_guide).pack(side="left", padx=(18, 6))
         ttk.Button(toolbar, text="Rolling Variety", command=self.show_variety_window).pack(side="left", padx=6)
+        ttk.Button(toolbar, text="Presets A/B", command=self.show_preset_window).pack(side="left", padx=6)
         ttk.Label(toolbar, textvariable=self.diag_vars["state"]).pack(side="right", padx=8)
 
         mfp = self._frame("MultiFunPlayer input", 0, 0)
@@ -466,24 +519,87 @@ class VectorApp:
         self.electrode_morph_bar = ttk.Progressbar(
             four_phase, orient="horizontal", mode="determinate", maximum=1.0, length=120)
         self.electrode_morph_bar.grid(row=7, column=5, sticky="w")
+        ttk.Checkbutton(four_phase, text="Speed-adaptive crossover",
+                        variable=self.four_phase_adaptive_crossover).grid(
+                            row=8, column=0, sticky="w")
+        ttk.Label(four_phase, text="Low-speed width").grid(row=8, column=1, sticky="e")
+        ttk.Spinbox(four_phase, from_=.05, to=1, increment=.05,
+                    textvariable=self.four_phase_slow_crossover_width,
+                    width=7).grid(row=8, column=2, sticky="w")
+        ttk.Label(four_phase, text="High-speed width").grid(row=8, column=3, sticky="e")
+        ttk.Spinbox(four_phase, from_=.05, to=1, increment=.05,
+                    textvariable=self.four_phase_fast_crossover_width,
+                    width=7).grid(row=8, column=4, sticky="w")
+        ttk.Label(four_phase, textvariable=self.four_phase_effective_crossover_width,
+                  width=12).grid(row=8, column=5, sticky="w", padx=8)
+        ttk.Checkbutton(four_phase, text="Direction-dependent trajectory",
+                        variable=self.four_phase_directional_trajectory).grid(
+                            row=9, column=0, sticky="w")
+        ttk.Label(four_phase, text="Reverse width ×").grid(row=9, column=1, sticky="e")
+        ttk.Spinbox(four_phase, from_=.2, to=3, increment=.05,
+                    textvariable=self.four_phase_reverse_width_scale,
+                    width=7).grid(row=9, column=2, sticky="w")
+        ttk.Label(four_phase, text="Reverse curve").grid(row=9, column=3, sticky="e")
+        ttk.Combobox(four_phase, textvariable=self.four_phase_reverse_curve,
+                     values=("Cosine", "Linear", "Ease In", "Ease Out", "S-curve"),
+                     state="readonly", width=10).grid(row=9, column=4, sticky="w")
+        reverse_sharpness = ttk.Frame(four_phase)
+        reverse_sharpness.grid(row=9, column=5, sticky="w", padx=8)
+        ttk.Label(reverse_sharpness, text="Sharpness").pack(side="left")
+        ttk.Spinbox(reverse_sharpness, from_=.2, to=5, increment=.1,
+                    textvariable=self.four_phase_reverse_sharpness,
+                    width=7).pack(side="left", padx=(4, 0))
+        ttk.Label(four_phase, text="Spatial response").grid(row=10, column=0, sticky="w")
+        ttk.Combobox(four_phase, textvariable=self.four_phase_spatial_curve,
+                     values=("Linear", "S-curve", "Endpoint emphasis", "Centre emphasis"),
+                     state="readonly", width=18).grid(row=10, column=1, columnspan=2, sticky="w")
+        ttk.Label(four_phase, text="Blend (1 = 100% selected response)").grid(
+            row=10, column=3, sticky="e")
+        ttk.Spinbox(four_phase, from_=0, to=1, increment=.05,
+                    textvariable=self.four_phase_spatial_blend,
+                    width=7).grid(row=10, column=4, sticky="w")
+        ttk.Label(four_phase, textvariable=self.four_phase_spatial_live,
+                  width=12).grid(row=10, column=5, sticky="w", padx=8)
+        ttk.Checkbutton(four_phase, text="Stroke-reversal emphasis",
+                        variable=self.four_phase_reversal_emphasis).grid(row=11, column=0, sticky="w")
+        ttk.Label(four_phase, text="Window (s)").grid(row=11, column=1, sticky="e")
+        ttk.Spinbox(four_phase, from_=.05, to=1.5, increment=.05,
+                    textvariable=self.four_phase_reversal_window, width=7).grid(row=11, column=2, sticky="w")
+        ttk.Label(four_phase, text="Headroom use").grid(row=11, column=3, sticky="e")
+        ttk.Spinbox(four_phase, from_=0, to=1, increment=.05,
+                    textvariable=self.four_phase_reversal_strength, width=7).grid(row=11, column=4, sticky="w")
+        ttk.Label(four_phase, textvariable=self.four_phase_reversal_live,
+                  width=12).grid(row=11, column=5, sticky="w", padx=8)
+        ttk.Checkbutton(four_phase, text="Stroke-phase texture",
+                        variable=self.four_phase_stroke_phase_texture).grid(row=12, column=0, sticky="w")
+        ttk.Label(four_phase, text="Acceleration width ×").grid(row=12, column=1, sticky="e")
+        ttk.Spinbox(four_phase, from_=.2, to=3, increment=.05,
+                    textvariable=self.four_phase_acceleration_width_scale,
+                    width=7).grid(row=12, column=2, sticky="w")
+        ttk.Label(four_phase, text="Deceleration width ×").grid(row=12, column=3, sticky="e")
+        ttk.Spinbox(four_phase, from_=.2, to=3, increment=.05,
+                    textvariable=self.four_phase_deceleration_width_scale,
+                    width=7).grid(row=12, column=4, sticky="w")
+        ttk.Label(four_phase, textvariable=self.four_phase_stroke_phase_live,
+                  width=20).grid(row=12, column=5, sticky="w", padx=8)
         ttk.Separator(four_phase, orient="horizontal").grid(
-            row=8, column=0, columnspan=6, sticky="ew", pady=7)
+            row=13, column=0, columnspan=6, sticky="ew", pady=7)
         self.four_phase_signed_values = []
         for offset, label in enumerate(("A signed", "B signed", "C signed", "D signed")):
-            row = offset + 9
+            row = offset + 14
             ttk.Label(four_phase, text=label, width=18).grid(row=row, column=0, sticky="w")
             value = tk.StringVar(value="+0.0000")
             ttk.Label(four_phase, textvariable=value, width=10,
                       font=("TkDefaultFont", 10, "bold")).grid(row=row, column=1, sticky="w")
             self.four_phase_signed_values.append(value)
         ttk.Label(four_phase, text="Conceptual relative potentials (−1 to +1); not T-code") \
-            .grid(row=9, column=2, columnspan=4, sticky="w", padx=8)
+            .grid(row=14, column=2, columnspan=4, sticky="w", padx=8)
         ttk.Separator(four_phase, orient="horizontal").grid(
-            row=13, column=0, columnspan=6, sticky="ew", pady=7)
+            row=18, column=0, columnspan=6, sticky="ew", pady=7)
         self.four_phase_potential_bars, self.four_phase_potential_values = [], []
         for offset, label in enumerate(("E1 / A potential", "E2 / B potential",
                                         "E3 / C potential", "E4 / D potential")):
-            row = offset + 14
+            row = offset + 19
             ttk.Label(four_phase, text=label, width=18).grid(row=row, column=0, sticky="w")
             ttk.Label(four_phase, text="0").grid(row=row, column=1)
             bar = ttk.Progressbar(four_phase, orient="horizontal", mode="determinate",
@@ -497,17 +613,17 @@ class VectorApp:
             self.four_phase_potential_values.append(value)
         self.four_phase_roles = tk.StringVar(value="Primary -- | preferred return --")
         ttk.Label(four_phase, textvariable=self.four_phase_roles,
-                  foreground="#9b4b00").grid(row=14, column=5, rowspan=4, sticky="w", padx=18)
+                  foreground="#9b4b00").grid(row=19, column=5, rowspan=4, sticky="w", padx=18)
         ttk.Checkbutton(four_phase,
                         text="Send E1–E4 visual test (FOC-Stim hardware MUST be disconnected)",
                         variable=self.send_four_phase_visual,
                         command=self._four_phase_send_toggle).grid(
-                            row=18, column=0, columnspan=4, sticky="w", pady=(8, 2))
+                            row=23, column=0, columnspan=4, sticky="w", pady=(8, 2))
         ttk.Label(four_phase, textvariable=self.four_phase_status).grid(
-            row=18, column=4, columnspan=2, sticky="w", padx=8)
+            row=23, column=4, columnspan=2, sticky="w", padx=8)
         # The internal commissioning plots remain available to the refresh code,
         # but are intentionally hidden in the publication UI.
-        for hidden_row in (*range(0, 5), *range(8, 14), 18):
+        for hidden_row in (*range(0, 5), *range(13, 19), 23):
             for widget in four_phase.grid_slaves(row=hidden_row):
                 widget.grid_remove()
 
@@ -638,6 +754,8 @@ class VectorApp:
                             ("<j>", lambda: self._shift_control_range("pulse_width", -1)),
                             ("<l>", lambda: self._shift_control_range("pulse_width", 1)),
                             ("<o>", self._cycle_electrode_order),
+                            ("<bracketleft>", lambda: self._apply_preset("A")),
+                            ("<bracketright>", lambda: self._apply_preset("B")),
                             ("<Prior>", lambda: self._adjust_prostate_phase(1)),
                             ("<Next>", lambda: self._adjust_prostate_phase(-1)),
                             ("<Return>", self.resume), ("<space>", self.neutral),
@@ -736,7 +854,11 @@ class VectorApp:
         if buttons & START: self.stop()
         if buttons & X: self._adjust_prostate_phase(1)
         if buttons & Y: self._adjust_prostate_phase(-1)
-        if buttons & RIGHT_SHOULDER: self._cycle_electrode_order()
+        if buttons & RIGHT_SHOULDER:
+            if modified:
+                self._toggle_ab_preset()
+            else:
+                self._cycle_electrode_order()
         if modified:
             if buttons & DPAD_UP: self._shift_control_range("pulse_rise", 1)
             if buttons & DPAD_DOWN: self._shift_control_range("pulse_rise", -1)
@@ -840,6 +962,37 @@ class VectorApp:
             base, (elapsed % full_cycle) / full_cycle,
             transition_seconds / stage_seconds)
 
+    def _effective_crossover_width(self, speed_percent: float) -> float:
+        if not self.four_phase_adaptive_crossover.get():
+            return min(1.0, max(.05, self.four_phase_crossover_width.get()))
+        return adaptive_crossover_width(
+            speed_percent, self.four_phase_slow_crossover_width.get(),
+            self.four_phase_fast_crossover_width.get())
+
+    def _crossover_profile(self, speed_percent: float, direction: int,
+                           stroke_progress: float = .5
+                           ) -> tuple[float, str, float, str]:
+        width, curve, sharpness, direction_name = directional_crossover_profile(
+            direction, self._effective_crossover_width(speed_percent),
+            self.four_phase_crossover_curve.get(),
+            self.four_phase_crossover_sharpness.get(),
+            self.four_phase_directional_trajectory.get(),
+            self.four_phase_reverse_width_scale.get(),
+            self.four_phase_reverse_curve.get(),
+            self.four_phase_reverse_sharpness.get())
+        width, phase_name = stroke_phase_crossover(
+            width, stroke_progress, self.four_phase_stroke_phase_texture.get(),
+            self.four_phase_acceleration_width_scale.get(),
+            self.four_phase_deceleration_width_scale.get())
+        if self.four_phase_stroke_phase_texture.get():
+            direction_name = f"{direction_name} {phase_name}"
+        return width, curve, sharpness, direction_name
+
+    def _spatial_path(self, output_l0: float) -> float:
+        path_l0 = 1.0 - output_l0 if self.four_phase_invert.get() else output_l0
+        return spatial_response(path_l0, self.four_phase_spatial_curve.get(),
+                                self.four_phase_spatial_blend.get())
+
     def apply_config(self) -> None:
         try:
             selected = MotionMode(self.mode.get())
@@ -885,12 +1038,129 @@ class VectorApp:
                     getattr(self, name).set(saved[name])
                 except tk.TclError:
                     pass
+        slots = saved.get("four_phase_presets", {})
+        if isinstance(slots, dict):
+            for slot in ("A", "B"):
+                if isinstance(slots.get(slot), dict):
+                    self._preset_slots[slot] = slots[slot]
         return not bool(saved.get("first_run_complete"))
 
     def _save_settings(self) -> None:
         values = {name: getattr(self, name).get() for name in self.SETTINGS_FIELDS}
+        values["four_phase_presets"] = self._preset_slots
         values["first_run_complete"] = True
         save_settings(values)
+
+    def _preset_snapshot(self) -> dict:
+        return {name: getattr(self, name).get()
+                for name in self.FOUR_PHASE_PRESET_FIELDS}
+
+    def _baseline_preset(self) -> dict:
+        baseline = self._preset_snapshot()
+        baseline.update({
+            "four_phase_return_depth": .30,
+            "four_phase_invert": False,
+            "four_phase_volume_ceiling": .85,
+            "four_phase_volume_modulation": False,
+            "four_phase_crossover_width": .50,
+            "four_phase_crossover_curve": "Linear",
+            "four_phase_crossover_sharpness": 1.0,
+            "four_phase_adaptive_crossover": False,
+            "four_phase_directional_trajectory": False,
+            "four_phase_spatial_curve": "Linear",
+            "four_phase_spatial_blend": 0.0,
+            "four_phase_reversal_emphasis": False,
+            "four_phase_stroke_phase_texture": False,
+            "electrode_order": "ABCD",
+        })
+        return baseline
+
+    def _capture_preset(self, slot: str) -> None:
+        self._preset_slots[slot] = self._preset_snapshot()
+        self._preset_active = slot
+        name = self.preset_a_name.get() if slot == "A" else self.preset_b_name.get()
+        self.preset_status.set(f"Captured and active: {slot} — {name}")
+        self._save_settings()
+
+    def _apply_preset(self, slot: str) -> None:
+        target = self._baseline_preset() if slot == "Baseline" else self._preset_slots.get(slot)
+        if not target:
+            self.preset_status.set(f"Preset {slot} is empty; capture it first")
+            return
+        duration = max(.1, min(10.0, self.preset_transition_seconds.get()))
+        self._preset_transition = (self._preset_snapshot(), target.copy(),
+                                   time.monotonic(), duration, slot)
+        self._preset_active = slot
+        self.preset_status.set(f"Transitioning to {slot}")
+        self._preset_transition_tick()
+
+    def _preset_transition_tick(self) -> None:
+        if self._preset_transition is None:
+            return
+        start, target, started, duration, slot = self._preset_transition
+        progress = min(1.0, max(0.0, (time.monotonic() - started) / duration))
+        eased = progress * progress * (3.0 - 2.0 * progress)
+        for name in self.FOUR_PHASE_PRESET_FIELDS:
+            old, new = start.get(name), target.get(name)
+            if old is None or new is None:
+                continue
+            if isinstance(old, bool) or isinstance(new, bool) or isinstance(old, str):
+                value = new if progress >= .5 else old
+            else:
+                value = old + (new - old) * eased
+            getattr(self, name).set(value)
+        self.preset_status.set(f"Transitioning to {slot}: {progress * 100:.0f}%")
+        if progress < 1.0:
+            self.root.after(20, self._preset_transition_tick)
+        else:
+            self._preset_transition = None
+            label = ("Baseline" if slot == "Baseline" else
+                     (self.preset_a_name.get() if slot == "A" else self.preset_b_name.get()))
+            self.preset_status.set(f"Active: {slot} — {label}")
+
+    def _toggle_ab_preset(self) -> None:
+        self._apply_preset("B" if self._preset_active == "A" else "A")
+
+    def _preset_matches(self, target: dict) -> bool:
+        current = self._preset_snapshot()
+        for name in self.FOUR_PHASE_PRESET_FIELDS:
+            left, right = current.get(name), target.get(name)
+            if isinstance(left, (int, float)) and not isinstance(left, bool):
+                if abs(float(left) - float(right)) > 1e-4:
+                    return False
+            elif left != right:
+                return False
+        return True
+
+    def show_preset_window(self) -> None:
+        if self._preset_window is not None and self._preset_window.winfo_exists():
+            self._preset_window.lift()
+            return
+        window = tk.Toplevel(self.root)
+        self._preset_window = window
+        window.title("Four-phase presets A/B")
+        window.resizable(False, False)
+        body = ttk.Frame(window, padding=14)
+        body.grid(sticky="nsew")
+        ttk.Label(body, text="Name").grid(row=0, column=1, sticky="w")
+        for row, (slot, variable) in enumerate((("A", self.preset_a_name),
+                                                ("B", self.preset_b_name)), start=1):
+            ttk.Label(body, text=f"Preset {slot}").grid(row=row, column=0, sticky="w", pady=4)
+            ttk.Entry(body, textvariable=variable, width=24).grid(row=row, column=1, padx=6)
+            ttk.Button(body, text="Capture current",
+                       command=lambda s=slot: self._capture_preset(s)).grid(row=row, column=2, padx=4)
+            ttk.Button(body, text="Apply",
+                       command=lambda s=slot: self._apply_preset(s)).grid(row=row, column=3, padx=4)
+        ttk.Button(body, text="Apply clean Baseline",
+                   command=lambda: self._apply_preset("Baseline")).grid(
+                       row=3, column=0, columnspan=2, sticky="w", pady=(10, 4))
+        ttk.Label(body, text="Transition (s)").grid(row=3, column=2, sticky="e")
+        ttk.Spinbox(body, from_=.1, to=10, increment=.1,
+                    textvariable=self.preset_transition_seconds, width=7).grid(row=3, column=3)
+        ttk.Label(body, textvariable=self.preset_status,
+                  foreground="#555").grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 2))
+        ttk.Label(body, text="Keyboard: [ applies A, ] applies B. Direct Xbox: hold LB and press RB to toggle A/B.",
+                  foreground="#555").grid(row=5, column=0, columnspan=4, sticky="w")
 
     def show_setup_guide(self) -> None:
         messagebox.showinfo(
@@ -899,7 +1169,8 @@ class VectorApp:
             "1. Leave stimulation hardware disconnected.\n"
             "2. In MFP, send L0 by UDP or TCP to 127.0.0.1:12345.\n"
             "3. Set the MFP script offset to -2.00 seconds.\n"
-            "4. Enable the primary ReStim WebSocket server and enter its port in Vector.\n"
+            "4. Enable the primary ReStim WebSocket server and enter its port in Vector "
+            "(normally 12346). Do NOT use ReStim's TCP port (commonly 12347).\n"
             "5. For prostate output, run a second ReStim WebSocket server on port 12350.\n"
             "6. Start the listener, connect both outputs, then select Start / Resume.\n\n"
             "Fine-tune MFP around -2.00 seconds while leaving Vector's delay at 2.00 seconds.\n\n"
@@ -907,16 +1178,19 @@ class VectorApp:
         )
 
     def _send_sample(self, sample: OutputSample) -> None:
-        path_l0 = 1.0 - sample.output_l0 if self.four_phase_invert.get() else sample.output_l0
+        path_l0 = self._spatial_path(sample.output_l0)
         delta = path_l0 - self._four_phase_send_last_l0
         if abs(delta) > 0.0005:
             self._four_phase_send_direction = 1 if delta > 0 else -1
         self._four_phase_send_last_l0 = path_l0
+        crossover_width, crossover_curve, crossover_sharpness, _ = \
+            self._crossover_profile(sample.speed_percent,
+                                    self._four_phase_send_direction,
+                                    sample.stroke_progress)
         electrodes = restim_crossfade(
             path_l0, self._four_phase_send_direction,
-            self.four_phase_return_depth.get(), self.four_phase_crossover_width.get(),
-            self.four_phase_crossover_curve.get(),
-            self.four_phase_crossover_sharpness.get())
+            self.four_phase_return_depth.get(), crossover_width,
+            crossover_curve, crossover_sharpness)
         morph_source, morph_target, morph_amount = self._electrode_morph_state(sample.due_at)
         if morph_source == morph_target:
             electrodes = map_electrode_order(electrodes, morph_source)
@@ -929,6 +1203,11 @@ class VectorApp:
             wave = (1.0 - math.cos((sample.calculated_at % cycle)
                                    * 2.0 * math.pi / cycle)) / 2.0
             ceiling = min(1.0, ceiling + self.four_phase_volume_headroom.get() * wave)
+        if self.four_phase_reversal_emphasis.get():
+            reversal = reversal_emphasis_envelope(
+                sample.reversal_distance_seconds, self.four_phase_reversal_window.get())
+            strength = min(1.0, max(0.0, self.four_phase_reversal_strength.get()))
+            ceiling += (1.0 - ceiling) * strength * reversal
         primary_volume = min(1.0, max(0.0,
             ceiling * sample.volume / max(self.volume.get(), 1e-9)))
         self.restim.send_primary(
@@ -959,6 +1238,16 @@ class VectorApp:
     def _refresh(self) -> None:
         self._drain_controller_events()
         self._update_variety()
+        if self._preset_transition is None and self._preset_active:
+            target = (self._baseline_preset() if self._preset_active == "Baseline"
+                      else self._preset_slots.get(self._preset_active))
+            if target:
+                label = ("Baseline" if self._preset_active == "Baseline" else
+                         (self.preset_a_name.get() if self._preset_active == "A"
+                          else self.preset_b_name.get()))
+                suffix = "" if self._preset_matches(target) else " (modified)"
+                self.preset_status.set(
+                    f"Active: {self._preset_active} — {label}{suffix}")
         diag = self.engine.diagnostics()
         values = {
             "raw_l0": f"{diag.raw_l0:.4f}", "output_l0": f"{diag.output_l0:.4f}",
@@ -997,7 +1286,12 @@ class VectorApp:
                            ("volume_prostate", diag.volume_prostate)):
             self.prostate_bars[key]["value"] = value
             self.prostate_values[key].set(f"{value:.4f}")
-        path_l0 = 1.0 - diag.output_l0 if self.four_phase_invert.get() else diag.output_l0
+        path_l0 = self._spatial_path(diag.output_l0)
+        self.four_phase_spatial_live.set(f"live {path_l0:.3f}")
+        reversal = (reversal_emphasis_envelope(
+            diag.reversal_distance_seconds, self.four_phase_reversal_window.get())
+            if self.four_phase_reversal_emphasis.get() else 0.0)
+        self.four_phase_reversal_live.set(f"live {reversal:.3f}")
         four_phase = vertical_crossfade(path_l0)
         for bar, variable, value in zip(self.four_phase_bars, self.four_phase_values,
                                         four_phase):
@@ -1010,11 +1304,21 @@ class VectorApp:
         signed, primary_index, return_index = directed_signed(
             path_l0, self._four_phase_direction,
             self.four_phase_return_depth.get())
+        effective_crossover, effective_curve, effective_sharpness, direction_name = \
+            self._crossover_profile(diag.speed_percent, self._four_phase_direction,
+                                    diag.stroke_progress)
+        self.four_phase_effective_crossover_width.set(
+            f"{direction_name} {effective_crossover:.3f}")
+        if self.four_phase_stroke_phase_texture.get():
+            phase_name = "accelerating" if diag.stroke_progress < .5 else "decelerating"
+            self.four_phase_stroke_phase_live.set(
+                f"{phase_name} {diag.stroke_progress:.2f} | live {effective_crossover:.3f}")
+        else:
+            self.four_phase_stroke_phase_live.set("off")
         potentials = restim_crossfade(path_l0, self._four_phase_direction,
                                       self.four_phase_return_depth.get(),
-                                      self.four_phase_crossover_width.get(),
-                                      self.four_phase_crossover_curve.get(),
-                                      self.four_phase_crossover_sharpness.get())
+                                      effective_crossover,
+                                      effective_curve, effective_sharpness)
         morph_source, morph_target, morph_amount = self._electrode_morph_state()
         if morph_source == morph_target:
             potentials = map_electrode_order(potentials, morph_source)

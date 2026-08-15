@@ -5,6 +5,78 @@ import math
 ELECTRODE_ORDERS = ("ABCD", "ABDC", "BACD", "ACBD")
 
 
+def adaptive_crossover_width(speed_percent: float, slow_width: float,
+                             fast_width: float) -> float:
+    """Interpolate crossover width from slow to fast using normalized speed."""
+    speed = min(1.0, max(0.0, speed_percent / 100.0))
+    slow = min(1.0, max(.05, slow_width))
+    fast = min(1.0, max(.05, fast_width))
+    # Smoothstep avoids a sharp response at either end of the speed range.
+    blend = speed * speed * (3.0 - 2.0 * speed)
+    return slow + (fast - slow) * blend
+
+
+def directional_crossover_profile(direction: int, width: float, curve: str,
+                                  sharpness: float, enabled: bool,
+                                  reverse_width_scale: float,
+                                  reverse_curve: str,
+                                  reverse_sharpness: float
+                                  ) -> tuple[float, str, float, str]:
+    """Select a continuous forward/reverse crossover profile."""
+    width = min(1.0, max(.05, width))
+    sharpness = min(5.0, max(.2, sharpness))
+    if enabled and direction < 0:
+        scale = min(3.0, max(.2, reverse_width_scale))
+        return (min(1.0, max(.05, width * scale)), reverse_curve,
+                min(5.0, max(.2, reverse_sharpness)), "reverse")
+    return width, curve, sharpness, "forward"
+
+
+def spatial_response(position: float, curve: str = "Linear",
+                     blend: float = 1.0) -> float:
+    """Monotonically reshape a four-phase path while preserving 0, .5 and 1."""
+    position = min(1.0, max(0.0, position))
+    blend = min(1.0, max(0.0, blend))
+    name = curve.strip().lower()
+    if name in ("s-curve", "s curve"):
+        shaped = position * position * (3.0 - 2.0 * position)
+    elif name in ("endpoint emphasis", "endpoints"):
+        distance = abs(position - .5) * 2.0
+        shaped = .5 + math.copysign(.5 * math.sqrt(distance), position - .5)
+    elif name in ("centre emphasis", "center emphasis", "centre", "center"):
+        distance = abs(position - .5) * 2.0
+        shaped = .5 + math.copysign(.5 * distance * distance, position - .5)
+    else:
+        shaped = position
+    return position + (shaped - position) * blend
+
+
+def reversal_emphasis_envelope(distance_seconds: float,
+                               window_seconds: float) -> float:
+    """Cosine emphasis centred on a known stroke reversal."""
+    window = max(.01, window_seconds)
+    distance = abs(distance_seconds)
+    if not math.isfinite(distance) or distance >= window:
+        return 0.0
+    return (1.0 + math.cos(math.pi * distance / window)) / 2.0
+
+
+def stroke_phase_crossover(width: float, progress: float, enabled: bool,
+                           acceleration_scale: float,
+                           deceleration_scale: float) -> tuple[float, str]:
+    """Smoothly vary crossover width from stroke start to stroke end."""
+    width = min(1.0, max(.05, width))
+    progress = min(1.0, max(0.0, progress))
+    if not enabled:
+        return width, "off"
+    acceleration_scale = min(3.0, max(.2, acceleration_scale))
+    deceleration_scale = min(3.0, max(.2, deceleration_scale))
+    blend = progress * progress * (3.0 - 2.0 * progress)
+    scale = acceleration_scale + (deceleration_scale - acceleration_scale) * blend
+    phase = "accelerating" if progress < .5 else "decelerating"
+    return min(1.0, max(.05, width * scale)), phase
+
+
 def pair_swapped_order(order: str) -> str:
     """Return the discrete destination of a full A/B + C/D pair morph."""
     if order not in ELECTRODE_ORDERS:

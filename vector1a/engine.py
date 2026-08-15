@@ -30,6 +30,8 @@ class OutputSample:
     alpha_prostate: float
     beta_prostate: float
     volume_prostate: float
+    reversal_distance_seconds: float = math.inf
+    stroke_progress: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,8 @@ class Diagnostics:
     alpha_prostate: float = 0.5
     beta_prostate: float = 0.5
     volume_prostate: float = 0.0
+    reversal_distance_seconds: float = math.inf
+    stroke_progress: float = 0.5
 
 
 class VectorEngine:
@@ -251,6 +255,18 @@ class VectorEngine:
         """
         rewritten: list[tuple[float, int, OutputSample]] = []
         for due_at, sequence, sample in self._queue:
+            sample = replace(
+                sample,
+                reversal_distance_seconds=min(
+                    sample.reversal_distance_seconds,
+                    abs(sample.calculated_at - stroke.end_time)))
+            # A reversal timestamp is both the end of one stroke and the start
+            # of the next. Keep that shared sample owned by the stroke that
+            # ended there; the first later sample starts the new stroke.
+            if stroke.start_time < sample.calculated_at <= stroke.end_time:
+                sample = replace(
+                    sample,
+                    stroke_progress=self._stroke_progress(stroke, sample.calculated_at))
             if (sample.mode == MotionMode.RESTIM_ORIGINAL
                     and stroke.start_time <= sample.calculated_at <= stroke.end_time):
                 alpha, beta, position, speed = self.calculator.calculate(
@@ -266,6 +282,17 @@ class VectorEngine:
             rewritten.append((due_at, sequence, sample))
         self._queue = rewritten
         heapq.heapify(self._queue)
+
+    def _nearest_reversal_distance(self, at_time: float) -> float:
+        return min((abs(at_time - stroke.end_time)
+                    for stroke in self._completed_strokes), default=math.inf)
+
+    @staticmethod
+    def _stroke_progress(stroke: SegmentState, at_time: float) -> float:
+        duration = stroke.end_time - stroke.start_time
+        if duration <= 1e-9:
+            return 0.5
+        return min(1.0, max(0.0, (at_time - stroke.start_time) / duration))
 
     def _stroke_for_time(self, scheduled_at: float) -> SegmentState:
         for stroke in reversed(self._completed_strokes):
@@ -337,6 +364,8 @@ class VectorEngine:
                 pulse_rise_time,
                 pulse_width,
                 alpha_prostate, beta_prostate, volume_prostate,
+                self._nearest_reversal_distance(scheduled_at),
+                self._stroke_progress(prostate_segment, scheduled_at),
             )
             heapq.heappush(self._queue, (sample.due_at, sample.sequence, sample))
 
@@ -379,6 +408,8 @@ class VectorEngine:
                     sample.pulse_rise_time,
                     sample.pulse_width,
                     sample.alpha_prostate, sample.beta_prostate, sample.volume_prostate,
+                    sample.reversal_distance_seconds,
+                    sample.stroke_progress,
                 )
         with self._lock:
             if not due:
