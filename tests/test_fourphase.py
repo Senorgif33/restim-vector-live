@@ -7,7 +7,8 @@ from vector1a.fourphase import (adaptive_crossover_width, apply_group_delay, cro
                                 interpolate_electrodes, morph_electrode_order, moving_sequence_window,
                                 normalize_signed, pair_morph,
                                 potential_roles, pair_swapped_order, restim_crossfade,
-                                reversal_emphasis_envelope, sequence_cycle_stage, spatial_response,
+                                proportional_reversal_boost, reversal_emphasis_envelope,
+                                sequence_cycle_stage, spatial_response,
                                 stroke_phase_crossover, vertical_crossfade)
 
 
@@ -75,6 +76,11 @@ class FourPhaseCommissioningTests(unittest.TestCase):
         values = [reversal_emphasis_envelope(step / 100, .4) for step in range(41)]
         self.assertTrue(all(0 <= value <= 1 for value in values))
         self.assertTrue(all(a >= b for a, b in zip(values, values[1:])))
+
+    def test_reversal_boost_is_proportional_to_current_volume(self):
+        self.assertAlmostEqual(proportional_reversal_boost(.40, 1.0, .20), .48)
+        self.assertAlmostEqual(proportional_reversal_boost(.80, .5, .20), .88)
+        self.assertEqual(proportional_reversal_boost(.95, 1.0, .20), 1.0)
 
     def test_spatial_curves_preserve_endpoints_and_centre(self):
         for curve in ("Linear", "S-curve", "Endpoint emphasis", "Centre emphasis"):

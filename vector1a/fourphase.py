@@ -61,6 +61,15 @@ def reversal_emphasis_envelope(distance_seconds: float,
     return (1.0 + math.cos(math.pi * distance / window)) / 2.0
 
 
+def proportional_reversal_boost(volume: float, envelope: float,
+                                boost_fraction: float) -> float:
+    """Boost current volume proportionally, with an absolute 0..1 clamp."""
+    volume = min(1.0, max(0.0, float(volume)))
+    envelope = min(1.0, max(0.0, float(envelope)))
+    boost = min(1.0, max(0.0, float(boost_fraction)))
+    return min(1.0, volume * (1.0 + envelope * boost))
+
+
 def stroke_phase_crossover(width: float, progress: float, enabled: bool,
                            acceleration_scale: float,
                            deceleration_scale: float) -> tuple[float, str]:

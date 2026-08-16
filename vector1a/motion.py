@@ -5,6 +5,8 @@ from enum import Enum
 import math
 import random
 
+from .fourphase import spatial_response
+
 
 class MotionMode(str, Enum):
     CIRCULAR = "Circular 0-180"
@@ -76,15 +78,27 @@ class MotionCalculator:
                     del self._segment_directions[key]
         return self._segment_directions[segment.sequence]
 
+    @staticmethod
+    def _rotate_about_center(alpha: float, beta: float,
+                             degrees: float) -> tuple[float, float]:
+        """Rotate Cartesian alpha/beta around neutral; positive is clockwise on screen."""
+        angle = math.radians(degrees)
+        x, y = alpha - .5, beta - .5
+        return (.5 + x * math.cos(angle) - y * math.sin(angle),
+                .5 + x * math.sin(angle) + y * math.cos(angle))
+
     def calculate(self, mode: MotionMode, segment: SegmentState, at_time: float,
-                  params: MotionParameters) -> tuple[float, float, float, float]:
-        position = segment.position(at_time)
+                  params: MotionParameters, spatial_curve: str = "Linear",
+                  spatial_blend: float = 0.0) -> tuple[float, float, float, float]:
+        position = spatial_response(segment.position(at_time), spatial_curve, spatial_blend)
         speed = segment.speed_percent
 
         if mode == MotionMode.RESTIM_ORIGINAL:
             progress = segment.progress(at_time)
-            center = (segment.start_position + segment.end_position) / 2.0
-            radius = (segment.start_position - segment.end_position) / 2.0
+            start = spatial_response(segment.start_position, spatial_curve, spatial_blend)
+            end = spatial_response(segment.end_position, spatial_curve, spatial_blend)
+            center = (start + end) / 2.0
+            radius = (start - end) / 2.0
             direction = self._direction_for(segment, params.direction_change_probability)
             alpha = center + radius * math.cos(progress * math.pi)
             beta = 0.5 + radius * direction * math.sin(progress * math.pi)
@@ -94,14 +108,18 @@ class MotionCalculator:
             alpha = 0.5 + radius * math.cos(theta)
             beta = 0.5 + radius * math.sin(theta)
         else:
-            # RFP oscillating geometry: a smooth 270-degree polar arc. The
-            # complementary mode is the vertical beta mirror of the same arc.
+            # Smooth electrode-aligned arc from A/top to C/right.  Starting at
+            # 270 degrees and sweeping 240 degrees finishes at 30 degrees (C)
+            # instead of continuing to the 3-o'clock point.
             radius = self._radius(speed, params)
-            theta = (1.0 - position) * (3.0 * math.pi / 2.0)
+            theta = (3.0 * math.pi / 2.0) - position * (4.0 * math.pi / 3.0)
             alpha = 0.5 + radius * math.cos(theta)
             beta = 0.5 + radius * math.sin(theta)
             if mode == MotionMode.TOP_RIGHT_BOTTOM_LEFT:
                 beta = 1.0 - beta
+                alpha, beta = self._rotate_about_center(alpha, beta, 30.0)
+            else:
+                alpha, beta = self._rotate_about_center(alpha, beta, -30.0)
 
         clamp = lambda value: min(1.0, max(0.0, value))
         return clamp(alpha), clamp(beta), position, speed

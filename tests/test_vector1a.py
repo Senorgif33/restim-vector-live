@@ -32,10 +32,12 @@ class MotionTests(unittest.TestCase):
     def test_four_modes_have_distinct_trajectories(self):
         points = {}
         for mode in MotionMode:
-            points[mode] = self.calc.calculate(mode, self.segment, 10.25, self.params)[:2]
-        self.assertEqual(len({tuple(round(v, 5) for v in point) for point in points.values()}), 4)
+            samples = [self.calc.calculate(mode, self.segment, 10.0 + p, self.params)[:2]
+                       for p in (0.2, 0.5, 0.8)]
+            points[mode] = tuple(round(v, 5) for sample in samples for v in sample)
+        self.assertEqual(len(set(points.values())), 4)
 
-    def test_diagonal_modes_are_beta_mirrors(self):
+    def test_diagonal_modes_use_opposite_restim_alignment(self):
         left = self.calc.calculate(MotionMode.TOP_LEFT_BOTTOM_RIGHT, self.segment, 10.25, self.params)
         right = self.calc.calculate(MotionMode.TOP_RIGHT_BOTTOM_LEFT, self.segment, 10.25, self.params)
         self.assertAlmostEqual(left[0], right[0])
@@ -47,9 +49,14 @@ class MotionTests(unittest.TestCase):
                   for p in (0.0, 0.25, 0.5, 0.75, 1.0)]
         expected = []
         for p in (0.0, 0.25, 0.5, 0.75, 1.0):
-            theta = (1.0 - p) * 3.0 * math.pi / 2.0
-            expected.append((0.5 + 0.5 * math.cos(theta),
-                             0.5 + 0.5 * math.sin(theta)))
+            theta = 3.0 * math.pi / 2.0 - p * 4.0 * math.pi / 3.0
+            alpha = 0.5 + 0.5 * math.cos(theta)
+            beta = 0.5 + 0.5 * math.sin(theta)
+            radians = math.radians(-30.0)
+            x = alpha - 0.5
+            y = beta - 0.5
+            expected.append((0.5 + x * math.cos(radians) - y * math.sin(radians),
+                             0.5 + x * math.sin(radians) + y * math.cos(radians)))
         for point, target in zip(actual, expected):
             self.assertAlmostEqual(point[0], target[0])
             self.assertAlmostEqual(point[1], target[1])
@@ -60,6 +67,26 @@ class MotionTests(unittest.TestCase):
         )
         self.assertAlmostEqual(alpha, 1.0)
         self.assertAlmostEqual(beta, 0.5)
+
+    def test_spatial_response_changes_three_phase_geometry_and_output_l0(self):
+        linear = self.calc.calculate(
+            MotionMode.CIRCULAR, self.segment, 10.25, self.params)
+        shaped = self.calc.calculate(
+            MotionMode.CIRCULAR, self.segment, 10.25, self.params,
+            "S-curve", 1.0)
+        self.assertAlmostEqual(linear[2], .25)
+        self.assertAlmostEqual(shaped[2], .15625)
+        self.assertNotAlmostEqual(linear[0], shaped[0])
+        self.assertNotAlmostEqual(linear[1], shaped[1])
+
+    def test_spatial_response_preserves_motion_endpoints(self):
+        for at_time, expected in ((10.0, 0.0), (11.0, 1.0)):
+            alpha, beta, position, _ = self.calc.calculate(
+                MotionMode.CIRCULAR, self.segment, at_time, self.params,
+                "Endpoint emphasis", 1.0)
+            self.assertAlmostEqual(position, expected)
+            self.assertTrue(0.0 <= alpha <= 1.0)
+            self.assertTrue(0.0 <= beta <= 1.0)
 
 
 class QueueTests(unittest.TestCase):

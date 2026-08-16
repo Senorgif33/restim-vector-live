@@ -124,6 +124,8 @@ class VectorEngine:
         self.speed_linked_variation = True
         self.variation_full_speed_percent = 35.0
         self.variation_fade_seconds = 0.75
+        self.spatial_curve = "Linear"
+        self.spatial_blend = 0.0
         self._variation_depth = 0.0
         self._variation_updated_at = now
         self._input_count = 0
@@ -161,7 +163,9 @@ class VectorEngine:
                   jitter_cycle_seconds: float = 1.0,
                   speed_linked_variation: bool = True,
                   variation_full_speed_percent: float = 35.0,
-                  variation_fade_seconds: float = .75) -> None:
+                  variation_fade_seconds: float = .75,
+                  spatial_curve: str = "Linear",
+                  spatial_blend: float = 0.0) -> None:
         with self._lock:
             mode_changed = mode != self.mode
             self.rate_hz = max(1, min(200, int(rate_hz)))
@@ -200,6 +204,8 @@ class VectorEngine:
             self.variation_full_speed_percent = min(
                 100.0, max(1.0, float(variation_full_speed_percent)))
             self.variation_fade_seconds = min(10.0, max(.05, float(variation_fade_seconds)))
+            self.spatial_curve = str(spatial_curve)
+            self.spatial_blend = min(1.0, max(0.0, float(spatial_blend)))
             if mode_changed and self._state in ("Buffering", "Running"):
                 # Never release samples calculated by a previously selected
                 # geometry under a newly-labelled UI state.
@@ -364,7 +370,8 @@ class VectorEngine:
                 scheduled_at, calculation_segment.speed_percent)
             calculation_segment = self._jitter_segment(calculation_segment, variation_depth)
             alpha, beta, output_l0, speed = self.calculator.calculate(
-                self.mode, calculation_segment, scheduled_at, self.params)
+                self.mode, calculation_segment, scheduled_at, self.params,
+                self.spatial_curve, self.spatial_blend * variation_depth)
             output_volume = self._calculate_volume(scheduled_at, speed)
             frequency = self._calculate_frequency(scheduled_at, speed)
             pulse_frequency = self._calculate_pulse_frequency(scheduled_at, speed, alpha)

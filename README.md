@@ -4,7 +4,7 @@ Vector 1A is a live bridge from one MultiFunPlayer `L0` T-code stream to one or
 two ReStim instances. It converts streamed 1D motion into synchronized alpha,
 beta, volume, frequency and pulse controls at a stable internal cadence.
 
-Current development build: **1.6.0-alpha36**.
+Current development build: **1.6.0-alpha40**.
 
 > [!CAUTION]
 > Commission with ReStim's graphical display and stimulation hardware
@@ -32,6 +32,9 @@ second after they begin.
   - Top-Left to Bottom-Right 0-90 (default)
   - Top-Right to Bottom-Left 0-270
   - ReStim Original 0-360
+- The two diagonal modes include their opposite internal 30-degree ReStim alignment
+  corrections, so their A-B-C-B-A and A-C-B-C-A paths do not require manual
+  Top rotation in ReStim.
 - Configurable 1D-to-2D motion parameters and fixed output rate.
 - Primary ReStim receives both 3-phase and 4-phase axes; ReStim uses the axes
   appropriate to its selected interface.
@@ -48,8 +51,8 @@ second after they begin.
   centre emphasis) with adjustable blending and preserved path endpoints;
   blend 0 is linear and blend 1 applies 100% of the selected response.
 - Optional stroke-reversal emphasis uses buffered reversal points to apply a
-  short, bounded lift from available volume headroom at reversals anywhere in
-  the stroke range. It changes intensity only; sample timing is preserved.
+  short proportional lift to the current volume at reversals anywhere in the
+  stroke range. It changes intensity only; sample timing is preserved.
 - Optional stroke-phase texture smoothly varies four-phase crossover width
   between independently adjustable acceleration and deceleration responses.
   Buffered stroke progress preserves continuity and output timing.
@@ -75,6 +78,8 @@ second after they begin.
   tilting, or reducing the amplitude of the geometry.
 - Keyboard-mapped Xbox controls and equal-length live range displays.
 - Collapsible panels with live summaries.
+- Plain-language in-app guides explain both the shared Motion controls and the
+  Four-phase primary motion controls, including units, signs and live readouts.
 - Persistent user settings and an in-app setup guide.
 - Background ReStim connection recovery remains active even while output is
   stopped. Vector detects silently closed WebSockets, reconnects automatically,
@@ -127,22 +132,36 @@ The **Setup guide** button repeats these instructions. Settings are saved at
 
 ### Stroke-reversal emphasis
 
-This optional four-phase transform briefly lifts intensity around actual
+This optional shared 3-phase/four-phase transform briefly lifts intensity around actual
 buffered stroke reversals without changing motion geometry or sample timing.
 Its live value runs from `0` away from a reversal to `1` at the reversal.
 
-The effect uses only the headroom above **Volume ceiling**. For example, a
-ceiling of `0.90` with **Headroom use** at `0.25` can add at most 2.5 percentage
-points and may be difficult to notice. A clear commissioning test is:
+The boost is a proportion of the current output. For example, **Current-volume
+boost** `0.20` means up to +20%: current volume `0.40` becomes `0.48`, while
+`0.80` becomes `0.96`. Output is always clamped at `1.00`. A clear commissioning
+test is:
 
-- **Volume ceiling:** `0.70`
 - **Window:** `0.40 s`
-- **Headroom use:** `1.00`
+- **Current-volume boost:** `0.20`
 
-Once confirmed, reduce **Headroom use** or raise **Volume ceiling** to taste.
-As a rough guide, a ceiling near `0.90` is subtle, `0.80` is moderate, and
-`0.70` is pronounced when full headroom is enabled. Commission visually with
-stimulation hardware disconnected before connected use.
+Commission visually with stimulation hardware disconnected before connected use.
+
+### Motion controls in plain language
+
+- **Base volume** is the normal volume before dynamic volume response and
+  direction-dependent texture are applied.
+- **Smooth L0 position variation** moves the motion coordinate, not volume.
+  Maximum shift `0.10` permits approximately `-0.10` to `+0.10` around the
+  scripted L0 position, clipped to the valid 0-1 range.
+- **Scale optional effects with speed** is a shared master depth. Effects fade
+  toward zero at rest, reach full configured depth at **Full effects at speed**,
+  and follow changes with the selected **Response time**.
+- **Spatial response** reshapes progress along a path while preserving its
+  endpoints. Blend `0` is linear and blend `1` fully applies the chosen curve.
+- **Boost volume near stroke reversal** raises current volume proportionally
+  inside the selected window.
+- **Stroke-phase texture** applies separate volume multipliers while L0 is
+  rising and falling.
 
 ## Output axes
 

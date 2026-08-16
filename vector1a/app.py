@@ -17,7 +17,7 @@ from .variety import fit_range_for_travel, rolling_offset, rolling_value
 from .fourphase import (ELECTRODE_ORDERS, adaptive_crossover_width, apply_group_delay, directed_signed,
                         directional_crossover_profile, map_electrode_order,
                         morph_electrode_order, moving_sequence_window, potential_roles, sequence_cycle_stage,
-                        spatial_response, reversal_emphasis_envelope,
+                        proportional_reversal_boost, reversal_emphasis_envelope,
                         stroke_phase_crossover, restim_crossfade, vertical_crossfade)
 from . import __version__
 
@@ -80,7 +80,8 @@ class VectorApp:
         "four_phase_spatial_blend", "four_phase_reversal_emphasis",
         "four_phase_reversal_window", "four_phase_reversal_strength",
         "four_phase_stroke_phase_texture", "four_phase_acceleration_width_scale",
-        "four_phase_deceleration_width_scale", "four_phase_group_delay",
+        "four_phase_deceleration_width_scale", "motion_rising_volume_multiplier",
+        "motion_falling_volume_multiplier", "four_phase_group_delay",
         "four_phase_group_delay_ms", "four_phase_group_delay_transition", "electrode_order",
         "four_phase_moving_sequence", "four_phase_moving_sequence_depth",
         "four_phase_moving_sequence_width",
@@ -107,7 +108,8 @@ class VectorApp:
         "four_phase_reversal_emphasis", "four_phase_reversal_window",
         "four_phase_reversal_strength",
         "four_phase_stroke_phase_texture", "four_phase_acceleration_width_scale",
-        "four_phase_deceleration_width_scale", "four_phase_group_delay",
+        "four_phase_deceleration_width_scale", "motion_rising_volume_multiplier",
+        "motion_falling_volume_multiplier", "four_phase_group_delay",
         "four_phase_group_delay_ms", "four_phase_group_delay_transition",
         "four_phase_moving_sequence", "four_phase_moving_sequence_depth",
         "four_phase_moving_sequence_width",
@@ -198,6 +200,8 @@ class VectorApp:
         self.four_phase_stroke_phase_texture = tk.BooleanVar(value=False)
         self.four_phase_acceleration_width_scale = tk.DoubleVar(value=.70)
         self.four_phase_deceleration_width_scale = tk.DoubleVar(value=1.20)
+        self.motion_rising_volume_multiplier = tk.DoubleVar(value=1.0)
+        self.motion_falling_volume_multiplier = tk.DoubleVar(value=1.0)
         self.four_phase_stroke_phase_live = tk.StringVar(value="off")
         self.four_phase_group_delay = tk.BooleanVar(value=False)
         self.four_phase_group_delay_ms = tk.DoubleVar(value=0.0)
@@ -225,7 +229,7 @@ class VectorApp:
         self.speed_linked_variation = tk.BooleanVar(value=True)
         self.variation_full_speed_percent = tk.DoubleVar(value=35.0)
         self.variation_fade_seconds = tk.DoubleVar(value=.75)
-        self.variation_depth_live = tk.StringVar(value="Variation depth 0%")
+        self.variation_depth_live = tk.StringVar(value="Effect depth 0%")
         self.send_four_phase_visual = tk.BooleanVar(value=False)
         self.controller_enabled = tk.BooleanVar(value=True)
         self.controller_target = tk.IntVar(value=0)
@@ -275,6 +279,8 @@ class VectorApp:
         self._four_phase_direction = 1
         self._four_phase_send_last_l0 = 0.5
         self._four_phase_send_direction = 1
+        self._motion_send_last_l0 = 0.5
+        self._motion_send_direction = 1
         self._four_phase_history = deque(maxlen=128)
         self._four_phase_effective_group_delay = 0.0
         self._four_phase_group_delay_last_time = None
@@ -295,7 +301,7 @@ class VectorApp:
     def _frame(self, title: str, row: int, column: int = 0, span: int = 1) -> ttk.Frame:
         collapsed_titles = {
             "Frequency", "Pulse frequency", "Pulse rise time", "Pulse width",
-            "Prostate controls", "Four-phase primary controls",
+            "Prostate controls", "Four-phase primary motion",
             "Xbox controller", "Rolling Variety", "Live diagnostics",
         }
         section = CollapsibleSection(self.root, title, collapsed=(title in collapsed_titles))
@@ -354,7 +360,7 @@ class VectorApp:
         fields = (
             ("Points per second", self.rate, 1, 200, 1),
             ("Look-ahead / delay (s)", self.lookahead, 0.05, 10, 0.05),
-            ("Fixed volume", self.volume, 0, 1, 0.01),
+            ("Base volume", self.volume, 0, 1, 0.01),
             ("Minimum distance from center", self.minimum_radius, 0, 0.9, 0.05),
             ("Speed threshold (%)", self.speed_threshold, 0, 100, 1),
             ("Direction change probability", self.direction_probability, 0, 1, 0.05),
@@ -366,9 +372,9 @@ class VectorApp:
             ttk.Spinbox(motion, from_=low, to=high, increment=step, textvariable=variable,
                         width=10, command=self.apply_config).grid(row=row, column=col + 1, padx=6, sticky="w")
         ttk.Button(motion, text="Apply", command=self.apply_config).grid(row=3, column=5, sticky="e")
-        ttk.Checkbutton(motion, text="Add smooth L0 jitter", variable=self.jitter_enabled,
+        ttk.Checkbutton(motion, text="Add smooth L0 position variation", variable=self.jitter_enabled,
                         command=self.apply_config).grid(row=3, column=0, sticky="w", pady=(5, 2))
-        ttk.Label(motion, text="Amplitude").grid(row=3, column=1, sticky="e")
+        ttk.Label(motion, text="Maximum shift (±L0)").grid(row=3, column=1, sticky="e")
         ttk.Spinbox(motion, from_=0, to=.20, increment=.005,
                     textvariable=self.jitter_amplitude, width=8,
                     command=self.apply_config).grid(row=3, column=2, sticky="w")
@@ -376,19 +382,49 @@ class VectorApp:
         ttk.Spinbox(motion, from_=.05, to=30, increment=.05,
                     textvariable=self.jitter_cycle_seconds, width=8,
                     command=self.apply_config).grid(row=3, column=4, sticky="w")
-        ttk.Checkbutton(motion, text="Speed-link variation depth",
+        ttk.Checkbutton(motion, text="Scale optional effects with speed",
                         variable=self.speed_linked_variation,
                         command=self.apply_config).grid(row=4, column=0, sticky="w", pady=(3, 0))
-        ttk.Label(motion, text="Full depth at speed (%)").grid(row=4, column=1, sticky="e")
+        ttk.Label(motion, text="Full effects at speed (%)").grid(row=4, column=1, sticky="e")
         ttk.Spinbox(motion, from_=1, to=100, increment=1,
                     textvariable=self.variation_full_speed_percent, width=8,
                     command=self.apply_config).grid(row=4, column=2, sticky="w")
-        ttk.Label(motion, text="Fade (s)").grid(row=4, column=3, sticky="e")
+        ttk.Label(motion, text="Response time (s)").grid(row=4, column=3, sticky="e")
         ttk.Spinbox(motion, from_=.05, to=10, increment=.05,
                     textvariable=self.variation_fade_seconds, width=8,
                     command=self.apply_config).grid(row=4, column=4, sticky="w")
         ttk.Label(motion, textvariable=self.variation_depth_live,
                   foreground="#555").grid(row=4, column=5, sticky="w", padx=8)
+        ttk.Label(motion, text="Spatial response").grid(row=5, column=0, sticky="w", pady=(4, 0))
+        ttk.Combobox(motion, textvariable=self.four_phase_spatial_curve,
+                     values=("Linear", "S-curve", "Endpoint emphasis", "Centre emphasis"),
+                     state="readonly", width=18).grid(row=5, column=1, sticky="w")
+        ttk.Label(motion, text="Blend (1 = 100%)").grid(row=5, column=3, sticky="e")
+        ttk.Spinbox(motion, from_=0, to=1, increment=.05,
+                    textvariable=self.four_phase_spatial_blend, width=8,
+                    command=self.apply_config).grid(row=5, column=4, sticky="w")
+        ttk.Checkbutton(motion, text="Boost volume near stroke reversal",
+                        variable=self.four_phase_reversal_emphasis).grid(row=6, column=0, sticky="w")
+        ttk.Label(motion, text="Window either side (s)").grid(row=6, column=1, sticky="e")
+        ttk.Spinbox(motion, from_=.05, to=1.5, increment=.05,
+                    textvariable=self.four_phase_reversal_window, width=8).grid(row=6, column=2, sticky="w")
+        ttk.Label(motion, text="Current-volume boost (+×)").grid(row=6, column=3, sticky="e")
+        ttk.Spinbox(motion, from_=0, to=1, increment=.05,
+                    textvariable=self.four_phase_reversal_strength, width=8).grid(row=6, column=4, sticky="w")
+        ttk.Label(motion, textvariable=self.four_phase_reversal_live,
+                  foreground="#555").grid(row=6, column=5, sticky="w", padx=8)
+        ttk.Checkbutton(motion, text="Stroke-phase texture",
+                        variable=self.four_phase_stroke_phase_texture).grid(row=7, column=0, sticky="w")
+        ttk.Label(motion, text="L0 rising volume ×").grid(row=7, column=1, sticky="e")
+        ttk.Spinbox(motion, from_=.8, to=1, increment=.01,
+                    textvariable=self.motion_rising_volume_multiplier, width=8).grid(row=7, column=2, sticky="w")
+        ttk.Label(motion, text="L0 falling volume ×").grid(row=7, column=3, sticky="e")
+        ttk.Spinbox(motion, from_=.8, to=1, increment=.01,
+                    textvariable=self.motion_falling_volume_multiplier, width=8).grid(row=7, column=4, sticky="w")
+        ttk.Label(motion, text="Shared by 3-phase and 4-phase",
+                   foreground="#555").grid(row=7, column=5, sticky="w", padx=8)
+        ttk.Button(motion, text="Explain these controls", command=self.show_motion_guide).grid(
+            row=8, column=5, sticky="e", pady=(5, 0))
 
         volume_frame = self._frame("Volume response", 2, 0, 2)
         ttk.Checkbutton(volume_frame, text="Reduce volume when motion stops",
@@ -401,6 +437,11 @@ class VectorApp:
             ttk.Label(volume_frame, text=label).grid(row=0, column=col, padx=(18, 4))
             ttk.Spinbox(volume_frame, from_=low, to=high, increment=step,
                         textvariable=variable, width=8, command=self.apply_config).grid(row=0, column=col + 1)
+        ttk.Label(volume_frame, text="Primary volume ceiling").grid(
+            row=0, column=7, padx=(18, 4))
+        ttk.Spinbox(volume_frame, from_=0, to=1, increment=.05,
+                    textvariable=self.four_phase_volume_ceiling, width=8).grid(
+                        row=0, column=8)
 
         frequency_frame = self._frame("Frequency", 3, 0, 2)
         ttk.Label(frequency_frame, text="0").grid(row=0, column=0)
@@ -511,7 +552,7 @@ class VectorApp:
                     textvariable=self.prostate_phase_degrees, width=7,
                     command=self.apply_config).grid(row=2, column=8)
 
-        four_phase = self._frame("Four-phase primary controls", 8, 0, 2)
+        four_phase = self._frame("Four-phase primary motion", 8, 0, 2)
         self.four_phase_bars, self.four_phase_values = [], []
         for row, label in enumerate(("A — top", "B", "C", "D — bottom")):
             ttk.Label(four_phase, text=label, width=18).grid(row=row, column=0, sticky="w")
@@ -525,7 +566,7 @@ class VectorApp:
                       font=("TkDefaultFont", 10, "bold")).grid(row=row, column=4, padx=8)
             self.four_phase_bars.append(bar); self.four_phase_values.append(value)
         ttk.Label(four_phase,
-                  text="A→B→C→D follows buffered L0; adjacent equal-power crossfade. NOT sent to ReStim.",
+                  text="Live E1-E4 Primary output; adjacent electrodes blend continuously.",
                   foreground="#9b4b00").grid(row=0, column=5, rowspan=4, sticky="w", padx=18)
         ttk.Label(four_phase, text="Return depth").grid(row=4, column=0, sticky="w")
         ttk.Spinbox(four_phase, from_=0, to=1, increment=.05,
@@ -533,22 +574,20 @@ class VectorApp:
                         row=4, column=1, sticky="w")
         ttk.Label(four_phase, text="Signed: primary +1.00 | return −depth | unused 0.00") \
             .grid(row=4, column=2, columnspan=4, sticky="w", padx=8)
-        ttk.Checkbutton(four_phase, text="Invert path", variable=self.four_phase_invert).grid(row=5, column=0, sticky="w")
-        ttk.Label(four_phase, text="Volume ceiling").grid(row=5, column=1, sticky="e")
-        ttk.Spinbox(four_phase, from_=0, to=1, increment=.05, textvariable=self.four_phase_volume_ceiling, width=7).grid(row=5, column=2, sticky="w")
-        ttk.Checkbutton(four_phase, text="Slow volume overlay", variable=self.four_phase_volume_modulation).grid(row=5, column=3, sticky="w")
-        ttk.Label(four_phase, text="Headroom").grid(row=5, column=4, sticky="e")
+        ttk.Checkbutton(four_phase, text="Reverse L0 direction", variable=self.four_phase_invert).grid(row=5, column=0, sticky="w")
+        ttk.Checkbutton(four_phase, text="Add slow volume variation", variable=self.four_phase_volume_modulation).grid(row=5, column=3, sticky="w")
+        ttk.Label(four_phase, text="Maximum addition").grid(row=5, column=4, sticky="e")
         ttk.Spinbox(four_phase, from_=0, to=1, increment=.05, textvariable=self.four_phase_volume_headroom, width=7).grid(row=5, column=5, sticky="w")
-        ttk.Label(four_phase, text="Overlay cycle (min)").grid(row=6, column=4, sticky="e")
+        ttk.Label(four_phase, text="Volume cycle (min)").grid(row=6, column=4, sticky="e")
         ttk.Spinbox(four_phase, from_=.5, to=30, increment=.5, textvariable=self.four_phase_volume_cycle, width=7).grid(row=6, column=5, sticky="w")
-        ttk.Label(four_phase, text="Crossover width").grid(row=6, column=0, sticky="w")
+        ttk.Label(four_phase, text="Base crossover width").grid(row=6, column=0, sticky="w")
         ttk.Spinbox(four_phase, from_=.05, to=1, increment=.05,
                     textvariable=self.four_phase_crossover_width, width=7).grid(row=6, column=1, sticky="w")
-        ttk.Label(four_phase, text="Curve").grid(row=6, column=2, sticky="e", padx=(8, 4))
+        ttk.Label(four_phase, text="Crossover curve").grid(row=6, column=2, sticky="e", padx=(8, 4))
         ttk.Combobox(four_phase, textvariable=self.four_phase_crossover_curve,
                      values=("Cosine", "Linear", "Ease In", "Ease Out", "S-curve"),
                      state="readonly", width=10).grid(row=6, column=3, sticky="w")
-        ttk.Label(four_phase, text="Sharpness").grid(row=7, column=0, sticky="w")
+        ttk.Label(four_phase, text="Crossover sharpness").grid(row=7, column=0, sticky="w")
         ttk.Spinbox(four_phase, from_=.2, to=5, increment=.1,
                     textvariable=self.four_phase_crossover_sharpness, width=7).grid(row=7, column=1, sticky="w")
         ttk.Label(four_phase, text="Signalling sequence").grid(row=7, column=2, sticky="e", padx=(8, 4))
@@ -556,11 +595,11 @@ class VectorApp:
                                  values=ELECTRODE_ORDERS, state="readonly", width=7)
         order_box.grid(row=7, column=3, sticky="w")
         order_box.bind("<<ComboboxSelected>>", lambda _event: self._electrode_order_changed())
-        ttk.Label(four_phase, text="Pair morph").grid(row=7, column=4, sticky="e", padx=(8, 4))
+        ttk.Label(four_phase, text="Sequence blend (live)").grid(row=7, column=4, sticky="e", padx=(8, 4))
         self.electrode_morph_bar = ttk.Progressbar(
             four_phase, orient="horizontal", mode="determinate", maximum=1.0, length=120)
         self.electrode_morph_bar.grid(row=7, column=5, sticky="w")
-        ttk.Checkbutton(four_phase, text="Speed-adaptive crossover",
+        ttk.Checkbutton(four_phase, text="Change crossover width with speed",
                         variable=self.four_phase_adaptive_crossover).grid(
                             row=8, column=0, sticky="w")
         ttk.Label(four_phase, text="Low-speed width").grid(row=8, column=1, sticky="e")
@@ -573,14 +612,14 @@ class VectorApp:
                     width=7).grid(row=8, column=4, sticky="w")
         ttk.Label(four_phase, textvariable=self.four_phase_effective_crossover_width,
                   width=12).grid(row=8, column=5, sticky="w", padx=8)
-        ttk.Checkbutton(four_phase, text="Direction-dependent trajectory",
+        ttk.Checkbutton(four_phase, text="Use different return-stroke crossover",
                         variable=self.four_phase_directional_trajectory).grid(
                             row=9, column=0, sticky="w")
-        ttk.Label(four_phase, text="Reverse width ×").grid(row=9, column=1, sticky="e")
+        ttk.Label(four_phase, text="Return width ×").grid(row=9, column=1, sticky="e")
         ttk.Spinbox(four_phase, from_=.2, to=3, increment=.05,
                     textvariable=self.four_phase_reverse_width_scale,
                     width=7).grid(row=9, column=2, sticky="w")
-        ttk.Label(four_phase, text="Reverse curve").grid(row=9, column=3, sticky="e")
+        ttk.Label(four_phase, text="Return curve").grid(row=9, column=3, sticky="e")
         ttk.Combobox(four_phase, textvariable=self.four_phase_reverse_curve,
                      values=("Cosine", "Linear", "Ease In", "Ease Out", "S-curve"),
                      state="readonly", width=10).grid(row=9, column=4, sticky="w")
@@ -590,30 +629,8 @@ class VectorApp:
         ttk.Spinbox(reverse_sharpness, from_=.2, to=5, increment=.1,
                     textvariable=self.four_phase_reverse_sharpness,
                     width=7).pack(side="left", padx=(4, 0))
-        ttk.Label(four_phase, text="Spatial response").grid(row=10, column=0, sticky="w")
-        ttk.Combobox(four_phase, textvariable=self.four_phase_spatial_curve,
-                     values=("Linear", "S-curve", "Endpoint emphasis", "Centre emphasis"),
-                     state="readonly", width=18).grid(row=10, column=1, columnspan=2, sticky="w")
-        ttk.Label(four_phase, text="Blend (1 = 100% selected response)").grid(
-            row=10, column=3, sticky="e")
-        ttk.Spinbox(four_phase, from_=0, to=1, increment=.05,
-                    textvariable=self.four_phase_spatial_blend,
-                    width=7).grid(row=10, column=4, sticky="w")
-        ttk.Label(four_phase, textvariable=self.four_phase_spatial_live,
-                  width=12).grid(row=10, column=5, sticky="w", padx=8)
-        ttk.Checkbutton(four_phase, text="Stroke-reversal emphasis",
-                        variable=self.four_phase_reversal_emphasis).grid(row=11, column=0, sticky="w")
-        ttk.Label(four_phase, text="Window (s)").grid(row=11, column=1, sticky="e")
-        ttk.Spinbox(four_phase, from_=.05, to=1.5, increment=.05,
-                    textvariable=self.four_phase_reversal_window, width=7).grid(row=11, column=2, sticky="w")
-        ttk.Label(four_phase, text="Headroom use").grid(row=11, column=3, sticky="e")
-        ttk.Spinbox(four_phase, from_=0, to=1, increment=.05,
-                    textvariable=self.four_phase_reversal_strength, width=7).grid(row=11, column=4, sticky="w")
-        ttk.Label(four_phase, textvariable=self.four_phase_reversal_live,
-                  width=12).grid(row=11, column=5, sticky="w", padx=8)
-        ttk.Checkbutton(four_phase, text="Stroke-phase texture",
-                        variable=self.four_phase_stroke_phase_texture).grid(row=12, column=0, sticky="w")
-        ttk.Label(four_phase, text="Acceleration width ×").grid(row=12, column=1, sticky="e")
+        ttk.Label(four_phase, text="Change width through each stroke").grid(row=12, column=0, sticky="w")
+        ttk.Label(four_phase, text="Accelerating width ×").grid(row=12, column=1, sticky="e")
         ttk.Spinbox(four_phase, from_=.2, to=3, increment=.05,
                     textvariable=self.four_phase_acceleration_width_scale,
                     width=7).grid(row=12, column=2, sticky="w")
@@ -623,9 +640,9 @@ class VectorApp:
                     width=7).grid(row=12, column=4, sticky="w")
         ttk.Label(four_phase, textvariable=self.four_phase_stroke_phase_live,
                   width=20).grid(row=12, column=5, sticky="w", padx=8)
-        ttk.Checkbutton(four_phase, text="AB/CD timing separation",
+        ttk.Checkbutton(four_phase, text="Offset A/B versus C/D timing",
                         variable=self.four_phase_group_delay).grid(row=13, column=0, sticky="w")
-        ttk.Label(four_phase, text="Delay (ms)").grid(row=13, column=1, sticky="e")
+        ttk.Label(four_phase, text="Group delay (ms; +A/B later)").grid(row=13, column=1, sticky="e")
         ttk.Spinbox(four_phase, from_=-300, to=300, increment=10,
                     textvariable=self.four_phase_group_delay_ms, width=7).grid(
                         row=13, column=2, sticky="w")
@@ -635,18 +652,21 @@ class VectorApp:
                         row=13, column=4, sticky="w")
         ttk.Label(four_phase, textvariable=self.four_phase_group_delay_live,
                   foreground="#555").grid(row=13, column=5, sticky="w")
-        ttk.Checkbutton(four_phase, text="Moving sequence window",
+        ttk.Checkbutton(four_phase, text="Bias sequence within each stroke",
                         variable=self.four_phase_moving_sequence).grid(row=14, column=0, sticky="w")
-        ttk.Label(four_phase, text="Depth").grid(row=14, column=1, sticky="e")
+        ttk.Label(four_phase, text="Maximum blend").grid(row=14, column=1, sticky="e")
         ttk.Spinbox(four_phase, from_=0, to=1, increment=.05,
                     textvariable=self.four_phase_moving_sequence_depth, width=7).grid(
                         row=14, column=2, sticky="w")
-        ttk.Label(four_phase, text="Width").grid(row=14, column=3, sticky="e")
+        ttk.Label(four_phase, text="Stroke portion").grid(row=14, column=3, sticky="e")
         ttk.Spinbox(four_phase, from_=.1, to=1, increment=.05,
                     textvariable=self.four_phase_moving_sequence_width, width=7).grid(
                         row=14, column=4, sticky="w")
         ttk.Label(four_phase, textvariable=self.four_phase_moving_sequence_live,
-                  foreground="#555").grid(row=14, column=5, sticky="w")
+                   foreground="#555").grid(row=14, column=5, sticky="w")
+        ttk.Button(four_phase, text="Explain these controls",
+                   command=self.show_four_phase_guide).grid(
+                       row=5, column=1, columnspan=2, sticky="w", padx=(8, 0))
         self.four_phase_signed_values = []
         for offset, label in enumerate(("A signed", "B signed", "C signed", "D signed")):
             row = offset + 15
@@ -1125,9 +1145,7 @@ class VectorApp:
         return width, curve, sharpness, direction_name
 
     def _spatial_path(self, output_l0: float, variation_depth: float = 1.0) -> float:
-        path_l0 = 1.0 - output_l0 if self.four_phase_invert.get() else output_l0
-        return spatial_response(path_l0, self.four_phase_spatial_curve.get(),
-                                self.four_phase_spatial_blend.get() * variation_depth)
+        return 1.0 - output_l0 if self.four_phase_invert.get() else output_l0
 
     def apply_config(self) -> None:
         try:
@@ -1165,7 +1183,9 @@ class VectorApp:
                                   jitter_cycle_seconds=self.jitter_cycle_seconds.get(),
                                   speed_linked_variation=self.speed_linked_variation.get(),
                                   variation_full_speed_percent=self.variation_full_speed_percent.get(),
-                                  variation_fade_seconds=self.variation_fade_seconds.get())
+                                  variation_fade_seconds=self.variation_fade_seconds.get(),
+                                  spatial_curve=self.four_phase_spatial_curve.get(),
+                                  spatial_blend=self.four_phase_spatial_blend.get())
         except (tk.TclError, ValueError) as exc:
             messagebox.showerror("Invalid settings", str(exc))
 
@@ -1316,9 +1336,72 @@ class VectorApp:
             f"Settings are saved in:\n{settings_path()}"
         )
 
+    def show_motion_guide(self) -> None:
+        messagebox.showinfo(
+            "Motion controls explained",
+            "Motion modes\n\n"
+            "Circular 0-180 follows a semicircle. Top-Left to Bottom-Right follows "
+            "a 240-degree A-to-C arc with Vector's internal -30-degree alignment. "
+            "Top-Right to Bottom-Left uses the corresponding +30-degree alignment. "
+            "ReStim Original builds one arc per detected stroke.\n\n"
+            "Base volume is the normal volume before the Volume response section "
+            "and direction texture are applied.\n\n"
+            "Smooth L0 position variation shifts the motion coordinate, not volume. "
+            "Maximum shift 0.10 means up to approximately 0.10 either side of the "
+            "scripted L0 position, clipped to the 0-1 range.\n\n"
+            "Scale optional effects with speed fades variation out at rest and brings "
+            "it in as motion accelerates. Full effects at speed is the calculated "
+            "speed where the configured effects reach 100%; Response time controls "
+            "how gently that depth changes. The live Effect depth readout shows the "
+            "amount currently applied.\n\n"
+            "Spatial response reshapes progress along the path without changing its "
+            "endpoints. Blend 0 is linear; Blend 1 applies the selected curve fully.\n\n"
+            "Boost volume near stroke reversal applies a short proportional increase "
+            "around each known endpoint. A boost of 0.20 means up to 20% of the current "
+            "volume, subject to the absolute 100% limit.\n\n"
+            "Stroke-phase texture applies the selected volume multipliers according "
+            "to whether L0 is rising or falling."
+        )
+
+    def show_four_phase_guide(self) -> None:
+        messagebox.showinfo(
+            "Four-phase controls explained",
+            "Signal path\n\n"
+            "The four green bars are the live E1-E4 commands sent to the Primary "
+            "ReStim. Signalling sequence maps the logical path onto the physical "
+            "electrodes. Reverse L0 direction swaps which end corresponds to low "
+            "and high script positions. Return depth sets the preferred return "
+            "electrode's relative negative contribution.\n\n"
+            "Electrode crossover\n\n"
+            "Crossover width controls how much of each transition is shared by two "
+            "adjacent electrodes: smaller is more focused, larger is broader and "
+            "smoother. Curve controls how that handover develops; Sharpness mainly "
+            "changes the S-curve. Change crossover width with speed interpolates "
+            "between the low- and high-speed widths.\n\n"
+            "Stroke texture\n\n"
+            "Use different return-stroke crossover gives falling/reverse motion its "
+            "own width multiplier, curve and sharpness. Change width through each "
+            "stroke moves smoothly from the accelerating multiplier to the "
+            "decelerating multiplier.\n\n"
+            "Timing and sequence movement\n\n"
+            "A positive group delay makes A/B later; a negative value makes C/D "
+            "later. Transition controls how gently a changed delay is introduced. "
+            "Bias sequence within each stroke temporarily blends toward the next or "
+            "previous signalling sequence near mid-stroke, returning to the selected "
+            "sequence at the endpoints. Maximum blend is its strength; Stroke portion "
+            "is how much of the stroke contains the effect.\n\n"
+            "Slow volume variation uses up to Maximum addition over the selected "
+            "cycle, never exceeding 100%. The live Sequence blend bar is a readout, "
+            "not another setting."
+        )
+
     def _send_sample(self, sample: OutputSample) -> None:
         variation_depth = (sample.variation_depth
                            if self.speed_linked_variation.get() else 1.0)
+        motion_delta = sample.output_l0 - self._motion_send_last_l0
+        if abs(motion_delta) > 0.0005:
+            self._motion_send_direction = 1 if motion_delta > 0 else -1
+        self._motion_send_last_l0 = sample.output_l0
         path_l0 = self._spatial_path(sample.output_l0, variation_depth)
         delta = path_l0 - self._four_phase_send_last_l0
         if abs(delta) > 0.0005:
@@ -1364,14 +1447,22 @@ class VectorApp:
                                    * 2.0 * math.pi / cycle)) / 2.0
             ceiling = min(1.0, ceiling +
                           self.four_phase_volume_headroom.get() * wave * variation_depth)
+        primary_volume = min(1.0, max(0.0,
+            ceiling * sample.volume / max(self.volume.get(), 1e-9)))
+        if self.four_phase_stroke_phase_texture.get():
+            configured = (self.motion_rising_volume_multiplier.get()
+                          if self._motion_send_direction > 0
+                          else self.motion_falling_volume_multiplier.get())
+            multiplier = 1.0 + (min(1.0, max(.8, configured)) - 1.0) * variation_depth
+            primary_volume *= multiplier
         if self.four_phase_reversal_emphasis.get():
             reversal = reversal_emphasis_envelope(
                 sample.reversal_distance_seconds, self.four_phase_reversal_window.get())
-            strength = min(1.0, max(0.0,
+            boost = min(1.0, max(0.0,
                 self.four_phase_reversal_strength.get() * variation_depth))
-            ceiling += (1.0 - ceiling) * strength * reversal
-        primary_volume = min(1.0, max(0.0,
-            ceiling * sample.volume / max(self.volume.get(), 1e-9)))
+            primary_volume = proportional_reversal_boost(
+                primary_volume, reversal, boost)
+        primary_volume = min(1.0, max(0.0, primary_volume))
         self.restim.send_primary(
             sample.alpha, sample.beta, electrodes, primary_volume, sample.frequency,
             sample.pulse_frequency, sample.pulse_rise_time, sample.pulse_width)
@@ -1383,6 +1474,8 @@ class VectorApp:
     def neutral(self) -> None:
         self.apply_config()
         self._reset_four_phase_group_delay()
+        self._motion_send_last_l0 = 0.5
+        self._motion_send_direction = 1
         self.engine.neutral()
         self.restim.send_primary(0.5, 0.5, (0.5, 0.5, 0.5, 0.5),
                                  self.volume.get(), 0.5, 0.5, 0.5, 0.5)
@@ -1395,6 +1488,8 @@ class VectorApp:
 
     def stop(self) -> None:
         self._reset_four_phase_group_delay()
+        self._motion_send_last_l0 = 0.5
+        self._motion_send_direction = 1
         self.engine.stop()
         self.restim.send_primary(0.5, 0.5, (0.5, 0.5, 0.5, 0.5),
                                  0.0, 0.5, 0.5, 0.5, 0.5)
@@ -1441,7 +1536,7 @@ class VectorApp:
         }
         for key, value in values.items():
             self.diag_vars[key].set(value)
-        self.variation_depth_live.set(f"Variation depth {diag.variation_depth * 100:.0f}%")
+        self.variation_depth_live.set(f"Effect depth {diag.variation_depth * 100:.0f}%")
         self.frequency_bar["value"] = diag.frequency
         self.frequency_value.set(f"{diag.frequency:.4f}")
         self.pulse_frequency_bar.set(self.pulse_frequency_min.get(),
@@ -1538,13 +1633,17 @@ class VectorApp:
             "MultiFunPlayer input": f"{self.mfp_status.get()} | {self.mfp_host.get()}:{self.mfp_port.get()}",
             "ReStim output": f"Primary: {self.restim_status.get()} | Prostate: {self.prostate_status.get()}",
             "Motion": f"{self.mode.get()} | {self.rate.get()} Hz | {self.lookahead.get():.2f} s delay",
-            "Volume response": f"Ceiling {self.volume.get() * 100:.0f}% | rest {self.volume_rest_level.get() * 100:.0f}%",
+            "Volume response": (
+                f"Base {self.volume.get() * 100:.0f}% | "
+                f"primary ceiling {self.four_phase_volume_ceiling.get() * 100:.0f}% | "
+                f"rest {self.volume_rest_level.get() * 100:.0f}%"
+            ),
             "Frequency": f"{diag.frequency:.3f} | ramp {self.frequency_ramp_level.get():.2f}",
             "Pulse frequency": f"{diag.pulse_frequency:.3f} | range {self.pulse_frequency_min.get():.2f}-{self.pulse_frequency_max.get():.2f}",
             "Pulse rise time": f"{diag.pulse_rise_time:.3f} | range {self.pulse_rise_min.get():.2f}-{self.pulse_rise_max.get():.2f}",
             "Pulse width": f"{diag.pulse_width:.3f} | range {self.pulse_width_min.get():.2f}-{self.pulse_width_max.get():.2f}",
             "Prostate controls": f"alpha {diag.alpha_prostate:.3f} beta {diag.beta_prostate:.3f} volume {diag.volume_prostate * 100:.0f}% | phase {self.prostate_phase_degrees.get():+.0f} degrees",
-            "Four-phase primary controls": (
+            "Four-phase primary motion": (
                 f"{sequence_status} | "
                 f"E1 {potentials[0]:.2f} E2 {potentials[1]:.2f} "
                 f"E3 {potentials[2]:.2f} E4 {potentials[3]:.2f}"),
