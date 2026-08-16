@@ -4,7 +4,7 @@ Vector 1A is a live bridge from one MultiFunPlayer `L0` T-code stream to one or
 two ReStim instances. It converts streamed 1D motion into synchronized alpha,
 beta, volume, frequency and pulse controls at a stable internal cadence.
 
-Current development build: **1.6.0-alpha40**.
+Current development build: **1.6.0-alpha41**.
 
 > [!CAUTION]
 > Commission with ReStim's graphical display and stimulation hardware
@@ -50,6 +50,11 @@ second after they begin.
 - Four-phase spatial response curves (linear, S-curve, endpoint emphasis and
   centre emphasis) with adjustable blending and preserved path endpoints;
   blend 0 is linear and blend 1 applies 100% of the selected response.
+- Selectable four-phase spatial model: **Moving focus** hands stimulation from
+  A through D, while **Depth spread** progressively retains reached electrodes
+  so the active span accumulates with penetration and withdraws symmetrically.
+  Depth spread includes adjustable tip retention and transition softness, and
+  continuously projects every E1-E4 frame into ReStim's required domain.
 - Optional stroke-reversal emphasis uses buffered reversal points to apply a
   short proportional lift to the current volume at reversals anywhere in the
   stroke range. It changes intensity only; sample timing is preserved.
@@ -70,6 +75,12 @@ second after they begin.
   on forward motion or the previous sequence on reverse motion around
   mid-stroke, then returns. Depth and window width are adjustable; the slow
   sequence carousel takes priority when both options are selected.
+- Depth spread applies the selected static signalling-sequence mapping after
+  building logical A-B-C-D intensities. It bypasses the moving sequence window,
+  Rolling Variety sequence carousel, crossover/direction/width textures and
+  AB/CD timing separation so those transforms cannot invalidate the ReStim
+  projection. Spatial response and volume-only reversal emphasis remain active;
+  speed-linked depth continues to scale compatible spatial and volume effects.
 - Dynamic volume reduction at rest and smooth return during movement.
 - Live frequency, pulse-frequency, rise-time and pulse-width commissioning.
 - Second ReStim output with tear-shaped prostate alpha/beta and independent

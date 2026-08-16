@@ -2,7 +2,7 @@ import math
 import unittest
 
 from vector1a.fourphase import (adaptive_crossover_width, apply_group_delay, crossover_blend,
-                                directed_signed, directional_crossover_profile,
+                                depth_spread, directed_signed, directional_crossover_profile,
                                 map_electrode_order,
                                 interpolate_electrodes, morph_electrode_order, moving_sequence_window,
                                 normalize_signed, pair_morph,
@@ -13,6 +13,61 @@ from vector1a.fourphase import (adaptive_crossover_width, apply_group_delay, cro
 
 
 class FourPhaseCommissioningTests(unittest.TestCase):
+    def assert_restim_constraints(self, values):
+        self.assertAlmostEqual(max(values), 1.0)
+        anchor = values.index(max(values))
+        self.assertGreaterEqual(
+            sum(value for index, value in enumerate(values) if index != anchor),
+            1.0 - 1e-12)
+
+    def test_depth_spread_has_conservative_endpoints(self):
+        tip = depth_spread(0.0, .80, .20)
+        full = depth_spread(1.0, .80, .20)
+        self.assertEqual(tip, (1.0, 1 / 3, 1 / 3, 1 / 3))
+        self.assertEqual(full, (.80, 1.0, 1.0, 1.0))
+
+    def test_depth_spread_accumulates_reached_electrodes(self):
+        shallow = depth_spread(1 / 6, .80, .20)
+        middle = depth_spread(.5, .80, .20)
+        deep = depth_spread(5 / 6, .80, .20)
+        self.assertGreater(shallow[1], shallow[2])
+        self.assertGreater(middle[2], shallow[2])
+        self.assertGreater(deep[3], middle[3])
+        self.assertGreaterEqual(middle[1], shallow[1])
+        self.assertGreaterEqual(deep[1], middle[1])
+        self.assertGreaterEqual(deep[2], middle[2])
+
+    def test_depth_spread_is_continuous_at_region_boundaries(self):
+        for boundary in (1 / 3, 2 / 3):
+            before = depth_spread(boundary - 1e-7, .80, .20)
+            at = depth_spread(boundary, .80, .20)
+            after = depth_spread(boundary + 1e-7, .80, .20)
+            self.assertLess(max(abs(a - b) for a, b in zip(before, at)), 1e-5)
+            self.assertLess(max(abs(a - b) for a, b in zip(at, after)), 1e-5)
+
+    def test_depth_spread_withdrawal_retraces_penetration(self):
+        penetration = [depth_spread(step / 100, .73, .64) for step in range(101)]
+        withdrawal = [depth_spread(step / 100, .73, .64) for step in range(100, -1, -1)]
+        self.assertEqual(withdrawal, list(reversed(penetration)))
+
+    def test_depth_spread_mapping_happens_after_logical_profile(self):
+        logical = depth_spread(.45, .80, .20)
+        self.assertEqual(map_electrode_order(logical, "ABDC"),
+                         (logical[0], logical[1], logical[3], logical[2]))
+        self.assertEqual(map_electrode_order(logical, "BACD"),
+                         (logical[1], logical[0], logical[2], logical[3]))
+
+    def test_depth_spread_always_satisfies_restim_constraints(self):
+        for retention in (0.0, .2, .8, 1.0):
+            for softness in (0.0, .2, .7, 1.0):
+                previous = depth_spread(0.0, retention, softness)
+                self.assert_restim_constraints(previous)
+                for step in range(1, 1001):
+                    current = depth_spread(step / 1000, retention, softness)
+                    self.assert_restim_constraints(current)
+                    self.assertLess(max(abs(a - b) for a, b in zip(previous, current)), .02)
+                    previous = current
+
     def test_moving_sequence_window_returns_to_base_at_endpoints(self):
         for progress in (0.0, 1.0):
             source, target, amount = moving_sequence_window("ABDC", 1, progress, .8, 1.0)

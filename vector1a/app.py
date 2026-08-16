@@ -4,6 +4,7 @@ import tkinter as tk
 import time
 import queue
 import math
+import threading
 from collections import deque
 from tkinter import messagebox, ttk
 
@@ -14,7 +15,8 @@ from .settings import load_settings, save_settings, settings_path
 from .controller import (A, B, X, Y, START, LEFT_SHOULDER, RIGHT_SHOULDER, DPAD_UP, DPAD_DOWN,
                          DPAD_LEFT, DPAD_RIGHT, XInputController)
 from .variety import fit_range_for_travel, rolling_offset, rolling_value
-from .fourphase import (ELECTRODE_ORDERS, adaptive_crossover_width, apply_group_delay, directed_signed,
+from .fourphase import (ELECTRODE_ORDERS, SPATIAL_MODELS, adaptive_crossover_width,
+                        apply_group_delay, depth_spread, directed_signed,
                         directional_crossover_profile, map_electrode_order,
                         morph_electrode_order, moving_sequence_window, potential_roles, sequence_cycle_stage,
                         proportional_reversal_boost, reversal_emphasis_envelope,
@@ -85,6 +87,8 @@ class VectorApp:
         "four_phase_group_delay_ms", "four_phase_group_delay_transition", "electrode_order",
         "four_phase_moving_sequence", "four_phase_moving_sequence_depth",
         "four_phase_moving_sequence_width",
+        "four_phase_spatial_model", "four_phase_tip_retention",
+        "four_phase_spread_softness",
     )
     SETTINGS_FIELDS = (
         "mfp_host", "mfp_port", "restim_host", "restim_port", "prostate_host", "prostate_port",
@@ -113,6 +117,8 @@ class VectorApp:
         "four_phase_group_delay_ms", "four_phase_group_delay_transition",
         "four_phase_moving_sequence", "four_phase_moving_sequence_depth",
         "four_phase_moving_sequence_width",
+        "four_phase_spatial_model", "four_phase_tip_retention",
+        "four_phase_spread_softness",
         "preset_a_name", "preset_b_name", "preset_transition_seconds",
         "electrode_order", "variety_electrode_morph", "variety_electrode_morph_cycle",
         "variety_electrode_morph_transition_seconds",
@@ -211,6 +217,10 @@ class VectorApp:
         self.four_phase_moving_sequence_depth = tk.DoubleVar(value=.50)
         self.four_phase_moving_sequence_width = tk.DoubleVar(value=1.0)
         self.four_phase_moving_sequence_live = tk.StringVar(value="off")
+        self.four_phase_spatial_model = tk.StringVar(value="Moving focus")
+        self.four_phase_tip_retention = tk.DoubleVar(value=.80)
+        self.four_phase_spread_softness = tk.DoubleVar(value=.20)
+        self.four_phase_model_live = tk.StringVar(value="Moving focus")
         self.preset_a_name = tk.StringVar(value="A")
         self.preset_b_name = tk.StringVar(value="B")
         self.preset_transition_seconds = tk.DoubleVar(value=2.5)
@@ -284,6 +294,9 @@ class VectorApp:
         self._four_phase_history = deque(maxlen=128)
         self._four_phase_effective_group_delay = 0.0
         self._four_phase_group_delay_last_time = None
+        self._four_phase_live_lock = threading.Lock()
+        self._four_phase_live_output = (
+            (0.5, 0.5, 0.5, 0.5), "ABCD", "ABCD", 0.0, "stable")
         self.listener = MFPListener(self.engine.receive_l0, self._set_mfp_status)
         self.xinput = XInputController(self._xinput_buttons_threaded, self._xinput_status_threaded)
         self.sections = {}
@@ -566,7 +579,7 @@ class VectorApp:
                       font=("TkDefaultFont", 10, "bold")).grid(row=row, column=4, padx=8)
             self.four_phase_bars.append(bar); self.four_phase_values.append(value)
         ttk.Label(four_phase,
-                  text="Live E1-E4 Primary output; adjacent electrodes blend continuously.",
+                  text="Last transmitted E1-E4 Primary output.",
                   foreground="#9b4b00").grid(row=0, column=5, rowspan=4, sticky="w", padx=18)
         ttk.Label(four_phase, text="Return depth").grid(row=4, column=0, sticky="w")
         ttk.Spinbox(four_phase, from_=0, to=1, increment=.05,
@@ -629,6 +642,23 @@ class VectorApp:
         ttk.Spinbox(reverse_sharpness, from_=.2, to=5, increment=.1,
                     textvariable=self.four_phase_reverse_sharpness,
                     width=7).pack(side="left", padx=(4, 0))
+        ttk.Label(four_phase, text="Spatial model").grid(row=10, column=0, sticky="w")
+        ttk.Combobox(four_phase, textvariable=self.four_phase_spatial_model,
+                     values=SPATIAL_MODELS, state="readonly", width=14).grid(
+                         row=10, column=1, sticky="w")
+        ttk.Label(four_phase, text="Tip retention at full depth").grid(
+            row=10, column=2, sticky="e", padx=(8, 4))
+        ttk.Spinbox(four_phase, from_=0, to=1, increment=.05,
+                    textvariable=self.four_phase_tip_retention, width=7).grid(
+                        row=10, column=3, sticky="w")
+        ttk.Label(four_phase, text="Spread softness").grid(
+            row=10, column=4, sticky="e")
+        ttk.Spinbox(four_phase, from_=0, to=1, increment=.05,
+                    textvariable=self.four_phase_spread_softness, width=7).grid(
+                        row=10, column=5, sticky="w")
+        ttk.Label(four_phase, textvariable=self.four_phase_model_live,
+                  foreground="#9b4b00").grid(
+                      row=11, column=0, columnspan=6, sticky="w", pady=(2, 4))
         ttk.Label(four_phase, text="Change width through each stroke").grid(row=12, column=0, sticky="w")
         ttk.Label(four_phase, text="Accelerating width ×").grid(row=12, column=1, sticky="e")
         ttk.Spinbox(four_phase, from_=.2, to=3, increment=.05,
@@ -1098,6 +1128,9 @@ class VectorApp:
     def _sequence_morph_state(self, direction: int, stroke_progress: float,
                               variation_depth: float, at_time: float | None = None
                               ) -> tuple[str, str, float, str]:
+        if self.four_phase_spatial_model.get() == "Depth spread":
+            order = self.electrode_order.get()
+            return order, order, 0.0, "depth spread"
         carousel_active = self.variety_enabled.get() and self.variety_electrode_morph.get()
         if self.four_phase_moving_sequence.get() and not carousel_active:
             source, target, amount = moving_sequence_window(
@@ -1146,6 +1179,31 @@ class VectorApp:
 
     def _spatial_path(self, output_l0: float, variation_depth: float = 1.0) -> float:
         return 1.0 - output_l0 if self.four_phase_invert.get() else output_l0
+
+    def _four_phase_profile(
+            self, path_l0: float, direction: int, speed_percent: float,
+            stroke_progress: float, variation_depth: float,
+            at_time: float | None = None
+            ) -> tuple[tuple[float, float, float, float], str, str, float, str]:
+        """Build logical E1-E4 values, then apply physical sequence mapping."""
+        if self.four_phase_spatial_model.get() == "Depth spread":
+            logical = depth_spread(
+                path_l0, self.four_phase_tip_retention.get(),
+                self.four_phase_spread_softness.get())
+            order = self.electrode_order.get()
+            return map_electrode_order(logical, order), order, order, 0.0, "depth spread"
+
+        width, curve, sharpness, _ = self._crossover_profile(
+            speed_percent, direction, stroke_progress, variation_depth)
+        logical = restim_crossfade(
+            path_l0, direction, self.four_phase_return_depth.get(),
+            width, curve, sharpness)
+        source, target, amount, kind = self._sequence_morph_state(
+            direction, stroke_progress, variation_depth, at_time)
+        if source == target:
+            return map_electrode_order(logical, source), source, target, amount, kind
+        return (morph_electrode_order(logical, source, target, amount),
+                source, target, amount, kind)
 
     def apply_config(self) -> None:
         try:
@@ -1217,6 +1275,9 @@ class VectorApp:
     def _baseline_preset(self) -> dict:
         baseline = self._preset_snapshot()
         baseline.update({
+            "four_phase_spatial_model": "Moving focus",
+            "four_phase_tip_retention": .80,
+            "four_phase_spread_softness": .20,
             "four_phase_return_depth": .30,
             "four_phase_invert": False,
             "four_phase_volume_ceiling": .85,
@@ -1369,9 +1430,21 @@ class VectorApp:
             "Signal path\n\n"
             "The four green bars are the live E1-E4 commands sent to the Primary "
             "ReStim. Signalling sequence maps the logical path onto the physical "
-            "electrodes. Reverse L0 direction swaps which end corresponds to low "
+            "electrodes. Moving focus replaces each electrode with the next as depth "
+            "changes. Depth spread progressively retains A, then B and C as D joins; "
+            "Tip retention controls how much A remains at full depth and Spread "
+            "softness rounds each accumulating transition. Reverse L0 direction "
+            "swaps which end corresponds to low "
             "and high script positions. Return depth sets the preferred return "
             "electrode's relative negative contribution.\n\n"
+            "Depth spread precedence\n\n"
+            "Depth spread uses the selected static signalling sequence, but bypasses "
+            "the sequence carousel, within-stroke sequence bias, crossover and "
+            "direction textures, stroke-phase width changes, and A/B versus C/D "
+            "timing separation. This keeps every transmitted profile inside ReStim's "
+            "four-phase constraints. Spatial response and volume-only reversal "
+            "emphasis remain active; speed-linked depth still scales compatible "
+            "spatial and volume effects.\n\n"
             "Electrode crossover\n\n"
             "Crossover width controls how much of each transition is shared by two "
             "adjacent electrodes: smaller is more focused, larger is broader and "
@@ -1407,25 +1480,13 @@ class VectorApp:
         if abs(delta) > 0.0005:
             self._four_phase_send_direction = 1 if delta > 0 else -1
         self._four_phase_send_last_l0 = path_l0
-        crossover_width, crossover_curve, crossover_sharpness, _ = \
-            self._crossover_profile(sample.speed_percent,
-                                    self._four_phase_send_direction,
-                                    sample.stroke_progress, variation_depth)
-        electrodes = restim_crossfade(
-            path_l0, self._four_phase_send_direction,
-            self.four_phase_return_depth.get(), crossover_width,
-            crossover_curve, crossover_sharpness)
-        morph_source, morph_target, morph_amount, _ = self._sequence_morph_state(
-            self._four_phase_send_direction, sample.stroke_progress,
-            variation_depth, sample.due_at)
-        if morph_source == morph_target:
-            electrodes = map_electrode_order(electrodes, morph_source)
-        else:
-            electrodes = morph_electrode_order(
-                electrodes, morph_source, morph_target, morph_amount)
+        electrodes, morph_source, morph_target, morph_amount, profile_kind = \
+            self._four_phase_profile(
+            path_l0, self._four_phase_send_direction, sample.speed_percent,
+            sample.stroke_progress, variation_depth, sample.due_at)
         self._four_phase_history.append((sample.due_at, electrodes))
         target_delay = 0.0
-        if self.four_phase_group_delay.get():
+        if self.four_phase_group_delay.get() and profile_kind != "depth spread":
             target_delay = min(.300, max(-.300,
                 self.four_phase_group_delay_ms.get() / 1000.0)) * variation_depth
         previous_time = self._four_phase_group_delay_last_time
@@ -1437,9 +1498,15 @@ class VectorApp:
             target_delay - self._four_phase_effective_group_delay) * blend
         if abs(target_delay) <= 1e-9 and abs(self._four_phase_effective_group_delay) < 1e-5:
             self._four_phase_effective_group_delay = 0.0
-        electrodes = apply_group_delay(
-            electrodes, list(self._four_phase_history), sample.due_at,
-            self._four_phase_effective_group_delay)
+        if profile_kind == "depth spread":
+            self._four_phase_effective_group_delay = 0.0
+        else:
+            electrodes = apply_group_delay(
+                electrodes, list(self._four_phase_history), sample.due_at,
+                self._four_phase_effective_group_delay)
+        with self._four_phase_live_lock:
+            self._four_phase_live_output = (
+                electrodes, morph_source, morph_target, morph_amount, profile_kind)
         ceiling = min(1.0, max(0.0, self.four_phase_volume_ceiling.get()))
         if self.four_phase_volume_modulation.get():
             cycle = max(.5, self.four_phase_volume_cycle.get()) * 60.0
@@ -1479,6 +1546,10 @@ class VectorApp:
         self.engine.neutral()
         self.restim.send_primary(0.5, 0.5, (0.5, 0.5, 0.5, 0.5),
                                  self.volume.get(), 0.5, 0.5, 0.5, 0.5)
+        with self._four_phase_live_lock:
+            order = self.electrode_order.get()
+            self._four_phase_live_output = (
+                (0.5, 0.5, 0.5, 0.5), order, order, 0.0, "neutral")
         self.prostate_restim.send_prostate(0.5, 0.5, self.volume.get(), 0.5, 0.5, 0.5, 0.5)
 
     def resume(self) -> None:
@@ -1493,6 +1564,10 @@ class VectorApp:
         self.engine.stop()
         self.restim.send_primary(0.5, 0.5, (0.5, 0.5, 0.5, 0.5),
                                  0.0, 0.5, 0.5, 0.5, 0.5)
+        with self._four_phase_live_lock:
+            order = self.electrode_order.get()
+            self._four_phase_live_output = (
+                (0.5, 0.5, 0.5, 0.5), order, order, 0.0, "stopped")
         self.prostate_restim.send_prostate(0.5, 0.5, 0.0, 0.5, 0.5, 0.5, 0.5)
 
     def _reset_four_phase_group_delay(self) -> None:
@@ -1574,37 +1649,43 @@ class VectorApp:
         if abs(delta) > 0.0005:
             self._four_phase_direction = 1 if delta > 0 else -1
         self._four_phase_last_l0 = path_l0
-        signed, primary_index, return_index = directed_signed(
-            path_l0, self._four_phase_direction,
-            self.four_phase_return_depth.get())
-        effective_crossover, effective_curve, effective_sharpness, direction_name = \
-            self._crossover_profile(diag.speed_percent, self._four_phase_direction,
-                                    diag.stroke_progress, variation_depth)
-        self.four_phase_effective_crossover_width.set(
-            f"{direction_name} {effective_crossover:.3f}")
-        if self.four_phase_stroke_phase_texture.get():
-            phase_name = "accelerating" if diag.stroke_progress < .5 else "decelerating"
-            self.four_phase_stroke_phase_live.set(
-                f"{phase_name} {diag.stroke_progress:.2f} | live {effective_crossover:.3f}")
+        depth_mode = self.four_phase_spatial_model.get() == "Depth spread"
+        if depth_mode:
+            signed = depth_spread(
+                path_l0, self.four_phase_tip_retention.get(),
+                self.four_phase_spread_softness.get())
+            self.four_phase_effective_crossover_width.set("bypassed")
+            self.four_phase_stroke_phase_live.set("bypassed by Depth spread")
+            self.four_phase_model_live.set(
+                "Depth spread: static sequence only; sequence bias, crossover, "
+                "direction, width texture and AB/CD delay are bypassed")
         else:
-            self.four_phase_stroke_phase_live.set("off")
-        potentials = restim_crossfade(path_l0, self._four_phase_direction,
-                                      self.four_phase_return_depth.get(),
-                                      effective_crossover,
-                                      effective_curve, effective_sharpness)
-        morph_source, morph_target, morph_amount, morph_kind = self._sequence_morph_state(
-            self._four_phase_direction, diag.stroke_progress, variation_depth)
-        if morph_source == morph_target:
-            potentials = map_electrode_order(potentials, morph_source)
-        else:
-            potentials = morph_electrode_order(
-                potentials, morph_source, morph_target, morph_amount)
+            signed = directed_signed(
+                path_l0, self._four_phase_direction,
+                self.four_phase_return_depth.get())[0]
+            effective_crossover, _, _, direction_name = self._crossover_profile(
+                diag.speed_percent, self._four_phase_direction,
+                diag.stroke_progress, variation_depth)
+            self.four_phase_effective_crossover_width.set(
+                f"{direction_name} {effective_crossover:.3f}")
+            if self.four_phase_stroke_phase_texture.get():
+                phase_name = "accelerating" if diag.stroke_progress < .5 else "decelerating"
+                self.four_phase_stroke_phase_live.set(
+                    f"{phase_name} {diag.stroke_progress:.2f} | live {effective_crossover:.3f}")
+            else:
+                self.four_phase_stroke_phase_live.set("off")
+            self.four_phase_model_live.set("Moving focus: crossover and sequence textures available")
+        with self._four_phase_live_lock:
+            (potentials, morph_source, morph_target,
+             morph_amount, morph_kind) = self._four_phase_live_output
         self.electrode_morph_bar["value"] = morph_amount
         if morph_kind == "window":
             self.four_phase_moving_sequence_live.set(
                 f"{morph_source}→{morph_target} | {morph_amount * 100:.0f}%")
         elif morph_kind == "carousel" and self.four_phase_moving_sequence.get():
             self.four_phase_moving_sequence_live.set("carousel priority")
+        elif morph_kind == "depth spread":
+            self.four_phase_moving_sequence_live.set("bypassed by Depth spread")
         else:
             self.four_phase_moving_sequence_live.set("off")
         for variable, value in zip(self.four_phase_signed_values, signed):
@@ -1614,7 +1695,9 @@ class VectorApp:
             bar["value"] = value
             variable.set(f"{value:.4f}")
         primary, preferred_return = potential_roles(potentials)
-        if morph_source == morph_target:
+        if morph_kind == "depth spread":
+            sequence_status = f"Depth spread | static sequence {morph_source}"
+        elif morph_source == morph_target:
             sequence_status = f"Current sequence {morph_source}"
         elif morph_amount <= .001:
             sequence_status = (f"Current sequence {morph_source} | next "

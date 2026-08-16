@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 ELECTRODE_ORDERS = ("ABCD", "ABDC", "BACD", "ACBD")
+SPATIAL_MODELS = ("Moving focus", "Depth spread")
 
 
 def adaptive_crossover_width(speed_percent: float, slow_width: float,
@@ -252,6 +253,62 @@ def vertical_crossfade(position: float) -> tuple[float, float, float, float]:
     weights[section] = math.cos(progress * math.pi / 2.0)
     weights[section + 1] = math.sin(progress * math.pi / 2.0)
     return tuple(weights)
+
+
+def project_restim_intensities(
+        values: tuple[float, float, float, float]
+        ) -> tuple[float, float, float, float]:
+    """Project apparent intensities into ReStim's valid four-phase domain.
+
+    One requested intensity must equal one and the other three must total at
+    least one.  A uniform normalization establishes the maximum; any remaining
+    return deficit is distributed over the other channels in proportion to
+    their available headroom.  This leaves already-valid profiles unchanged.
+    """
+    clamped = tuple(min(1.0, max(0.0, float(value))) for value in values)
+    maximum = max(clamped)
+    if maximum <= 1e-12:
+        return (1.0, 1 / 3, 1 / 3, 1 / 3)
+    normalized = [value / maximum for value in clamped]
+    anchor = normalized.index(max(normalized))
+    return_sum = sum(value for index, value in enumerate(normalized)
+                     if index != anchor)
+    deficit = max(0.0, 1.0 - return_sum)
+    if deficit > 1e-12:
+        headroom = sum(1.0 - value for index, value in enumerate(normalized)
+                       if index != anchor)
+        if headroom > 1e-12:
+            for index, value in enumerate(normalized):
+                if index != anchor:
+                    normalized[index] = value + deficit * (1.0 - value) / headroom
+    normalized[anchor] = 1.0
+    return tuple(min(1.0, max(0.0, value)) for value in normalized)
+
+
+def depth_spread(position: float, tip_retention: float = .80,
+                 softness: float = .20
+                 ) -> tuple[float, float, float, float]:
+    """Accumulate a logical A-to-D depth profile and project it for ReStim.
+
+    B, C and D join over consecutive thirds of the L0 range.  ``softness``
+    blends each linear join toward smoothstep without moving its endpoints.
+    A stays fully present until D begins joining, then eases to
+    ``tip_retention`` at full depth.
+    """
+    position = min(1.0, max(0.0, float(position)))
+    retention = min(1.0, max(0.0, float(tip_retention)))
+    softness = min(1.0, max(0.0, float(softness)))
+
+    def gate(local: float) -> float:
+        linear = min(1.0, max(0.0, local))
+        smooth = linear * linear * (3.0 - 2.0 * linear)
+        return linear + (smooth - linear) * softness
+
+    b = gate(position * 3.0)
+    c = gate(position * 3.0 - 1.0)
+    d = gate(position * 3.0 - 2.0)
+    a = 1.0 - (1.0 - retention) * d
+    return project_restim_intensities((a, b, c, d))
 
 
 def directed_signed(position: float, direction: int = 1, return_depth: float = .30
