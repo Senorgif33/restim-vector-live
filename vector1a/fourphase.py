@@ -286,27 +286,33 @@ def project_restim_intensities(
 
 
 def depth_spread(position: float, tip_retention: float = .80,
-                 softness: float = .20
+                 softness: float = .20, full_depth_capture: float = .05
                  ) -> tuple[float, float, float, float]:
     """Accumulate a logical A-to-D depth profile and project it for ReStim.
 
     B, C and D join over consecutive thirds of the L0 range.  ``softness``
     blends each linear join toward smoothstep without moving its endpoints.
     A stays fully present until D begins joining, then eases to
-    ``tip_retention`` at full depth.
+    ``tip_retention`` at full depth. ``full_depth_capture`` completes D early
+    and holds the complete profile across the final portion of the depth range.
     """
     position = min(1.0, max(0.0, float(position)))
     retention = min(1.0, max(0.0, float(tip_retention)))
     softness = min(1.0, max(0.0, float(softness)))
+    capture = min(.20, max(0.0, float(full_depth_capture)))
 
     def gate(local: float) -> float:
+        if local >= 1.0 - 1e-12:
+            return 1.0
         linear = min(1.0, max(0.0, local))
         smooth = linear * linear * (3.0 - 2.0 * linear)
         return linear + (smooth - linear) * softness
 
     b = gate(position * 3.0)
     c = gate(position * 3.0 - 1.0)
-    d = gate(position * 3.0 - 2.0)
+    # D still begins at two-thirds depth. Compress only its final ramp so full
+    # depth can be reached by near-endpoint scripts without changing B or C.
+    d = gate((position * 3.0 - 2.0) / (1.0 - 3.0 * capture))
     a = 1.0 - (1.0 - retention) * d
     return project_restim_intensities((a, b, c, d))
 

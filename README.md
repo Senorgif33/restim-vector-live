@@ -4,7 +4,7 @@ Vector 1A is a live bridge from one MultiFunPlayer `L0` T-code stream to one or
 two ReStim instances. It converts streamed 1D motion into synchronized alpha,
 beta, volume, frequency and pulse controls at a stable internal cadence.
 
-Current development build: **1.6.0-alpha41**.
+Current development build: **1.6.0-alpha42**.
 
 > [!CAUTION]
 > Commission with ReStim's graphical display and stimulation hardware
@@ -53,8 +53,10 @@ second after they begin.
 - Selectable four-phase spatial model: **Moving focus** hands stimulation from
   A through D, while **Depth spread** progressively retains reached electrodes
   so the active span accumulates with penetration and withdraws symmetrically.
-  Depth spread includes adjustable tip retention and transition softness, and
-  continuously projects every E1-E4 frame into ReStim's required domain.
+  Depth spread includes adjustable tip retention, transition softness and a
+  full-depth capture zone (default 5%) so near-endpoint scripts reach and hold
+  E4 at 100%. Every E1-E4 frame is continuously projected into ReStim's
+  required domain.
 - Optional stroke-reversal emphasis uses buffered reversal points to apply a
   short proportional lift to the current volume at reversals anywhere in the
   stroke range. It changes intensity only; sample timing is preserved.

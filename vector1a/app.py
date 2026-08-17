@@ -88,7 +88,7 @@ class VectorApp:
         "four_phase_moving_sequence", "four_phase_moving_sequence_depth",
         "four_phase_moving_sequence_width",
         "four_phase_spatial_model", "four_phase_tip_retention",
-        "four_phase_spread_softness",
+        "four_phase_spread_softness", "four_phase_full_depth_capture",
     )
     SETTINGS_FIELDS = (
         "mfp_host", "mfp_port", "restim_host", "restim_port", "prostate_host", "prostate_port",
@@ -118,7 +118,7 @@ class VectorApp:
         "four_phase_moving_sequence", "four_phase_moving_sequence_depth",
         "four_phase_moving_sequence_width",
         "four_phase_spatial_model", "four_phase_tip_retention",
-        "four_phase_spread_softness",
+        "four_phase_spread_softness", "four_phase_full_depth_capture",
         "preset_a_name", "preset_b_name", "preset_transition_seconds",
         "electrode_order", "variety_electrode_morph", "variety_electrode_morph_cycle",
         "variety_electrode_morph_transition_seconds",
@@ -220,6 +220,7 @@ class VectorApp:
         self.four_phase_spatial_model = tk.StringVar(value="Moving focus")
         self.four_phase_tip_retention = tk.DoubleVar(value=.80)
         self.four_phase_spread_softness = tk.DoubleVar(value=.20)
+        self.four_phase_full_depth_capture = tk.DoubleVar(value=.05)
         self.four_phase_model_live = tk.StringVar(value="Moving focus")
         self.preset_a_name = tk.StringVar(value="A")
         self.preset_b_name = tk.StringVar(value="B")
@@ -656,9 +657,14 @@ class VectorApp:
         ttk.Spinbox(four_phase, from_=0, to=1, increment=.05,
                     textvariable=self.four_phase_spread_softness, width=7).grid(
                         row=10, column=5, sticky="w")
+        ttk.Label(four_phase, text="Full-depth capture").grid(
+            row=11, column=0, sticky="w")
+        ttk.Spinbox(four_phase, from_=0, to=.20, increment=.01,
+                    textvariable=self.four_phase_full_depth_capture, width=7).grid(
+                        row=11, column=1, sticky="w")
         ttk.Label(four_phase, textvariable=self.four_phase_model_live,
                   foreground="#9b4b00").grid(
-                      row=11, column=0, columnspan=6, sticky="w", pady=(2, 4))
+                      row=11, column=2, columnspan=4, sticky="w", pady=(2, 4))
         ttk.Label(four_phase, text="Change width through each stroke").grid(row=12, column=0, sticky="w")
         ttk.Label(four_phase, text="Accelerating width ×").grid(row=12, column=1, sticky="e")
         ttk.Spinbox(four_phase, from_=.2, to=3, increment=.05,
@@ -1189,7 +1195,8 @@ class VectorApp:
         if self.four_phase_spatial_model.get() == "Depth spread":
             logical = depth_spread(
                 path_l0, self.four_phase_tip_retention.get(),
-                self.four_phase_spread_softness.get())
+                self.four_phase_spread_softness.get(),
+                self.four_phase_full_depth_capture.get())
             order = self.electrode_order.get()
             return map_electrode_order(logical, order), order, order, 0.0, "depth spread"
 
@@ -1278,6 +1285,7 @@ class VectorApp:
             "four_phase_spatial_model": "Moving focus",
             "four_phase_tip_retention": .80,
             "four_phase_spread_softness": .20,
+            "four_phase_full_depth_capture": .05,
             "four_phase_return_depth": .30,
             "four_phase_invert": False,
             "four_phase_volume_ceiling": .85,
@@ -1433,7 +1441,9 @@ class VectorApp:
             "electrodes. Moving focus replaces each electrode with the next as depth "
             "changes. Depth spread progressively retains A, then B and C as D joins; "
             "Tip retention controls how much A remains at full depth and Spread "
-            "softness rounds each accumulating transition. Reverse L0 direction "
+            "softness rounds each accumulating transition. Full-depth capture sets "
+            "how much of the deepest L0 range holds D at 100%; 0.05 means the last "
+            "5%. Reverse L0 direction "
             "swaps which end corresponds to low "
             "and high script positions. Return depth sets the preferred return "
             "electrode's relative negative contribution.\n\n"
@@ -1653,7 +1663,8 @@ class VectorApp:
         if depth_mode:
             signed = depth_spread(
                 path_l0, self.four_phase_tip_retention.get(),
-                self.four_phase_spread_softness.get())
+                self.four_phase_spread_softness.get(),
+                self.four_phase_full_depth_capture.get())
             self.four_phase_effective_crossover_width.set("bypassed")
             self.four_phase_stroke_phase_live.set("bypassed by Depth spread")
             self.four_phase_model_live.set(

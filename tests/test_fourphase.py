@@ -26,6 +26,24 @@ class FourPhaseCommissioningTests(unittest.TestCase):
         self.assertEqual(tip, (1.0, 1 / 3, 1 / 3, 1 / 3))
         self.assertEqual(full, (.80, 1.0, 1.0, 1.0))
 
+    def test_depth_spread_captures_full_depth_before_exact_endpoint(self):
+        captured = depth_spread(.95, .80, .20, .05)
+        self.assertEqual(captured, (.80, 1.0, 1.0, 1.0))
+        self.assertEqual(depth_spread(1.0, .80, .20, .05), captured)
+        self.assertLess(depth_spread(.94, .80, .20, .05)[3], 1.0)
+
+    def test_depth_spread_capture_boundary_is_continuous(self):
+        before = depth_spread(.95 - 1e-7, .80, .20, .05)
+        at = depth_spread(.95, .80, .20, .05)
+        after = depth_spread(.95 + 1e-7, .80, .20, .05)
+        self.assertLess(max(abs(a - b) for a, b in zip(before, at)), 1e-5)
+        self.assertEqual(at, after)
+
+    def test_zero_capture_preserves_exact_endpoint_behavior(self):
+        self.assertLess(depth_spread(.999, .80, .20, 0.0)[3], 1.0)
+        self.assertEqual(depth_spread(1.0, .80, .20, 0.0),
+                         (.80, 1.0, 1.0, 1.0))
+
     def test_depth_spread_accumulates_reached_electrodes(self):
         shallow = depth_spread(1 / 6, .80, .20)
         middle = depth_spread(.5, .80, .20)
@@ -60,13 +78,16 @@ class FourPhaseCommissioningTests(unittest.TestCase):
     def test_depth_spread_always_satisfies_restim_constraints(self):
         for retention in (0.0, .2, .8, 1.0):
             for softness in (0.0, .2, .7, 1.0):
-                previous = depth_spread(0.0, retention, softness)
-                self.assert_restim_constraints(previous)
-                for step in range(1, 1001):
-                    current = depth_spread(step / 1000, retention, softness)
-                    self.assert_restim_constraints(current)
-                    self.assertLess(max(abs(a - b) for a, b in zip(previous, current)), .02)
-                    previous = current
+                for capture in (0.0, .05, .20):
+                    previous = depth_spread(0.0, retention, softness, capture)
+                    self.assert_restim_constraints(previous)
+                    for step in range(1, 1001):
+                        current = depth_spread(
+                            step / 1000, retention, softness, capture)
+                        self.assert_restim_constraints(current)
+                        self.assertLess(
+                            max(abs(a - b) for a, b in zip(previous, current)), .02)
+                        previous = current
 
     def test_moving_sequence_window_returns_to_base_at_endpoints(self):
         for progress in (0.0, 1.0):
