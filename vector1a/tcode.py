@@ -12,6 +12,7 @@ class TCodeCommand:
 
 
 _COMMAND = re.compile(r"^([A-Za-z][0-9])([0-9]+)(?:I([0-9]+))?$")
+_SCAN_COMMAND = re.compile(r"([A-Za-z][0-9])([0-9]+?)(?:I([0-9]+))?(?=[A-Za-z][0-9]|[\s,;|]|$)")
 
 
 def parse_command(text: str) -> TCodeCommand:
@@ -25,13 +26,20 @@ def parse_command(text: str) -> TCodeCommand:
 
 
 def parse_message(message: str) -> list[TCodeCommand]:
+    """Parse a T-code packet.
+
+    MFP output is commonly whitespace separated, but some transports/plugins
+    concatenate commands (for example ``L05000L17500V07000``).  Scan the
+    packet rather than relying on whitespace so both forms are accepted.
+    Unknown text is ignored, matching the listener's previous tolerant
+    behaviour.
+    """
     commands: list[TCodeCommand] = []
-    for token in re.split(r"[\s\r\n]+", message.strip()):
-        if token:
-            try:
-                commands.append(parse_command(token))
-            except ValueError:
-                pass
+    for match in _SCAN_COMMAND.finditer(message.strip()):
+        axis, digits, interval = match.groups()
+        value = int(digits) / (10 ** len(digits))
+        commands.append(TCodeCommand(
+            axis.upper(), min(1.0, max(0.0, value)), int(interval or 0)))
     return commands
 
 

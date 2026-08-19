@@ -1,15 +1,29 @@
 # Vector 1A
 
-Vector 1A is a live bridge from one MultiFunPlayer `L0` T-code stream to one or
-two ReStim instances. It converts streamed 1D motion into synchronized alpha,
-beta, volume, frequency and pulse controls at a stable internal cadence.
+Vector 1A is a standalone live bridge from MultiFunPlayer T-code to one or two ReStim
+instances. It does not require an AI model, GPU, cloud service, or voice stack. With an
+ordinary positional `L0` stream, Vector remains the deterministic motion generator. When
+MFP supplies a clearly authored ReStim axis set, Vector can automatically pass those axes
+through on the same delayed timeline and generate only the missing axes.
 
-Current development build: **1.6.0-alpha42**.
+Current development build: **1.6.0-alpha49**.
 
 > [!CAUTION]
 > Commission with ReStim's graphical display and stimulation hardware
 > disconnected. Vector 1A is not a medical device and cannot make connected
 > hardware, electrode placement, intensity, or generated signals safe.
+
+
+### Alpha 48: session coordination and routing ownership
+
+The MFP axis-routing window now shows whether each live axis is currently **AUTHORED** by MFP or **VECTOR** generated. Session startup can optionally launch MFP and one or two ReStim instances, wait for ReStim ports to become ready, connect them, and expose a single `SESSION: STARTING / READY / ATTENTION` state. These features are optional and disabled by default.
+
+## Standalone by design
+
+Vector 1A's signal engine, routing, orchestration and ReStim connections are entirely
+local and deterministic. No language model or voice system is required. Future director
+integrations can be layered above Vector as optional companions rather than becoming a
+dependency of the core application.
 
 ## Signal path
 
@@ -27,6 +41,20 @@ second after they begin.
 
 ## Features
 
+- Authored-axis routing discovers MFP T-code axes at runtime and supports two policies.
+  **Manual selected axes** provides per-axis checkboxes (including `L0`) so an authored
+  value can replace the matching Vector-generated primary-ReStim axis or pass through as
+  an additional T-code axis. **Auto authored ReStim set** detects unmistakably ReStim-style
+  streams (for example `V0`, `C0`, `P0`, `P1`, `P3`, `E1-E4`) and passes the complete fresh
+  authored set, including `L0`/`L1`, while Vector generates only missing axes. If the input
+  falls back to ordinary `L0` only, Vector automatically resumes full generation. All
+  authored values are sampled on their original MFP timeline and released with Vector's
+  deterministic look-ahead delay. The routing dialog shows axes detected this session,
+  axes currently live, and the active routing mode.
+- Optional session startup can launch configured MultiFunPlayer, primary ReStim
+  and prostate ReStim applications/shortcuts when Vector opens. Launching is kept
+  separate from signal generation; Vector still owns its listener, connections,
+  queue and output safety state.
 - Four RFP/funscript-tools-compatible motion modes:
   - Circular 0-180
   - Top-Left to Bottom-Right 0-90 (default)
@@ -136,8 +164,12 @@ Vector itself has no third-party Python package dependencies.
 7. Optionally run a second ReStim WebSocket server on port `12350` for prostate
    output.
 8. In Vector, start the listener, connect the output(s), then choose
-   **Start / Resume**.
-9. Fine-tune synchronization in MFP around -2.00 seconds while leaving Vector's
+   **Start / Resume**. Alternatively, open **Session startup** to configure
+   optional one-click launching of MFP and either ReStim instance.
+9. If MFP is also streaming non-`L0` axes, open **MFP axes** and tick only the
+   authored axes you want sent to the Primary ReStim. Unchecked axes leave
+   Vector's generated behaviour unchanged.
+10. Fine-tune synchronization in MFP around -2.00 seconds while leaving Vector's
    delay at 2.00 seconds.
 
 The **Setup guide** button repeats these instructions. Settings are saved at
@@ -239,3 +271,18 @@ copyright and license details.
 ## License
 
 Vector 1A is available under the MIT License. See `LICENSE`.
+
+
+## Alpha 44 MFP axis diagnostics
+
+Alpha 44 makes authored-axis discovery more tolerant and observable. The MFP listener now accepts both whitespace-separated and concatenated T-code packets, and the **MFP axes** window shows recent raw packets beside the axis names parsed from them. This is diagnostic only unless an authored axis checkbox is explicitly enabled; all authored-axis routing remains off by default.
+
+
+## Alpha 45 authored routing policy
+
+Alpha 45 adds two routing policies in **MFP axes**. **Manual selected axes** allows any detected axis, including `L0`, to replace Vector's generated value on the same delayed timeline. `V0` is labelled as Primary volume to distinguish it from additional volume axes such as `V1`. **Auto authored ReStim set** detects a ReStim-semantic stream by the presence of axes such as `V0`, `C0`, `P0`, `P1`, `P3`, or `E1`-`E4`. When detected, Vector passes the complete authored axis set, including `L0` and `L1`, while continuing to generate only missing axes. A plain positional `L0` stream remains in normal Vector-generation mode.
+
+
+## Alpha 46 delayed-timeline authored routing fix
+
+Alpha 46 fixes automatic authored ReStim routing when Vector is using its normal look-ahead delay.  Alpha 45 tested axis freshness against the newest packet currently held in history; because that newest packet is usually later than the delayed sample's original calculation time, the auto router could incorrectly return no overrides.  Alpha 46 evaluates freshness using the newest authored packet that existed at the delayed sample time.  This makes authored `V0`, `L0`, `L1`, and the rest of the detected ReStim set win at the final Primary ReStim merge while preserving Vector's synchronized delay and generated fallback for genuinely missing axes.

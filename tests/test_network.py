@@ -100,6 +100,45 @@ class NetworkTests(unittest.TestCase):
                          "L05000 L15000 E15000 E25000 E35000 E45000 V00000")
         self.assertIn("L01000 L12000 E19999 E20000", decode(frames[1]))
 
+
+    def test_primary_authored_override_can_replace_generated_l0(self):
+        client = ReStimWebSocketClient(lambda _: None)
+        messages = []
+        client._socket = type("Socket", (), {"sendall": lambda _, value: messages.append(value)})()
+        client.send_primary(.1, .2, (1.0, 0.0, .25, .5), .6, .7, .8, .9, .4,
+                            overrides={"L0": .77, "V0": .45})
+        frame = messages[0]; size = frame[1] & 0x7f; index = 2
+        if size == 126: size = int.from_bytes(frame[2:4], "big"); index = 4
+        mask, payload = frame[index:index+4], frame[index+4:index+4+size]
+        text = bytes(value ^ mask[i % 4] for i, value in enumerate(payload)).decode()
+        self.assertIn("L07700", text)
+        self.assertIn("V04500", text)
+        self.assertNotIn("L01000", text)
+        self.assertNotIn("V06000", text)
+
+    def test_primary_authored_overrides_replace_generated_and_append_extra_axes(self):
+        client = ReStimWebSocketClient(lambda _: None)
+        messages = []
+        client._socket = type("Socket", (), {"sendall": lambda _, value: messages.append(value)})()
+        client.send_primary(.1, .2, (1.0, 0.0, .25, .5), .6, .7, .8, .9, .4,
+                            overrides={"L1": .91, "R0": .33})
+        frame = messages[0]; size = frame[1] & 0x7f; index = 2
+        if size == 126: size = int.from_bytes(frame[2:4], "big"); index = 4
+        mask, payload = frame[index:index+4], frame[index+4:index+4+size]
+        text = bytes(value ^ mask[i % 4] for i, value in enumerate(payload)).decode()
+        self.assertIn("L19100", text)
+        self.assertIn("R03300", text)
+        self.assertNotIn("L12000", text)
+
+    def test_listener_reports_all_axes_without_changing_l0_callback_contract(self):
+        l0 = []
+        commands = []
+        listener = MFPListener(lambda value, *_: l0.append(value), lambda _: None,
+                               lambda command, _: commands.append((command.axis, command.value)))
+        listener._handle("L02500 L17500 R05000")
+        self.assertEqual(l0, [.25])
+        self.assertEqual(commands, [("L0", .25), ("L1", .75), ("R0", .5)])
+
     def test_quiet_listener_is_not_reported_as_failed(self):
         listener = MFPListener(lambda *_: None, lambda _: None)
         listener._run.set()
@@ -140,3 +179,15 @@ class NetworkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_mfp_listener_records_raw_packet_and_all_axes():
+    seen = []
+    listener = MFPListener(lambda value, interval, when: None, lambda text: None,
+                           lambda command, when: seen.append(command.axis))
+    listener._handle("L05000L17500V02500 C09000", "udp")
+    assert seen == ["L0", "L1", "V0", "C0"]
+    packet = listener.recent_packets(1)[0]
+    assert packet["transport"] == "UDP"
+    assert packet["axes"] == ["L0", "L1", "V0", "C0"]
+    assert packet["raw"] == "L05000L17500V02500 C09000"

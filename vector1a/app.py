@@ -6,11 +6,13 @@ import queue
 import math
 import threading
 from collections import deque
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from .engine import OutputSample, VectorEngine
 from .motion import MotionMode, MotionParameters
 from .network import MFPListener, ReStimWebSocketClient
+from .routing import AuthoredAxisRouter
+from .orchestration import SessionOrchestrator, port_is_open, wait_for_port
 from .settings import load_settings, save_settings, settings_path
 from .controller import (A, B, X, Y, START, LEFT_SHOULDER, RIGHT_SHOULDER, DPAD_UP, DPAD_DOWN,
                          DPAD_LEFT, DPAD_RIGHT, XInputController)
@@ -93,6 +95,8 @@ class VectorApp:
     SETTINGS_FIELDS = (
         "mfp_host", "mfp_port", "restim_host", "restim_port", "prostate_host", "prostate_port",
         "four_phase_host", "four_phase_port",
+        "auto_start_mfp", "auto_start_restim", "auto_start_prostate",
+        "mfp_launch_target", "restim_launch_target", "prostate_launch_target",
         "rate", "lookahead", "volume", "dynamic_volume", "volume_rest_level", "volume_ratio",
         "volume_ramp_up", "frequency_ramp_level", "frequency_ratio", "send_frequency",
         "pulse_frequency_ratio", "pulse_frequency_min", "pulse_frequency_max", "send_pulse_frequency",
@@ -150,6 +154,17 @@ class VectorApp:
         self.prostate_port = tk.IntVar(value=12350)
         self.four_phase_host = tk.StringVar(value="127.0.0.1")
         self.four_phase_port = tk.IntVar(value=12351)
+        self.auto_start_mfp = tk.BooleanVar(value=False)
+        self.auto_start_restim = tk.BooleanVar(value=False)
+        self.auto_start_prostate = tk.BooleanVar(value=False)
+        self.mfp_launch_target = tk.StringVar(value="")
+        self.restim_launch_target = tk.StringVar(value="")
+        self.prostate_launch_target = tk.StringVar(value="")
+        self.startup_status = tk.StringVar(value="Manual startup")
+        self.session_ready_status = tk.StringVar(value="SESSION: MANUAL")
+        self._startup_in_progress = False
+        self.authored_axes_status = tk.StringVar(value="No authored axes detected")
+        self.authored_routing_mode = tk.StringVar(value="Manual selected axes")
         self.rate = tk.IntVar(value=50)
         self.lookahead = tk.DoubleVar(value=2.0)
         self.volume = tk.DoubleVar(value=0.70)
@@ -283,6 +298,8 @@ class VectorApp:
         self._connection_events: deque[str] = deque(maxlen=200)
         self._last_connection_event: dict[str, str] = {}
 
+        self.axis_router = AuthoredAxisRouter()
+        self.orchestrator = SessionOrchestrator(self._set_startup_status)
         self.restim = ReStimWebSocketClient(self._set_restim_status)
         self.prostate_restim = ReStimWebSocketClient(self._set_prostate_status)
         self.engine = VectorEngine(self._send_sample)
@@ -298,7 +315,7 @@ class VectorApp:
         self._four_phase_live_lock = threading.Lock()
         self._four_phase_live_output = (
             (0.5, 0.5, 0.5, 0.5), "ABCD", "ABCD", 0.0, "stable")
-        self.listener = MFPListener(self.engine.receive_l0, self._set_mfp_status)
+        self.listener = MFPListener(self.engine.receive_l0, self._set_mfp_status, self._on_mfp_command)
         self.xinput = XInputController(self._xinput_buttons_threaded, self._xinput_status_threaded)
         self.sections = {}
         self._first_run = self._load_settings()
@@ -308,6 +325,7 @@ class VectorApp:
         self.xinput.start()
         self.engine.start()
         self.root.after(100, self._refresh)
+        self.root.after(350, self._auto_start_session)
         if self._first_run:
             self.root.after(500, self.show_setup_guide)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -338,7 +356,10 @@ class VectorApp:
         ttk.Button(toolbar, text="Rolling Variety", command=self.show_variety_window).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Presets A/B", command=self.show_preset_window).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Connection log", command=self.show_connection_log).pack(side="left", padx=6)
+        ttk.Button(toolbar, text="MFP axes", command=self.show_axis_routing).pack(side="left", padx=6)
+        ttk.Button(toolbar, text="Session startup", command=self.show_session_startup).pack(side="left", padx=6)
         ttk.Label(toolbar, textvariable=self.diag_vars["state"]).pack(side="right", padx=8)
+        ttk.Label(toolbar, textvariable=self.session_ready_status, font=("TkDefaultFont", 9, "bold")).pack(side="right", padx=12)
 
         mfp = self._frame("MultiFunPlayer input", 0, 0)
         ttk.Label(mfp, text="Bind address").grid(row=0, column=0, sticky="w")
@@ -348,6 +369,8 @@ class VectorApp:
         ttk.Button(mfp, text="Start listener", command=self.start_listener).grid(row=1, column=0, pady=8)
         ttk.Button(mfp, text="Stop listener", command=self.listener.stop).grid(row=1, column=1, pady=8)
         ttk.Label(mfp, textvariable=self.mfp_status).grid(row=1, column=2, columnspan=2, sticky="w")
+        ttk.Label(mfp, textvariable=self.authored_axes_status, foreground="#555").grid(
+            row=2, column=0, columnspan=4, sticky="w", pady=(0, 4))
 
         restim = self._frame("ReStim output", 0, 1)
         ttk.Label(restim, text="Primary WS").grid(row=0, column=0, sticky="w")
@@ -878,6 +901,298 @@ class VectorApp:
         ttk.Button(buttons, text="Clear", command=clear_log).pack(side="left", padx=6)
         ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
 
+    def _on_mfp_command(self, command, received_at: float) -> None:
+        """Capture all MFP axes; L0 still enters the proven engine separately."""
+        self.axis_router.receive(command, received_at)
+
+    def _set_startup_status(self, text: str) -> None:
+        self._record_connection_event("Startup", text)
+        try:
+            self.root.after(0, self.startup_status.set, text)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _browse_launch_target(self, variable: tk.StringVar) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select application or shortcut",
+            filetypes=(("Applications and shortcuts", "*.exe *.lnk *.bat *.cmd"),
+                       ("All files", "*.*")))
+        if selected:
+            variable.set(selected)
+
+    def show_session_startup(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("Session startup")
+        window.transient(self.root)
+        window.geometry("820x300")
+        body = ttk.Frame(window, padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=(
+            "Optional standalone session coordinator. Vector can launch the selected applications, "
+            "wait for ReStim services to become available, connect them, and report one session-ready state. "
+            "Signal generation remains entirely inside Vector."), wraplength=760).grid(
+                row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
+        rows = (
+            ("MultiFunPlayer", self.auto_start_mfp, self.mfp_launch_target),
+            ("Primary ReStim", self.auto_start_restim, self.restim_launch_target),
+            ("Prostate ReStim", self.auto_start_prostate, self.prostate_launch_target),
+        )
+        for row, (label, enabled, target) in enumerate(rows, 1):
+            ttk.Checkbutton(body, text=f"Auto-start {label}", variable=enabled).grid(
+                row=row, column=0, sticky="w", pady=5)
+            ttk.Entry(body, textvariable=target, width=62).grid(
+                row=row, column=1, columnspan=2, sticky="ew", padx=8)
+            ttk.Button(body, text="Browse…",
+                       command=lambda v=target: self._browse_launch_target(v)).grid(
+                           row=row, column=3, sticky="e")
+        ttk.Label(body, textvariable=self.startup_status, foreground="#555").grid(
+            row=5, column=0, columnspan=4, sticky="w", pady=(12, 6))
+        buttons = ttk.Frame(body)
+        buttons.grid(row=6, column=0, columnspan=4, sticky="ew")
+        ttk.Button(buttons, text="Start selected session", command=self._launch_session_apps).pack(side="left")
+        ttk.Button(buttons, text="Save", command=self._save_settings).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
+        body.columnconfigure(1, weight=1)
+
+    def _launch_session_apps(self) -> None:
+        if self._startup_in_progress:
+            self._set_startup_status("Session startup already in progress")
+            return
+
+        selected = {
+            "mfp": bool(self.auto_start_mfp.get()),
+            "restim": bool(self.auto_start_restim.get()),
+            "prostate": bool(self.auto_start_prostate.get()),
+        }
+        targets = {
+            "mfp": self.mfp_launch_target.get(),
+            "restim": self.restim_launch_target.get(),
+            "prostate": self.prostate_launch_target.get(),
+        }
+        hosts = {
+            "restim": self.restim_host.get().strip(),
+            "prostate": self.prostate_host.get().strip(),
+        }
+        ports = {
+            "restim": int(self.restim_port.get()),
+            "prostate": int(self.prostate_port.get()),
+        }
+        if not any(selected.values()):
+            self.session_ready_status.set("SESSION: MANUAL")
+            self._set_startup_status("No auto-start applications selected")
+            self._save_settings()
+            return
+
+        self._startup_in_progress = True
+        self.session_ready_status.set("SESSION: STARTING")
+        self._set_startup_status("Starting selected session components…")
+        self._save_settings()
+
+        # MFP sends into Vector, so Vector can prepare the listener immediately.
+        if selected["mfp"]:
+            self.start_listener()
+
+        def worker() -> None:
+            messages: list[str] = []
+            failed: list[str] = []
+            if selected["mfp"]:
+                result = self.orchestrator.launch("MultiFunPlayer", targets["mfp"])
+                messages.append(result.message)
+                if targets["mfp"].strip() and not result.launched and "already launched" not in result.message:
+                    failed.append("MultiFunPlayer")
+
+            for key, label in (("restim", "Primary ReStim"), ("prostate", "Prostate ReStim")):
+                if not selected[key]:
+                    continue
+                host, port = hosts[key], ports[key]
+                if port_is_open(host, port):
+                    messages.append(f"{label}: already listening on {host}:{port}")
+                else:
+                    result = self.orchestrator.launch(label, targets[key])
+                    messages.append(result.message)
+                    if not wait_for_port(host, port, timeout=12.0):
+                        failed.append(label)
+                        messages.append(f"{label}: port {host}:{port} not ready after 12 s")
+
+            def finish() -> None:
+                # Only attempt WebSocket handshakes after the corresponding TCP service is ready.
+                if selected["restim"] and "Primary ReStim" not in failed:
+                    self.connect_restim()
+                if selected["prostate"] and "Prostate ReStim" not in failed:
+                    self.connect_prostate()
+                self._startup_in_progress = False
+                if failed:
+                    self.session_ready_status.set("SESSION: ATTENTION")
+                    messages.append("Attention: " + ", ".join(failed))
+                else:
+                    self.session_ready_status.set("SESSION: READY")
+                    messages.append("READY")
+                self._set_startup_status(" | ".join(messages))
+
+            self.root.after(0, finish)
+
+        threading.Thread(target=worker, name="vector-session-startup", daemon=True).start()
+
+    def _auto_start_session(self) -> None:
+        if self.auto_start_mfp.get() or self.auto_start_restim.get() or self.auto_start_prostate.get():
+            self._launch_session_apps()
+
+    def show_axis_routing(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("MFP authored-axis routing")
+        window.transient(self.root)
+        window.geometry("900x680")
+        outer = ttk.Frame(window, padding=12)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text=(
+            "Choose manual per-axis routing, or Auto authored ReStim set. Auto mode only takes over "
+            "when MFP is clearly supplying ReStim-semantic axes (for example V0/C0/P0/P1/P3/E1-E4). "
+            "It then passes the complete authored set, including L0/L1, on Vector's delayed timeline; "
+            "any missing ReStim axes remain Vector-generated."),
+            wraplength=840).pack(anchor="w", pady=(0, 8))
+        policy = ttk.Frame(outer)
+        policy.pack(fill="x", pady=(0, 8))
+        ttk.Label(policy, text="Routing policy:", font=("TkDefaultFont", 9, "bold")).pack(side="left")
+        ttk.Radiobutton(policy, text="Manual selected axes", variable=self.authored_routing_mode,
+                        value="Manual selected axes", command=self._save_settings).pack(side="left", padx=(10, 4))
+        ttk.Radiobutton(policy, text="Auto authored ReStim set", variable=self.authored_routing_mode,
+                        value="Auto authored ReStim set", command=self._save_settings).pack(side="left", padx=4)
+
+        state_frame = ttk.LabelFrame(outer, text="Live routing state", padding=(10, 7))
+        state_frame.pack(fill="x", pady=(0, 8))
+        discovered_text = tk.StringVar(value="Detected this session: none")
+        live_text = tk.StringVar(value="Currently live: none")
+        mode_text = tk.StringVar(value="Routing mode: VECTOR GENERATION")
+        ttk.Label(state_frame, textvariable=discovered_text).pack(anchor="w")
+        ttk.Label(state_frame, textvariable=live_text).pack(anchor="w", pady=(2, 0))
+        ttk.Label(state_frame, textvariable=mode_text, font=("TkDefaultFont", 9, "bold")).pack(anchor="w", pady=(2, 0))
+
+        frame = ttk.Frame(outer)
+        frame.pack(fill="x", expand=False)
+        controls: dict[str, tuple[tk.BooleanVar, ttk.Label, ttk.Label]] = {}
+
+        ttk.Separator(outer).pack(fill="x", pady=(12, 8))
+        ttk.Label(outer, text="Recent MFP packets (raw input → parsed axes)",
+                  font=("TkDefaultFont", 9, "bold")).pack(anchor="w")
+        packet_box = tk.Text(outer, height=12, wrap="none")
+        packet_box.pack(fill="both", expand=True, pady=(4, 6))
+        packet_box.configure(state="disabled")
+        packet_signature = [None]
+
+        def copy_packets() -> None:
+            packets = self.listener.recent_packets(40)
+            lines = []
+            now = time.monotonic()
+            for packet in packets:
+                age = max(0.0, now - float(packet["time"]))
+                axes = ",".join(packet["axes"]) or "none"
+                lines.append(f'{packet["transport"]} {age:5.2f}s  parsed=[{axes}]  raw={packet["raw"]}')
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(lines))
+
+        packet_buttons = ttk.Frame(outer)
+        packet_buttons.pack(fill="x")
+        ttk.Button(packet_buttons, text="Copy packet diagnostics",
+                   command=copy_packets).pack(side="left")
+        generated = {"L0", "L1", "E1", "E2", "E3", "E4", "V0", "C0", "P0", "P1", "P3"}
+        axis_names = {
+            "L0": "Alpha / primary position", "L1": "Beta",
+            "V0": "Primary volume", "C0": "Frequency",
+            "P0": "Pulse frequency", "P1": "Pulse width", "P3": "Pulse rise time",
+            "E1": "Electrode A", "E2": "Electrode B", "E3": "Electrode C", "E4": "Electrode D",
+            "V1": "Additional volume axis",
+        }
+
+        def toggle(axis: str, variable: tk.BooleanVar) -> None:
+            self.axis_router.set_enabled(axis, variable.get())
+            self._save_settings()
+
+        def refresh_routes() -> None:
+            if not window.winfo_exists():
+                return
+            now = time.monotonic()
+            status = self.axis_router.axis_status(now)
+            axes = sorted(set(status) | self.axis_router.enabled_axes())
+            discovered = sorted(status)
+            live_axes = sorted(self.axis_router.live_axes(now))
+            discovered_text.set("Detected this session: " + (", ".join(discovered) if discovered else "none"))
+            live_text.set("Currently live: " + (", ".join(live_axes) if live_axes else "none"))
+            if not axes:
+                self.authored_axes_status.set("No authored axes detected")
+                mode_text.set("Routing mode: VECTOR GENERATION")
+            else:
+                enabled = sorted(self.axis_router.enabled_axes())
+                if self.authored_routing_mode.get() == "Auto authored ReStim set":
+                    auto_active = self.axis_router.auto_authored_active(now)
+                    if auto_active:
+                        suffix = " | AUTO full authored set"
+                        mode_text.set("Routing mode: AUTO AUTHORED RESTIM")
+                    else:
+                        suffix = " | AUTO waiting; Vector generation"
+                        mode_text.set("Routing mode: VECTOR GENERATION (auto waiting)")
+                else:
+                    suffix = (" | routed: " + ", ".join(enabled) if enabled else " | Vector generation active")
+                    mode_text.set("Routing mode: MANUAL PASSTHROUGH" if enabled else "Routing mode: VECTOR GENERATION")
+                self.authored_axes_status.set("Authored axes: " + ", ".join(axes) + suffix)
+            packets = self.listener.recent_packets(12)
+            signature = tuple((p["transport"], p["raw"], tuple(p["axes"])) for p in packets)
+            if signature != packet_signature[0]:
+                packet_signature[0] = signature
+                packet_now = time.monotonic()
+                lines = []
+                for packet in packets:
+                    age = max(0.0, packet_now - float(packet["time"]))
+                    parsed = ",".join(packet["axes"]) or "none"
+                    raw = str(packet["raw"]).replace("\r", "\\r").replace("\n", "\\n")
+                    if len(raw) > 180:
+                        raw = raw[:177] + "..."
+                    lines.append(f'{packet["transport"]} {age:5.2f}s  parsed=[{parsed}]  raw={raw}')
+                packet_box.configure(state="normal")
+                packet_box.delete("1.0", "end")
+                packet_box.insert("1.0", "\n".join(lines) if lines else "Waiting for MFP packets…")
+                packet_box.configure(state="disabled")
+            for axis in axes:
+                if axis not in controls:
+                    row = len(controls)
+                    var = tk.BooleanVar(value=axis in self.axis_router.enabled_axes())
+                    label = axis_names.get(axis, axis)
+                    ttk.Checkbutton(frame, text=f"{axis}  {label}", variable=var,
+                                    command=lambda a=axis, v=var: toggle(a, v)).grid(
+                                        row=row, column=0, sticky="w", pady=4)
+                    mode = "Vector candidate" if axis in generated else "additional axis"
+                    owner = ttk.Label(frame, text=mode)
+                    owner.grid(row=row, column=1, sticky="w", padx=12)
+                    live = ttk.Label(frame, text="waiting")
+                    live.grid(row=row, column=2, sticky="w", padx=12)
+                    controls[axis] = (var, live, owner)
+                info = status.get(axis)
+                live = controls[axis][1]
+                owner = controls[axis][2]
+                is_live = axis in live_axes
+                if self.authored_routing_mode.get() == "Auto authored ReStim set":
+                    authored = self.axis_router.auto_authored_active(now) and is_live
+                else:
+                    authored = axis in self.axis_router.enabled_axes() and is_live
+                if authored:
+                    owner.configure(text="AUTHORED")
+                elif axis in generated:
+                    owner.configure(text="VECTOR")
+                elif is_live:
+                    owner.configure(text="MFP (not routed)")
+                else:
+                    owner.configure(text="inactive")
+                if info is None:
+                    live.configure(text="configured; not seen this session")
+                else:
+                    value = info.get("value")
+                    age = float(info.get("last_seen_age", 0.0))
+                    live.configure(text=f"{value:.3f} | {age:.1f}s ago" if value is not None else f"{age:.1f}s ago")
+            window.after(300, refresh_routes)
+
+        ttk.Separator(outer).pack(fill="x", pady=8)
+        ttk.Button(outer, text="Close", command=window.destroy).pack(anchor="e")
+        refresh_routes()
+
     def start_listener(self) -> None:
         try:
             self.listener.start(self.mfp_host.get().strip(), self.mfp_port.get())
@@ -1262,6 +1577,12 @@ class VectorApp:
                     getattr(self, name).set(saved[name])
                 except tk.TclError:
                     pass
+        routes = saved.get("authored_axis_routes", [])
+        if isinstance(routes, list):
+            self.axis_router.set_enabled_axes(routes)
+        mode = saved.get("authored_routing_mode")
+        if mode in ("Manual selected axes", "Auto authored ReStim set"):
+            self.authored_routing_mode.set(mode)
         slots = saved.get("four_phase_presets", {})
         if isinstance(slots, dict):
             for slot in ("A", "B"):
@@ -1272,6 +1593,8 @@ class VectorApp:
     def _save_settings(self) -> None:
         values = {name: getattr(self, name).get() for name in self.SETTINGS_FIELDS}
         values["four_phase_presets"] = self._preset_slots
+        values["authored_axis_routes"] = sorted(self.axis_router.enabled_axes())
+        values["authored_routing_mode"] = self.authored_routing_mode.get()
         values["first_run_complete"] = True
         save_settings(values)
 
@@ -1540,9 +1863,14 @@ class VectorApp:
             primary_volume = proportional_reversal_boost(
                 primary_volume, reversal, boost)
         primary_volume = min(1.0, max(0.0, primary_volume))
+        if self.authored_routing_mode.get() == "Auto authored ReStim set":
+            authored_overrides = self.axis_router.snapshot_auto(sample.calculated_at)
+        else:
+            authored_overrides = self.axis_router.snapshot(sample.calculated_at)
         self.restim.send_primary(
             sample.alpha, sample.beta, electrodes, primary_volume, sample.frequency,
-            sample.pulse_frequency, sample.pulse_rise_time, sample.pulse_width)
+            sample.pulse_frequency, sample.pulse_rise_time, sample.pulse_width,
+            overrides=authored_overrides)
         self.prostate_restim.send_prostate(
             sample.alpha_prostate, sample.beta_prostate, sample.volume_prostate,
             sample.frequency, sample.pulse_frequency, sample.pulse_width,
@@ -1587,6 +1915,15 @@ class VectorApp:
 
     def _refresh(self) -> None:
         self._drain_controller_events()
+        if not self._startup_in_progress and self.session_ready_status.get() == "SESSION: READY":
+            missing = []
+            if self.auto_start_restim.get() and not self.restim.connected:
+                missing.append("Primary")
+            if self.auto_start_prostate.get() and not self.prostate_restim.connected:
+                missing.append("Prostate")
+            if missing:
+                self.session_ready_status.set("SESSION: ATTENTION")
+                self._set_startup_status("Connection lost after READY: " + ", ".join(missing))
         self._update_variety()
         if self._preset_transition is None and self._preset_active:
             target = (self._baseline_preset() if self._preset_active == "Baseline"

@@ -8,6 +8,7 @@ import select
 import struct
 import threading
 import time
+from collections import deque
 from typing import Callable
 
 from .tcode import format_command, parse_message
@@ -15,14 +16,18 @@ from .tcode import format_command, parse_message
 
 class MFPListener:
     """Resilient TCP/UDP T-code listener; each transport restarts after failure."""
-    def __init__(self, on_l0: Callable[[float, int, float], None], status: Callable[[str], None]) -> None:
+    def __init__(self, on_l0: Callable[[float, int, float], None], status: Callable[[str], None],
+                 on_command: Callable[[object, float], None] | None = None) -> None:
         self.on_l0, self.status = on_l0, status
+        self.on_command = on_command
         self._run = threading.Event()
         self._threads: list[threading.Thread] = []
         self._sockets: list[socket.socket] = []
         self._socket_lock = threading.Lock()
         self._last_received: float | None = None
         self._transport_live = {"tcp": False, "udp": False}
+        self._raw_lock = threading.Lock()
+        self._raw_packets = deque(maxlen=80)
 
     def start(self, host: str, port: int) -> None:
         self.stop()
@@ -83,9 +88,24 @@ class MFPListener:
             if self._run.is_set():
                 time.sleep(0.5)
 
-    def _handle(self, text: str) -> None:
+    def recent_packets(self, limit: int = 20) -> list[dict[str, object]]:
+        """Return recent raw MFP packets and the axes parsed from each packet."""
+        with self._raw_lock:
+            return list(self._raw_packets)[-max(1, int(limit)):]
+
+    def _handle(self, text: str, transport: str = "?") -> None:
         received_at = time.monotonic()
-        for command in parse_message(text):
+        commands = parse_message(text)
+        with self._raw_lock:
+            self._raw_packets.append({
+                "time": received_at,
+                "transport": transport.upper(),
+                "raw": text.strip(),
+                "axes": [command.axis for command in commands],
+            })
+        for command in commands:
+            if self.on_command is not None:
+                self.on_command(command, received_at)
             if command.axis == "L0":
                 self._last_received = received_at
                 self.on_l0(command.value, command.interval_ms, received_at)
@@ -106,9 +126,9 @@ class MFPListener:
                         if not data: break
                         buffer += data.decode("ascii", errors="ignore")
                         while "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1); self._handle(line)
+                            line, buffer = buffer.split("\n", 1); self._handle(line, "tcp")
                         if " " in buffer:
-                            tokens = buffer.split(" "); buffer = tokens.pop(); self._handle(" ".join(tokens))
+                            tokens = buffer.split(" "); buffer = tokens.pop(); self._handle(" ".join(tokens), "tcp")
         finally:
             self._track(server, False); server.close()
 
@@ -120,7 +140,7 @@ class MFPListener:
             while self._run.is_set():
                 try: data, _ = udp.recvfrom(65535)
                 except socket.timeout: continue
-                self._handle(data.decode("ascii", errors="ignore"))
+                self._handle(data.decode("ascii", errors="ignore"), "udp")
         finally:
             self._track(udp, False); udp.close()
 
@@ -274,14 +294,23 @@ class ReStimWebSocketClient(_ReconnectClient):
     def send_primary(self, alpha: float, beta: float,
                      electrodes: tuple[float, float, float, float], volume: float,
                      frequency: float, pulse_frequency: float,
-                     pulse_rise_time: float, pulse_width: float) -> None:
-        commands = [format_command("L0", alpha), format_command("L1", beta)]
-        commands.extend(format_command(axis, value)
-                        for axis, value in zip(("E1", "E2", "E3", "E4"), electrodes))
-        commands.extend((format_command("V0", volume), format_command("C0", frequency),
-                         format_command("P0", pulse_frequency),
-                         format_command("P3", pulse_rise_time),
-                         format_command("P1", pulse_width)))
+                     pulse_rise_time: float, pulse_width: float,
+                     overrides: dict[str, float] | None = None) -> None:
+        values = {
+            "L0": alpha, "L1": beta,
+            "E1": electrodes[0], "E2": electrodes[1],
+            "E3": electrodes[2], "E4": electrodes[3],
+            "V0": volume, "C0": frequency, "P0": pulse_frequency,
+            "P3": pulse_rise_time, "P1": pulse_width,
+        }
+        if overrides:
+            values.update({axis.upper(): min(1.0, max(0.0, value))
+                           for axis, value in overrides.items()})
+        preferred_order = ("L0", "L1", "E1", "E2", "E3", "E4",
+                           "V0", "C0", "P0", "P3", "P1")
+        ordered_axes = list(preferred_order)
+        ordered_axes.extend(sorted(axis for axis in values if axis not in preferred_order))
+        commands = [format_command(axis, values[axis]) for axis in ordered_axes]
         neutral = " ".join([format_command("L0", .5), format_command("L1", .5)] +
                            [format_command(axis, .5) for axis in ("E1", "E2", "E3", "E4")] +
                            [format_command("V0", 0.0)])
