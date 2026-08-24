@@ -6,7 +6,7 @@ ordinary positional `L0` stream, Vector remains the deterministic motion generat
 MFP supplies a clearly authored ReStim axis set, Vector can automatically pass those axes
 through on the same delayed timeline and generate only the missing axes.
 
-Current development build: **1.6.0-alpha49**.
+Current development build: **1.6.0-alpha50**.
 
 > [!CAUTION]
 > Commission with ReStim's graphical display and stimulation hardware
@@ -51,6 +51,23 @@ second after they begin.
   authored values are sampled on their original MFP timeline and released with Vector's
   deterministic look-ahead delay. The routing dialog shows axes detected this session,
   axes currently live, and the active routing mode.
+- Optional **media timeline** consumer decodes absolute media position/`duration` from
+  MFP axes `T0`/`T1` (scale 10000 s; see `mfp-plugin/` Timeline Absolute). Timeline axes
+  are never forwarded to ReStim. With ordinary 4-digit T-code, `T0` often updates only
+  about once per media second; Vector keeps the last known time live for a few seconds
+  (and briefly holds it for the volume ramp) so sparse packets do not flicker to “none”
+  or slam gain to the floor. Optional **Media volume ramp** scales primary and
+  prostate volume by media percent between a floor and ceiling using Linear,
+  Exponential, Logarithmic, Smoothstep or Smootherstep curves. Optional **Custom
+  events** play funscript-tools `.events.yml` files after the volume ramp for
+  `volume`, `volume-prostate`, `pulse_frequency`, `pulse_width`, `frequency`,
+  `alpha`, `beta`, and `e1`–`e4`. Three-phase defs (alpha/beta) and four-phase
+  defs (e1–e4) require the matching ReStim mode. Events evaluate at **send-time**
+  absolute media position (`sample.due_at`, aligned with video / status), not the
+  calculate-time clock used to build the look-ahead queue sample. Definitions are
+  vendored in `vector1a/event_definitions.yml`. Requires Timeline Absolute
+  (`T0`/`T1`). Do not also bake the same events offline into authored funscripts
+  (double apply).
 - Optional session startup can launch configured MultiFunPlayer, primary ReStim
   and prostate ReStim applications/shortcuts when Vector opens. Launching is kept
   separate from signal generation; Vector still owns its listener, connections,

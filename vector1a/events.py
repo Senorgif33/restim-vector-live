@@ -1,0 +1,688 @@
+"""Live funscript-tools custom events on Vector's delayed media timeline.
+
+Stdlib-only YAML subset loader (no PyYAML). Matches offline Event Builder
+semantics for supported axes: volume, volume-prostate, pulse_frequency,
+pulse_width, frequency, alpha, beta, e1–e4.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import math
+from pathlib import Path
+from typing import Any
+
+SUPPORTED_AXES = frozenset({
+    "volume",
+    "volume-prostate",
+    "pulse_frequency",
+    "pulse_width",
+    "frequency",
+    "alpha",
+    "beta",
+    "e1",
+    "e2",
+    "e3",
+    "e4",
+})
+
+AXIS_AUTHORED = {
+    "volume": "V0",
+    "frequency": "C0",
+    "pulse_frequency": "P0",
+    "pulse_width": "P1",
+    "alpha": "L0",
+    "beta": "L1",
+    "e1": "E1",
+    "e2": "E2",
+    "e3": "E3",
+    "e4": "E4",
+}
+
+DEFAULT_NORMALIZATION = {
+    "pulse_frequency": {"max": 200.0},
+    "pulse_width": {"max": 100.0},
+    "frequency": {"max": 360.0},
+    "volume": {"max": 1.0},
+}
+
+_BUNDLED_DEFINITIONS = Path(__file__).with_name("event_definitions.yml")
+
+
+class EventError(Exception):
+    """Raised for load/parse failures that abort event loading."""
+
+
+# ---------------------------------------------------------------------------
+# Minimal YAML subset (maps, lists, scalars, comments)
+# ---------------------------------------------------------------------------
+
+def _strip_comment(line: str) -> str:
+    in_single = False
+    in_double = False
+    for index, char in enumerate(line):
+        if char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        elif char == "#" and not in_single and not in_double:
+            return line[:index].rstrip()
+    return line.rstrip()
+
+
+def _parse_scalar(text: str) -> Any:
+    text = text.strip()
+    if not text:
+        return ""
+    if (text.startswith('"') and text.endswith('"')) or (
+            text.startswith("'") and text.endswith("'")):
+        return text[1:-1]
+    lower = text.lower()
+    if lower == "true":
+        return True
+    if lower == "false":
+        return False
+    if lower in ("null", "~"):
+        return None
+    try:
+        if any(char in text for char in ".eE") and text.replace(".", "", 1).replace(
+                "-", "", 1).replace("+", "", 1).replace("e", "", 1).replace(
+                "E", "", 1).isdigit() is False:
+            # fall through to float attempt
+            pass
+        if "." in text or "e" in text.lower():
+            return float(text)
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        return text
+
+
+def parse_yaml_subset(text: str) -> Any:
+    """Parse a restricted YAML subset used by event definition / user files."""
+    raw_lines = text.splitlines()
+    lines: list[tuple[int, str]] = []
+    for raw in raw_lines:
+        cleaned = _strip_comment(raw)
+        if not cleaned.strip():
+            continue
+        indent = len(cleaned) - len(cleaned.lstrip(" "))
+        lines.append((indent, cleaned.strip()))
+
+    index = 0
+
+    def parse_block(min_indent: int) -> Any:
+        nonlocal index
+        if index >= len(lines):
+            return None
+        indent, content = lines[index]
+        if indent < min_indent:
+            return None
+        if content.startswith("- "):
+            return parse_list(min_indent)
+        if ":" in content:
+            return parse_map(min_indent)
+        value = _parse_scalar(content)
+        index += 1
+        return value
+
+    def parse_map(min_indent: int) -> dict[str, Any]:
+        nonlocal index
+        result: dict[str, Any] = {}
+        while index < len(lines):
+            indent, content = lines[index]
+            if indent < min_indent:
+                break
+            if content.startswith("- "):
+                break
+            if indent > min_indent and result:
+                break
+            if ":" not in content:
+                raise EventError(f"Expected mapping entry, got: {content}")
+            key, _, remainder = content.partition(":")
+            key = key.strip()
+            remainder = remainder.strip()
+            index += 1
+            if remainder:
+                result[key] = _parse_scalar(remainder)
+            else:
+                if index >= len(lines):
+                    result[key] = None
+                    continue
+                next_indent, next_content = lines[index]
+                # YAML allows a sequence value at the same indent as the key:
+                #   events:
+                #   - time: 0
+                if next_content.startswith("- ") and next_indent <= indent:
+                    result[key] = parse_list(next_indent)
+                elif next_indent <= indent:
+                    result[key] = None
+                elif next_content.startswith("- "):
+                    result[key] = parse_list(next_indent)
+                else:
+                    result[key] = parse_map(next_indent)
+        return result
+
+    def parse_list(min_indent: int) -> list[Any]:
+        nonlocal index
+        result: list[Any] = []
+        while index < len(lines):
+            indent, content = lines[index]
+            if indent < min_indent:
+                break
+            if not content.startswith("- "):
+                break
+            if indent > min_indent and result:
+                break
+            item_text = content[2:].strip()
+            index += 1
+            if not item_text:
+                if index < len(lines) and lines[index][0] > indent:
+                    child_indent = lines[index][0]
+                    if lines[index][1].startswith("- "):
+                        result.append(parse_list(child_indent))
+                    else:
+                        result.append(parse_map(child_indent))
+                else:
+                    result.append(None)
+            elif item_text.endswith(":") and ":" == item_text[-1]:
+                # "- key:" with nested map, or "- key: value" already handled
+                key = item_text[:-1].strip()
+                nested: dict[str, Any] = {}
+                if index < len(lines) and lines[index][0] > indent:
+                    nested = parse_map(lines[index][0])
+                nested_prefix = {key: None}
+                # Actually "- name: value" form is more common
+                result.append(nested if nested else {key: None})
+            elif ":" in item_text and not item_text.startswith("{"):
+                # Inline mapping start: "- operation: apply_linear_change"
+                key, _, remainder = item_text.partition(":")
+                entry: dict[str, Any] = {key.strip(): _parse_scalar(remainder.strip())}
+                if index < len(lines) and lines[index][0] > indent:
+                    entry.update(parse_map(lines[index][0]))
+                result.append(entry)
+            else:
+                result.append(_parse_scalar(item_text))
+        return result
+
+    if not lines:
+        return None
+    return parse_block(lines[0][0])
+
+
+def load_yaml_file(path: Path) -> Any:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise EventError(f"Failed to read {path}: {exc}") from exc
+    try:
+        return parse_yaml_subset(text)
+    except EventError:
+        raise
+    except Exception as exc:
+        raise EventError(f"Failed to parse YAML {path}: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Definitions + user event expansion
+# ---------------------------------------------------------------------------
+
+def _derive_step_ratio_params(final_params: dict[str, Any], event_name: str) -> None:
+    if "step_ratio" not in final_params:
+        return
+    sr = float(final_params["step_ratio"])
+    if not (0 < sr < 1 / 3):
+        raise EventError(
+            f"Event '{event_name}': step_ratio must be in (0, 1/3), got {sr}")
+    final_params.update({
+        "e3_phase": (1 - sr) * 360,
+        "e2_phase": (1 - 2 * sr) * 360,
+        "e1_duty": 1 - 3 * sr,
+        "e1_phase": (1 - 3 * sr) * 360,
+        "e3_tri_phase": (0.5 - sr) * 360,
+        "e2_tri_phase": (0.5 - 2 * sr) * 360,
+    })
+
+
+def _substitute_token(value: Any, final_params: dict[str, Any],
+                      event_name: str) -> Any:
+    if isinstance(value, str) and value.startswith("$"):
+        token = value[1:]
+        if token not in final_params:
+            raise EventError(
+                f"Token '{token}' not found in params for event '{event_name}'.")
+        return final_params[token]
+    return value
+
+
+def normalize_value(axis: str, value: float,
+                    normalization: dict[str, dict[str, float]]) -> float:
+    """Normalize raw axis units to 0..1 using definition max (funscript-tools rules)."""
+    for axis_key, config in normalization.items():
+        if axis_key in axis:
+            max_value = float(config.get("max", 1.0))
+            if max_value == 1.0:
+                return float(value)
+            if max_value > 1.0 and 0.0 <= float(value) <= 1.0:
+                return float(value)
+            return float(value) / max_value
+    return float(value)
+
+
+def _waveform_value(waveform: str, relative_time_s: float, frequency: float,
+                    phase_deg: float, duty_cycle: float) -> float:
+    phase_normalized = (phase_deg / 360.0) % 1.0
+    waveform_phase = (frequency * relative_time_s + phase_normalized) % 1.0
+    kind = waveform.lower()
+    if kind == "sin":
+        return math.sin(2 * math.pi * frequency * relative_time_s
+                        + math.radians(phase_deg))
+    if kind == "square":
+        clipped = min(0.99, max(0.01, duty_cycle))
+        return 1.0 if waveform_phase < clipped else -1.0
+    if kind == "triangle":
+        if waveform_phase < 0.5:
+            return -1.0 + 4.0 * waveform_phase
+        return 3.0 - 4.0 * waveform_phase
+    if kind == "sawtooth":
+        return -1.0 + 2.0 * waveform_phase
+    raise EventError(f"Unsupported waveform '{waveform}'")
+
+
+def _ramp_envelope(relative_time_s: float, duration_s: float,
+                   ramp_in_s: float, ramp_out_s: float) -> float:
+    if duration_s <= 0:
+        return 1.0
+    envelope = 1.0
+    if ramp_in_s > 0:
+        ramp_in_end = min(ramp_in_s, duration_s)
+        if relative_time_s < ramp_in_end:
+            envelope *= relative_time_s / ramp_in_end if ramp_in_end > 0 else 1.0
+    if ramp_out_s > 0:
+        ramp_out_start = duration_s - min(ramp_out_s, duration_s)
+        if relative_time_s > ramp_out_start:
+            span = duration_s - ramp_out_start
+            if span > 0:
+                envelope *= max(0.0, (duration_s - relative_time_s) / span)
+    return envelope
+
+
+def _overwrite_blend(relative_time_s: float, duration_s: float,
+                     ramp_in_s: float, ramp_out_s: float) -> float:
+    """Return blend 0..1 from original→effect for overwrite mode."""
+    if duration_s <= 0:
+        return 1.0
+    blend = 1.0
+    if ramp_in_s > 0:
+        ramp_in_end = min(ramp_in_s, duration_s)
+        if relative_time_s < ramp_in_end:
+            blend = relative_time_s / ramp_in_end if ramp_in_end > 0 else 1.0
+    if ramp_out_s > 0:
+        ramp_out_start = duration_s - min(ramp_out_s, duration_s)
+        if relative_time_s > ramp_out_start:
+            span = duration_s - ramp_out_start
+            if span > 0:
+                blend = max(0.0, (duration_s - relative_time_s) / span)
+    return blend
+
+
+@dataclass(frozen=True)
+class ActiveStep:
+    """One expanded, axis-resolved operation ready for single-sample eval."""
+    event_name: str
+    operation: str
+    axis: str
+    start_time_ms: int
+    duration_ms: int
+    params: dict[str, Any]
+
+
+@dataclass
+class LoadedEvents:
+    steps: list[ActiveStep] = field(default_factory=list)
+    event_count: int = 0
+    warnings: list[str] = field(default_factory=list)
+    source_path: str = ""
+
+
+def load_definitions(path: Path | None = None
+                     ) -> tuple[dict[str, Any], dict[str, dict[str, float]]]:
+    definitions_path = Path(path) if path else _BUNDLED_DEFINITIONS
+    data = load_yaml_file(definitions_path)
+    if not isinstance(data, dict) or "definitions" not in data:
+        raise EventError(
+            "Event definitions file must contain a top-level 'definitions' key.")
+    definitions = data["definitions"]
+    if not isinstance(definitions, dict):
+        raise EventError("'definitions' must be a mapping.")
+    normalization = data.get("normalization") or dict(DEFAULT_NORMALIZATION)
+    if not isinstance(normalization, dict):
+        raise EventError("'normalization' must be a mapping.")
+    # Ensure nested max defaults
+    merged = {key: dict(value) for key, value in DEFAULT_NORMALIZATION.items()}
+    for key, value in normalization.items():
+        if isinstance(value, dict):
+            merged[key] = {**merged.get(key, {}), **value}
+    return definitions, merged
+
+
+def expand_user_events(
+        user_data: dict[str, Any],
+        definitions: dict[str, Any],
+) -> LoadedEvents:
+    """Parse user events mapping; drop unsupported-axis steps with warnings."""
+    if "events" not in user_data:
+        raise EventError("User event file must contain a top-level 'events' key.")
+    user_events = user_data["events"]
+    if not isinstance(user_events, list):
+        raise EventError("'events' key in user file must contain a list.")
+
+    result = LoadedEvents()
+    expanded: list[ActiveStep] = []
+    unsupported_seen: set[str] = set()
+
+    for index, user_event in enumerate(user_events):
+        if not isinstance(user_event, dict):
+            raise EventError(f"Event #{index + 1} must be a mapping.")
+        if "time" not in user_event or "name" not in user_event:
+            raise EventError(
+                f"Event #{index + 1} is missing required key: 'time' or 'name'.")
+        event_name = str(user_event["name"])
+        if event_name not in definitions:
+            raise EventError(
+                f"Event '{event_name}' at time {user_event['time']} "
+                f"is not defined in event_definitions.yml.")
+        time_raw = user_event["time"]
+        if not isinstance(time_raw, (int, float)):
+            raise EventError(
+                f"Event '{event_name}' has invalid 'time' (must be number ms).")
+        event_time_ms = int(time_raw)
+
+        definition = definitions[event_name]
+        if not isinstance(definition, dict):
+            raise EventError(f"Definition for '{event_name}' must be a mapping.")
+        final_params = dict(definition.get("default_params") or {})
+        if "params" in user_event and isinstance(user_event["params"], dict):
+            final_params.update(user_event["params"])
+        _derive_step_ratio_params(final_params, event_name)
+
+        for step_idx, step in enumerate(definition.get("steps") or [], start=1):
+            if not isinstance(step, dict):
+                raise EventError(
+                    f"Event '{event_name}': step {step_idx} must be a mapping.")
+            if "operation" not in step:
+                raise EventError(
+                    f"Event '{event_name}': step {step_idx} is missing 'operation'.")
+            if "axis" not in step:
+                raise EventError(
+                    f"Event '{event_name}': step {step_idx} is missing 'axis'.")
+            operation = step["operation"]
+            step_params_raw = dict(step.get("params") or {})
+            if (operation == "apply_linear_change"
+                    and "start_value" not in step_params_raw):
+                raise EventError(
+                    f"Event '{event_name}': step {step_idx} uses "
+                    f"'apply_linear_change' but is missing 'start_value'.")
+
+            processed_params = {
+                key: _substitute_token(value, final_params, event_name)
+                for key, value in step_params_raw.items()
+            }
+            start_offset = _substitute_token(
+                step.get("start_offset", 0), final_params, event_name)
+            try:
+                start_offset_ms = int(start_offset)
+            except (TypeError, ValueError) as exc:
+                raise EventError(
+                    f"Event '{event_name}': invalid start_offset") from exc
+
+            axis_field = str(step["axis"])
+            for axis_name in [name.strip() for name in axis_field.split(",")]:
+                if not axis_name:
+                    continue
+                if axis_name not in SUPPORTED_AXES:
+                    unsupported_seen.add(axis_name)
+                    continue
+                try:
+                    duration_ms = int(processed_params["duration_ms"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise EventError(
+                        f"Event '{event_name}': step needs duration_ms") from exc
+                expanded.append(ActiveStep(
+                    event_name=event_name,
+                    operation=str(operation),
+                    axis=axis_name,
+                    start_time_ms=event_time_ms + start_offset_ms,
+                    duration_ms=duration_ms,
+                    params=dict(processed_params),
+                ))
+
+    if unsupported_seen:
+        result.warnings.append(
+            "Skipped unsupported axis steps: "
+            + ", ".join(sorted(unsupported_seen))
+            + f" (supported: {', '.join(sorted(SUPPORTED_AXES))})")
+
+    expanded.sort(key=lambda step: (step.start_time_ms, step.event_name, step.axis))
+    result.steps = expanded
+    result.event_count = len(user_events)
+    return result
+
+
+def apply_linear_change(base: float, position_ms: int, start_time_ms: int,
+                        duration_ms: int, start_value: float, end_value: float,
+                        ramp_in_ms: int = 0, ramp_out_ms: int = 0,
+                        mode: str = "additive",
+                        axis: str = "volume",
+                        normalization: dict[str, dict[str, float]] | None = None,
+                        ) -> float:
+    """Single-sample linear change matching FunscriptEditor semantics."""
+    norm = normalization or DEFAULT_NORMALIZATION
+    if duration_ms < 0:
+        return base
+    if position_ms < start_time_ms:
+        return base
+    if duration_ms == 0:
+        if position_ms != start_time_ms:
+            return base
+        effect = normalize_value(axis, start_value, norm)
+        if mode == "overwrite":
+            return min(1.0, max(0.0, effect))
+        return min(1.0, max(0.0, base + effect))
+    end_time_ms = start_time_ms + duration_ms
+    if position_ms >= end_time_ms:
+        return base
+
+    duration_s = duration_ms / 1000.0
+    relative_time_s = (position_ms - start_time_ms) / 1000.0
+    progress = relative_time_s / duration_s if duration_s > 0 else 0.0
+    start_n = normalize_value(axis, start_value, norm)
+    end_n = normalize_value(axis, end_value, norm)
+    linear = start_n + (end_n - start_n) * progress
+    ramp_in_s = ramp_in_ms / 1000.0
+    ramp_out_s = ramp_out_ms / 1000.0
+
+    if mode == "additive":
+        envelope = _ramp_envelope(relative_time_s, duration_s, ramp_in_s, ramp_out_s)
+        return min(1.0, max(0.0, base + linear * envelope))
+    if mode == "overwrite":
+        blend = _overwrite_blend(relative_time_s, duration_s, ramp_in_s, ramp_out_s)
+        return min(1.0, max(0.0, (1.0 - blend) * base + blend * linear))
+    return base
+
+
+def apply_modulation(base: float, position_ms: int, start_time_ms: int,
+                     duration_ms: int, waveform: str, frequency: float,
+                     amplitude: float, max_level_offset: float = 0.0,
+                     phase: float = 0.0, ramp_in_ms: int = 0,
+                     ramp_out_ms: int = 0, mode: str = "additive",
+                     duty_cycle: float = 0.5, axis: str = "volume",
+                     normalization: dict[str, dict[str, float]] | None = None,
+                     ) -> float:
+    """Single-sample modulation (v2.2.5 DC-center semantics)."""
+    norm = normalization or DEFAULT_NORMALIZATION
+    if duration_ms <= 0:
+        return base
+    if position_ms < start_time_ms or position_ms >= start_time_ms + duration_ms:
+        return base
+
+    duration_s = duration_ms / 1000.0
+    relative_time_s = (position_ms - start_time_ms) / 1000.0
+    try:
+        base_wave = _waveform_value(waveform, relative_time_s, float(frequency),
+                                    float(phase), float(duty_cycle))
+    except EventError:
+        return base
+
+    amp_n = normalize_value(axis, amplitude, norm)
+    offset_n = normalize_value(axis, max_level_offset, norm)
+    generated = offset_n + amp_n * base_wave
+    ramp_in_s = ramp_in_ms / 1000.0
+    ramp_out_s = ramp_out_ms / 1000.0
+
+    if mode == "additive":
+        envelope = _ramp_envelope(relative_time_s, duration_s, ramp_in_s, ramp_out_s)
+        return min(1.0, max(0.0, base + generated * envelope))
+    if mode == "overwrite":
+        blend = _overwrite_blend(relative_time_s, duration_s, ramp_in_s, ramp_out_s)
+        return min(1.0, max(0.0, (1.0 - blend) * base + blend * generated))
+    return base
+
+
+def evaluate_step(base: float, position_ms: int, step: ActiveStep,
+                  normalization: dict[str, dict[str, float]]) -> float:
+    params = step.params
+    if step.operation == "apply_linear_change":
+        return apply_linear_change(
+            base, position_ms, step.start_time_ms, step.duration_ms,
+            float(params["start_value"]),
+            float(params.get("end_value", params["start_value"])),
+            int(params.get("ramp_in_ms", 0) or 0),
+            int(params.get("ramp_out_ms", 0) or 0),
+            str(params.get("mode", "additive")),
+            step.axis,
+            normalization,
+        )
+    if step.operation == "apply_modulation":
+        return apply_modulation(
+            base, position_ms, step.start_time_ms, step.duration_ms,
+            str(params["waveform"]),
+            float(params["frequency"]),
+            float(params["amplitude"]),
+            float(params.get("max_level_offset", 0.0) or 0.0),
+            float(params.get("phase", 0.0) or 0.0),
+            int(params.get("ramp_in_ms", 0) or 0),
+            int(params.get("ramp_out_ms", 0) or 0),
+            str(params.get("mode", "additive")),
+            float(params.get("duty_cycle", 0.5) or 0.5),
+            step.axis,
+            normalization,
+        )
+    return base
+
+
+class EventEngine:
+    """Load definitions + `.events.yml` and evaluate supported axes per sample."""
+
+    def __init__(self, definitions_path: Path | str | None = None) -> None:
+        self.definitions_path = Path(definitions_path) if definitions_path else _BUNDLED_DEFINITIONS
+        self.definitions: dict[str, Any] = {}
+        self.normalization: dict[str, dict[str, float]] = dict(DEFAULT_NORMALIZATION)
+        self.loaded = LoadedEvents()
+        self._load_error = ""
+        try:
+            self.reload_definitions()
+        except EventError as exc:
+            self._load_error = str(exc)
+
+    def reload_definitions(self, path: Path | str | None = None) -> None:
+        if path is not None:
+            self.definitions_path = Path(path)
+        self.definitions, self.normalization = load_definitions(self.definitions_path)
+        self._load_error = ""
+
+    def load_events_file(self, path: Path | str) -> LoadedEvents:
+        events_path = Path(path)
+        data = load_yaml_file(events_path)
+        if not isinstance(data, dict):
+            raise EventError("User event file root must be a mapping.")
+        if not self.definitions:
+            self.reload_definitions()
+        loaded = expand_user_events(data, self.definitions)
+        loaded.source_path = str(events_path)
+        self.loaded = loaded
+        self._load_error = ""
+        return loaded
+
+    def clear(self) -> None:
+        self.loaded = LoadedEvents()
+        self._load_error = ""
+
+    @property
+    def warnings(self) -> list[str]:
+        return list(self.loaded.warnings)
+
+    @property
+    def event_count(self) -> int:
+        return self.loaded.event_count
+
+    @property
+    def step_count(self) -> int:
+        return len(self.loaded.steps)
+
+    def apply(self, position_ms: int | None,
+              values: dict[str, float]) -> dict[str, float]:
+        """Apply active steps in file order; clip each axis to 0..1.
+
+        Returns a new dict. Inactive when *position_ms* is None.
+        """
+        if position_ms is None or not self.loaded.steps:
+            return dict(values)
+        result = {axis: float(value) for axis, value in values.items()}
+        for step in self.loaded.steps:
+            if step.axis not in result:
+                continue
+            end = step.start_time_ms + max(0, step.duration_ms)
+            if step.duration_ms == 0:
+                if position_ms != step.start_time_ms:
+                    continue
+            elif position_ms < step.start_time_ms or position_ms >= end:
+                continue
+            result[step.axis] = evaluate_step(
+                result[step.axis], position_ms, step, self.normalization)
+        return result
+
+    def active_event_names(self, position_ms: int | None) -> list[str]:
+        if position_ms is None:
+            return []
+        names: list[str] = []
+        seen: set[str] = set()
+        for step in self.loaded.steps:
+            end = step.start_time_ms + max(0, step.duration_ms)
+            active = (position_ms == step.start_time_ms if step.duration_ms == 0
+                      else step.start_time_ms <= position_ms < end)
+            if active and step.event_name not in seen:
+                seen.add(step.event_name)
+                names.append(step.event_name)
+        return names
+
+    def status_line(self, position_ms: int | None = None,
+                    enabled: bool = True) -> str:
+        if self._load_error:
+            return f"Events: error — {self._load_error}"
+        if not enabled:
+            return "Events: off"
+        if not self.loaded.source_path:
+            return "Events: no file loaded"
+        active = self.active_event_names(position_ms)
+        warn = f"; {self.loaded.warnings[0]}" if self.loaded.warnings else ""
+        if position_ms is None:
+            return (f"Events: {self.loaded.event_count} loaded, "
+                    f"{self.step_count} steps (no media position){warn}")
+        if active:
+            return (f"Events: {self.loaded.event_count} loaded, "
+                    f"active={', '.join(active)} @ {position_ms} ms{warn}")
+        return (f"Events: {self.loaded.event_count} loaded, "
+                f"{self.step_count} steps, idle @ {position_ms} ms{warn}")

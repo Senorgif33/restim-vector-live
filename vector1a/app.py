@@ -6,14 +6,18 @@ import queue
 import math
 import threading
 from collections import deque
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from .engine import OutputSample, VectorEngine
+from .events import AXIS_AUTHORED, EventEngine, EventError
 from .motion import MotionMode, MotionParameters
 from .network import MFPListener, ReStimWebSocketClient
 from .routing import AuthoredAxisRouter
 from .orchestration import SessionOrchestrator, port_is_open, wait_for_port
 from .settings import load_settings, save_settings, settings_path
+from .timeline import (RAMP_CURVE_NAMES, TIMELINE_SCALE_SECONDS, MediaTimeline,
+                       decode_timeline_seconds, media_volume_gain)
 from .controller import (A, B, X, Y, START, LEFT_SHOULDER, RIGHT_SHOULDER, DPAD_UP, DPAD_DOWN,
                          DPAD_LEFT, DPAD_RIGHT, XInputController)
 from .variety import fit_range_for_travel, rolling_offset, rolling_value
@@ -134,6 +138,10 @@ class VectorApp:
         "variety_pulse_rise_cycle", "variety_pulse_width_cycle", "variety_phase_cycle",
         "variety_frequency", "variety_pulse_frequency",
         "variety_pulse_rise", "variety_pulse_width", "variety_phase",
+        "timeline_position_axis", "timeline_duration_axis", "timeline_scale_seconds",
+        "media_volume_ramp_enabled", "media_volume_ramp_floor",
+        "media_volume_ramp_ceiling", "media_volume_ramp_curve",
+        "events_enabled", "events_file_path", "events_definitions_path",
     )
 
     def __init__(self, root: tk.Tk) -> None:
@@ -165,6 +173,19 @@ class VectorApp:
         self._startup_in_progress = False
         self.authored_axes_status = tk.StringVar(value="No authored axes detected")
         self.authored_routing_mode = tk.StringVar(value="Manual selected axes")
+        self.timeline_status = tk.StringVar(value="Media timeline: none")
+        self.media_ramp_status = tk.StringVar(value="Media ramp: off")
+        self.timeline_position_axis = tk.StringVar(value="T0")
+        self.timeline_duration_axis = tk.StringVar(value="T1")
+        self.timeline_scale_seconds = tk.DoubleVar(value=TIMELINE_SCALE_SECONDS)
+        self.media_volume_ramp_enabled = tk.BooleanVar(value=False)
+        self.media_volume_ramp_floor = tk.DoubleVar(value=0.40)
+        self.media_volume_ramp_ceiling = tk.DoubleVar(value=1.0)
+        self.media_volume_ramp_curve = tk.StringVar(value="Linear")
+        self.events_enabled = tk.BooleanVar(value=False)
+        self.events_file_path = tk.StringVar(value="")
+        self.events_definitions_path = tk.StringVar(value="")
+        self.events_status = tk.StringVar(value="Events: off")
         self.rate = tk.IntVar(value=50)
         self.lookahead = tk.DoubleVar(value=2.0)
         self.volume = tk.DoubleVar(value=0.70)
@@ -299,6 +320,9 @@ class VectorApp:
         self._last_connection_event: dict[str, str] = {}
 
         self.axis_router = AuthoredAxisRouter()
+        self.media_timeline = MediaTimeline()
+        self.event_engine = EventEngine()
+        self._events_last_position_ms: int | None = None
         self.orchestrator = SessionOrchestrator(self._set_startup_status)
         self.restim = ReStimWebSocketClient(self._set_restim_status)
         self.prostate_restim = ReStimWebSocketClient(self._set_prostate_status)
@@ -344,7 +368,7 @@ class VectorApp:
     def _build(self) -> None:
         self.root.columnconfigure(0, weight=1)
         self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(12, weight=1)
+        self.root.rowconfigure(13, weight=1)
 
         toolbar = ttk.Frame(self.root, padding=(12, 6))
         toolbar.grid(row=0, column=0, columnspan=2, sticky="ew")
@@ -371,6 +395,8 @@ class VectorApp:
         ttk.Label(mfp, textvariable=self.mfp_status).grid(row=1, column=2, columnspan=2, sticky="w")
         ttk.Label(mfp, textvariable=self.authored_axes_status, foreground="#555").grid(
             row=2, column=0, columnspan=4, sticky="w", pady=(0, 4))
+        ttk.Label(mfp, textvariable=self.timeline_status, foreground="#555").grid(
+            row=3, column=0, columnspan=4, sticky="w", pady=(0, 4))
 
         restim = self._frame("ReStim output", 0, 1)
         ttk.Label(restim, text="Primary WS").grid(row=0, column=0, sticky="w")
@@ -480,7 +506,63 @@ class VectorApp:
                     textvariable=self.four_phase_volume_ceiling, width=8).grid(
                         row=0, column=8)
 
-        frequency_frame = self._frame("Frequency", 3, 0, 2)
+        ramp_frame = self._frame("Media volume ramp", 3, 0, 2)
+        ttk.Checkbutton(ramp_frame, text="Enable media volume ramp",
+                        variable=self.media_volume_ramp_enabled,
+                        command=self._save_settings).grid(row=0, column=0, sticky="w")
+        ttk.Label(ramp_frame, text="Floor").grid(row=0, column=1, padx=(18, 4))
+        ttk.Spinbox(ramp_frame, from_=0, to=1, increment=.05,
+                    textvariable=self.media_volume_ramp_floor, width=8,
+                    command=self._save_settings).grid(row=0, column=2, sticky="w")
+        ttk.Label(ramp_frame, text="Ceiling").grid(row=0, column=3, padx=(18, 4))
+        ttk.Spinbox(ramp_frame, from_=0, to=1, increment=.05,
+                    textvariable=self.media_volume_ramp_ceiling, width=8,
+                    command=self._save_settings).grid(row=0, column=4, sticky="w")
+        ttk.Label(ramp_frame, text="Curve").grid(row=0, column=5, padx=(18, 4))
+        ramp_curve_box = ttk.Combobox(ramp_frame, textvariable=self.media_volume_ramp_curve,
+                     values=RAMP_CURVE_NAMES, state="readonly", width=14)
+        ramp_curve_box.grid(row=0, column=6, sticky="w")
+        ramp_curve_box.bind("<<ComboboxSelected>>", lambda _event: self._save_settings())
+        ttk.Label(ramp_frame, textvariable=self.media_ramp_status,
+                  foreground="#555").grid(row=1, column=0, columnspan=7, sticky="w",
+                                          pady=(4, 0))
+        ttk.Label(ramp_frame, text=(
+            "Scales primary and prostate volume by media timeline percent "
+            "(T0/T1 from MFP Timeline Absolute). Distinct from motion rest-volume."),
+            foreground="#555", wraplength=900).grid(
+                row=2, column=0, columnspan=7, sticky="w", pady=(2, 0))
+
+        events_frame = self._frame("Custom events", 4, 0, 2)
+        ttk.Checkbutton(events_frame, text="Enable custom events",
+                        variable=self.events_enabled,
+                        command=self._on_events_enabled_changed).grid(
+                            row=0, column=0, sticky="w")
+        ttk.Entry(events_frame, textvariable=self.events_file_path,
+                  width=56).grid(row=0, column=1, sticky="we", padx=8)
+        ttk.Button(events_frame, text="Browse…",
+                   command=self._browse_events_file).grid(row=0, column=2, sticky="w")
+        ttk.Button(events_frame, text="Reload",
+                   command=self._reload_events_file).grid(row=0, column=3, sticky="w", padx=4)
+        ttk.Label(events_frame, text="Definitions").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(events_frame, textvariable=self.events_definitions_path,
+                  width=56).grid(row=1, column=1, sticky="we", padx=8, pady=(4, 0))
+        ttk.Button(events_frame, text="Browse…",
+                   command=self._browse_events_definitions).grid(
+                       row=1, column=2, sticky="w", pady=(4, 0))
+        ttk.Label(events_frame, textvariable=self.events_status,
+                  foreground="#555").grid(row=2, column=0, columnspan=4, sticky="w",
+                                          pady=(4, 0))
+        ttk.Label(events_frame, text=(
+            "Plays funscript-tools .events.yml on the delayed media timeline (T0/T1) "
+            "after the media volume ramp. Axes: volume, volume-prostate, "
+            "pulse_frequency, pulse_width, frequency, alpha, beta, e1–e4. "
+            "3P defs (alpha/beta) and 4P defs (e1–e4) require the matching ReStim mode. "
+            "Do not also bake the same events offline into authored funscripts (double apply)."),
+            foreground="#555", wraplength=900).grid(
+                row=3, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        events_frame.columnconfigure(1, weight=1)
+
+        frequency_frame = self._frame("Frequency", 5, 0, 2)
         ttk.Label(frequency_frame, text="0").grid(row=0, column=0)
         self.frequency_bar = ttk.Progressbar(frequency_frame, orient="horizontal", mode="determinate",
                                              maximum=1.0, length=520)
@@ -498,7 +580,7 @@ class VectorApp:
                     textvariable=self.frequency_ratio, width=7,
                     command=self.apply_config).grid(row=0, column=7)
 
-        pulse_frame = self._frame("Pulse frequency", 4, 0, 2)
+        pulse_frame = self._frame("Pulse frequency", 6, 0, 2)
         ttk.Label(pulse_frame, text="0").grid(row=0, column=0)
         self.pulse_frequency_bar = RangeBar(pulse_frame)
         self.pulse_frequency_bar.grid(row=0, column=1, padx=8)
@@ -517,7 +599,7 @@ class VectorApp:
                         textvariable=variable, width=7,
                         command=self.apply_config).grid(row=0, column=col + 1)
 
-        rise_frame = self._frame("Pulse rise time", 5, 0, 2)
+        rise_frame = self._frame("Pulse rise time", 7, 0, 2)
         ttk.Label(rise_frame, text="0 sharp").grid(row=0, column=0)
         self.pulse_rise_bar = RangeBar(rise_frame)
         self.pulse_rise_bar.grid(row=0, column=1, padx=8)
@@ -534,7 +616,7 @@ class VectorApp:
                         to=1 if index < 2 else 10, increment=0.05 if index < 2 else 1,
                         textvariable=variable, width=7,
                         command=self.apply_config).grid(row=0, column=col + 1)
-        width_frame = self._frame("Pulse width", 6, 0, 2)
+        width_frame = self._frame("Pulse width", 8, 0, 2)
         ttk.Label(width_frame, text="0 narrow").grid(row=0, column=0)
         self.pulse_width_bar = RangeBar(width_frame)
         self.pulse_width_bar.grid(row=0, column=1, padx=8)
@@ -552,7 +634,7 @@ class VectorApp:
                         textvariable=variable, width=7,
                         command=self.apply_config).grid(row=0, column=col + 1)
 
-        prostate = self._frame("Prostate controls", 7, 0, 2)
+        prostate = self._frame("Prostate controls", 9, 0, 2)
         self.prostate_bars = {}
         self.prostate_values = {}
         for row, (label, key) in enumerate((("Alpha-prostate", "alpha_prostate"),
@@ -589,7 +671,7 @@ class VectorApp:
                     textvariable=self.prostate_phase_degrees, width=7,
                     command=self.apply_config).grid(row=2, column=8)
 
-        four_phase = self._frame("Four-phase primary motion", 8, 0, 2)
+        four_phase = self._frame("Four-phase primary motion", 10, 0, 2)
         self.four_phase_bars, self.four_phase_values = [], []
         for row, label in enumerate(("A — top", "B", "C", "D — bottom")):
             ttk.Label(four_phase, text=label, width=18).grid(row=row, column=0, sticky="w")
@@ -769,7 +851,7 @@ class VectorApp:
             for widget in four_phase.grid_slaves(row=hidden_row):
                 widget.grid_remove()
 
-        controller = self._frame("Xbox controller", 9, 0, 2)
+        controller = self._frame("Xbox controller", 11, 0, 2)
         ttk.Checkbutton(controller, text="Enable controller controls",
                         variable=self.controller_enabled,
                         command=self._controller_enabled_changed).grid(row=0, column=0, sticky="w", padx=6)
@@ -792,7 +874,7 @@ class VectorApp:
                   text="W/S Frequency ramp ±  •  A/D Pulse frequency range −/+  •  I/K Rise range +/−  •  J/L Width range −/+  •  Enter Resume  •  Space Neutral  •  Esc Stop") \
             .grid(row=1, column=0, columnspan=6, sticky="w", padx=6, pady=(6, 2))
 
-        variety = self._frame("Rolling Variety", 10, 0, 2)
+        variety = self._frame("Rolling Variety", 12, 0, 2)
         ttk.Checkbutton(variety, text="Enable rolling variety", variable=self.variety_enabled,
                         command=self._variety_toggle).grid(row=0, column=0, padx=6)
         for column, (label, variable, cycle) in enumerate((
@@ -814,14 +896,14 @@ class VectorApp:
         ttk.Label(variety, textvariable=self.variety_status,
                   font=("TkDefaultFont", 10, "bold")).grid(row=0, column=3, columnspan=3, padx=18)
 
-        controls = self._frame("Commissioning controls", 11, 0, 2)
+        controls = self._frame("Commissioning controls", 13, 0, 2)
         ttk.Button(controls, text="Neutral", command=self.neutral, width=18).pack(side="left", padx=12)
         ttk.Button(controls, text="Resume", command=self.resume, width=18).pack(side="left", padx=12)
         ttk.Button(controls, text="STOP", command=self.stop, width=18).pack(side="left", padx=12)
         ttk.Label(controls, text="Test without FOCstim hardware connected.").pack(side="right", padx=12)
         self.sections["Commissioning controls"].grid_remove()
 
-        diagnostics = self._frame("Live diagnostics", 12, 0, 2)
+        diagnostics = self._frame("Live diagnostics", 14, 0, 2)
         diagnostics.columnconfigure(1, weight=1)
         diagnostics.columnconfigure(3, weight=1)
         labels = (
@@ -904,6 +986,133 @@ class VectorApp:
     def _on_mfp_command(self, command, received_at: float) -> None:
         """Capture all MFP axes; L0 still enters the proven engine separately."""
         self.axis_router.receive(command, received_at)
+        self.media_timeline.receive(command, received_at)
+
+    def _configure_media_timeline(self) -> None:
+        self.media_timeline.configure(
+            self.timeline_position_axis.get().strip() or "T0",
+            self.timeline_duration_axis.get().strip() or "T1",
+            self.timeline_scale_seconds.get())
+
+    def _authored_overrides_for_sample(self, calculated_at: float) -> dict[str, float]:
+        if self.authored_routing_mode.get() == "Auto authored ReStim set":
+            overrides = self.axis_router.snapshot_auto(calculated_at)
+        else:
+            overrides = self.axis_router.snapshot(calculated_at)
+        blocked = self.media_timeline.timeline_axes()
+        if blocked:
+            overrides = {axis: value for axis, value in overrides.items()
+                         if axis not in blocked}
+        return overrides
+
+
+    def _on_events_enabled_changed(self) -> None:
+        self._save_settings()
+        self._update_events_status()
+
+    def _browse_events_file(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select .events.yml",
+            filetypes=(("Event YAML", "*.events.yml *.events.yaml *.yml *.yaml"),
+                       ("All files", "*.*")))
+        if selected:
+            self.events_file_path.set(selected)
+            self._reload_events_file()
+
+    def _browse_events_definitions(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select event_definitions.yml",
+            filetypes=(("YAML", "*.yml *.yaml"), ("All files", "*.*")))
+        if selected:
+            self.events_definitions_path.set(selected)
+            self._reload_events_file()
+
+    def _reload_events_file(self) -> None:
+        defs = self.events_definitions_path.get().strip()
+        try:
+            if defs:
+                self.event_engine.reload_definitions(defs)
+            else:
+                self.event_engine.reload_definitions()
+            path = self.events_file_path.get().strip()
+            if path:
+                self.event_engine.load_events_file(path)
+            else:
+                self.event_engine.clear()
+        except EventError as exc:
+            self.events_status.set(f"Events: error - {exc}")
+            self._save_settings()
+            return
+        self._save_settings()
+        self._update_events_status()
+
+    def _update_events_status(self, position_ms: int | None = None) -> None:
+        if position_ms is None:
+            position_ms = self._events_last_position_ms
+        self.events_status.set(self.event_engine.status_line(
+            position_ms, enabled=bool(self.events_enabled.get())))
+
+    def _apply_events_to_sample(
+            self, at_time: float, primary_volume: float,
+            prostate_volume: float, frequency: float, pulse_frequency: float,
+            pulse_width: float, alpha: float, beta: float,
+            electrodes: tuple[float, float, float, float],
+            authored_overrides: dict[str, float]
+            ) -> tuple[float, float, float, float, float, float, float,
+                       tuple[float, float, float, float], dict[str, float]]:
+        """Apply live events at send-time media position (*at_time* = sample.due_at)."""
+        unchanged = (primary_volume, prostate_volume, frequency, pulse_frequency,
+                     pulse_width, alpha, beta, electrodes, authored_overrides)
+        if not self.events_enabled.get():
+            self._events_last_position_ms = None
+            return unchanged
+        self._configure_media_timeline()
+        state = self.media_timeline.snapshot(at_time)
+        position_ms = state.position_ms
+        self._events_last_position_ms = position_ms
+        if position_ms is None:
+            return unchanged
+        values = {
+            "volume": authored_overrides.get("V0", primary_volume),
+            "volume-prostate": prostate_volume,
+            "frequency": authored_overrides.get("C0", frequency),
+            "pulse_frequency": authored_overrides.get("P0", pulse_frequency),
+            "pulse_width": authored_overrides.get("P1", pulse_width),
+            "alpha": authored_overrides.get("L0", alpha),
+            "beta": authored_overrides.get("L1", beta),
+            "e1": authored_overrides.get("E1", electrodes[0]),
+            "e2": authored_overrides.get("E2", electrodes[1]),
+            "e3": authored_overrides.get("E3", electrodes[2]),
+            "e4": authored_overrides.get("E4", electrodes[3]),
+        }
+        result = self.event_engine.apply(position_ms, values)
+        primary_volume = result["volume"]
+        prostate_volume = result["volume-prostate"]
+        frequency = result["frequency"]
+        pulse_frequency = result["pulse_frequency"]
+        pulse_width = result["pulse_width"]
+        alpha = result["alpha"]
+        beta = result["beta"]
+        electrodes = (result["e1"], result["e2"], result["e3"], result["e4"])
+        if any(key in authored_overrides for key in AXIS_AUTHORED.values()):
+            authored_overrides = dict(authored_overrides)
+            for axis, key in AXIS_AUTHORED.items():
+                if key in authored_overrides:
+                    authored_overrides[key] = result[axis]
+        return (primary_volume, prostate_volume, frequency, pulse_frequency,
+                pulse_width, alpha, beta, electrodes, authored_overrides)
+
+    def _media_volume_gain_at(self, calculated_at: float) -> float | None:
+        if not self.media_volume_ramp_enabled.get():
+            return None
+        self._configure_media_timeline()
+        state = self.media_timeline.snapshot(calculated_at)
+        # Use held progress between sparse T0 packets; floor only when unusable.
+        return media_volume_gain(
+            state.progress,
+            self.media_volume_ramp_floor.get(),
+            self.media_volume_ramp_ceiling.get(),
+            self.media_volume_ramp_curve.get())
 
     def _set_startup_status(self, text: str) -> None:
         self._record_connection_event("Startup", text)
@@ -1063,9 +1272,14 @@ class VectorApp:
         discovered_text = tk.StringVar(value="Detected this session: none")
         live_text = tk.StringVar(value="Currently live: none")
         mode_text = tk.StringVar(value="Routing mode: VECTOR GENERATION")
+        timeline_text = tk.StringVar(value="Media timeline: none")
         ttk.Label(state_frame, textvariable=discovered_text).pack(anchor="w")
         ttk.Label(state_frame, textvariable=live_text).pack(anchor="w", pady=(2, 0))
         ttk.Label(state_frame, textvariable=mode_text, font=("TkDefaultFont", 9, "bold")).pack(anchor="w", pady=(2, 0))
+        ttk.Label(state_frame, textvariable=timeline_text, foreground="#555").pack(anchor="w", pady=(2, 0))
+        ttk.Label(state_frame, text=(
+            "T0/T1 (or configured timeline axes) are media clock only and cannot be routed to ReStim."),
+            foreground="#555", wraplength=840).pack(anchor="w", pady=(4, 0))
 
         frame = ttk.Frame(outer)
         frame.pack(fill="x", expand=False)
@@ -1101,27 +1315,45 @@ class VectorApp:
             "P0": "Pulse frequency", "P1": "Pulse width", "P3": "Pulse rise time",
             "E1": "Electrode A", "E2": "Electrode B", "E3": "Electrode C", "E4": "Electrode D",
             "V1": "Additional volume axis",
+            "T0": "Media absolute position (clock)", "T1": "Media absolute duration (clock)",
         }
 
         def toggle(axis: str, variable: tk.BooleanVar) -> None:
+            if axis in self.media_timeline.timeline_axes():
+                variable.set(False)
+                return
             self.axis_router.set_enabled(axis, variable.get())
             self._save_settings()
 
         def refresh_routes() -> None:
             if not window.winfo_exists():
                 return
+            self._configure_media_timeline()
             now = time.monotonic()
+            blocked = self.media_timeline.timeline_axes()
             status = self.axis_router.axis_status(now)
-            axes = sorted(set(status) | self.axis_router.enabled_axes())
+            axes = sorted(set(status) | self.axis_router.enabled_axes() | blocked)
             discovered = sorted(status)
             live_axes = sorted(self.axis_router.live_axes(now))
             discovered_text.set("Detected this session: " + (", ".join(discovered) if discovered else "none"))
             live_text.set("Currently live: " + (", ".join(live_axes) if live_axes else "none"))
+            timeline = self.media_timeline.snapshot(now)
+            if timeline.usable and timeline.position_s is not None:
+                duration = ("unknown" if timeline.duration_s is None
+                            else f"{timeline.duration_s:.1f} s")
+                progress = ("--" if timeline.progress is None
+                            else f"{timeline.progress * 100:.1f}%")
+                suffix = " (held)" if timeline.held else ""
+                timeline_text.set(
+                    f"Media timeline: {timeline.position_s:.1f} s / {duration}  "
+                    f"progress={progress}{suffix}")
+            else:
+                timeline_text.set("Media timeline: none / stale")
             if not axes:
                 self.authored_axes_status.set("No authored axes detected")
                 mode_text.set("Routing mode: VECTOR GENERATION")
             else:
-                enabled = sorted(self.axis_router.enabled_axes())
+                enabled = sorted(self.axis_router.enabled_axes() - blocked)
                 if self.authored_routing_mode.get() == "Auto authored ReStim set":
                     auto_active = self.axis_router.auto_authored_active(now)
                     if auto_active:
@@ -1169,19 +1401,48 @@ class VectorApp:
                 live = controls[axis][1]
                 owner = controls[axis][2]
                 is_live = axis in live_axes
-                if self.authored_routing_mode.get() == "Auto authored ReStim set":
-                    authored = self.axis_router.auto_authored_active(now) and is_live
+                if axis in blocked:
+                    owner.configure(text="MEDIA CLOCK")
+                    controls[axis][0].set(False)
+                    if axis in self.axis_router.enabled_axes():
+                        self.axis_router.set_enabled(axis, False)
                 else:
-                    authored = axis in self.axis_router.enabled_axes() and is_live
-                if authored:
-                    owner.configure(text="AUTHORED")
-                elif axis in generated:
-                    owner.configure(text="VECTOR")
-                elif is_live:
-                    owner.configure(text="MFP (not routed)")
-                else:
-                    owner.configure(text="inactive")
-                if info is None:
+                    if self.authored_routing_mode.get() == "Auto authored ReStim set":
+                        authored = self.axis_router.auto_authored_active(now) and is_live
+                    else:
+                        authored = axis in self.axis_router.enabled_axes() and is_live
+                    if authored:
+                        owner.configure(text="AUTHORED")
+                    elif axis in generated:
+                        owner.configure(text="VECTOR")
+                    elif is_live:
+                        owner.configure(text="MFP (not routed)")
+                    else:
+                        owner.configure(text="inactive")
+                if axis in blocked:
+                    timeline_info = self.media_timeline.snapshot(now)
+                    scale = self.timeline_scale_seconds.get()
+                    if axis == self.media_timeline.position_axis:
+                        seconds = timeline_info.position_s
+                        if seconds is None and info is not None and info.get("value") is not None:
+                            seconds = decode_timeline_seconds(float(info["value"]), scale)
+                        live.configure(text=("waiting" if seconds is None
+                                             else f"{seconds:.1f} s"))
+                    elif axis == self.media_timeline.duration_axis:
+                        seconds = timeline_info.duration_s
+                        if seconds is None and info is not None and info.get("value") is not None:
+                            decoded = decode_timeline_seconds(float(info["value"]), scale)
+                            seconds = None if decoded <= 0.0 else decoded
+                        if seconds is None:
+                            live.configure(text="unknown")
+                        else:
+                            live.configure(text=f"{seconds:.1f} s")
+                    elif info is None:
+                        live.configure(text="configured; not seen this session")
+                    else:
+                        age = float(info.get("last_seen_age", 0.0))
+                        live.configure(text=f"seen {age:.1f}s ago")
+                elif info is None:
                     live.configure(text="configured; not seen this session")
                 else:
                     value = info.get("value")
@@ -1577,9 +1838,25 @@ class VectorApp:
                     getattr(self, name).set(saved[name])
                 except tk.TclError:
                     pass
+        self._configure_media_timeline()
+        try:
+            defs = self.events_definitions_path.get().strip()
+            if defs:
+                self.event_engine.reload_definitions(defs)
+            path = self.events_file_path.get().strip()
+            if path:
+                self.event_engine.load_events_file(path)
+            else:
+                self.event_engine.clear()
+        except EventError as exc:
+            self.events_status.set(f"Events: error - {exc}")
+        else:
+            self._update_events_status()
         routes = saved.get("authored_axis_routes", [])
         if isinstance(routes, list):
-            self.axis_router.set_enabled_axes(routes)
+            blocked = self.media_timeline.timeline_axes()
+            self.axis_router.set_enabled_axes(
+                [axis for axis in routes if str(axis).upper() not in blocked])
         mode = saved.get("authored_routing_mode")
         if mode in ("Manual selected axes", "Auto authored ReStim set"):
             self.authored_routing_mode.set(mode)
@@ -1593,11 +1870,13 @@ class VectorApp:
     def _save_settings(self) -> None:
         values = {name: getattr(self, name).get() for name in self.SETTINGS_FIELDS}
         values["four_phase_presets"] = self._preset_slots
-        values["authored_axis_routes"] = sorted(self.axis_router.enabled_axes())
+        blocked = self.media_timeline.timeline_axes()
+        values["authored_axis_routes"] = sorted(
+            axis for axis in self.axis_router.enabled_axes() if axis not in blocked)
         values["authored_routing_mode"] = self.authored_routing_mode.get()
         values["first_run_complete"] = True
+        self._configure_media_timeline()
         save_settings(values)
-
     def _preset_snapshot(self) -> dict:
         return {name: getattr(self, name).get()
                 for name in self.FOUR_PHASE_PRESET_FIELDS}
@@ -1837,9 +2116,6 @@ class VectorApp:
             electrodes = apply_group_delay(
                 electrodes, list(self._four_phase_history), sample.due_at,
                 self._four_phase_effective_group_delay)
-        with self._four_phase_live_lock:
-            self._four_phase_live_output = (
-                electrodes, morph_source, morph_target, morph_amount, profile_kind)
         ceiling = min(1.0, max(0.0, self.four_phase_volume_ceiling.get()))
         if self.four_phase_volume_modulation.get():
             cycle = max(.5, self.four_phase_volume_cycle.get()) * 60.0
@@ -1863,17 +2139,36 @@ class VectorApp:
             primary_volume = proportional_reversal_boost(
                 primary_volume, reversal, boost)
         primary_volume = min(1.0, max(0.0, primary_volume))
-        if self.authored_routing_mode.get() == "Auto authored ReStim set":
-            authored_overrides = self.axis_router.snapshot_auto(sample.calculated_at)
-        else:
-            authored_overrides = self.axis_router.snapshot(sample.calculated_at)
+        authored_overrides = self._authored_overrides_for_sample(sample.calculated_at)
+        prostate_volume = min(1.0, max(0.0, sample.volume_prostate))
+        ramp_gain = self._media_volume_gain_at(sample.calculated_at)
+        if ramp_gain is not None:
+            primary_volume = min(1.0, max(0.0, primary_volume * ramp_gain))
+            prostate_volume = min(1.0, max(0.0, prostate_volume * ramp_gain))
+            if "V0" in authored_overrides:
+                authored_overrides = dict(authored_overrides)
+                authored_overrides["V0"] = min(
+                    1.0, max(0.0, authored_overrides["V0"] * ramp_gain))
+        frequency = sample.frequency
+        pulse_frequency = sample.pulse_frequency
+        pulse_width = sample.pulse_width
+        alpha = sample.alpha
+        beta = sample.beta
+        (primary_volume, prostate_volume, frequency, pulse_frequency, pulse_width,
+         alpha, beta, electrodes, authored_overrides) = self._apply_events_to_sample(
+            sample.due_at, primary_volume, prostate_volume, frequency,
+            pulse_frequency, pulse_width, alpha, beta, electrodes,
+            authored_overrides)
+        with self._four_phase_live_lock:
+            self._four_phase_live_output = (
+                electrodes, morph_source, morph_target, morph_amount, profile_kind)
         self.restim.send_primary(
-            sample.alpha, sample.beta, electrodes, primary_volume, sample.frequency,
-            sample.pulse_frequency, sample.pulse_rise_time, sample.pulse_width,
+            alpha, beta, electrodes, primary_volume, frequency,
+            pulse_frequency, sample.pulse_rise_time, pulse_width,
             overrides=authored_overrides)
         self.prostate_restim.send_prostate(
-            sample.alpha_prostate, sample.beta_prostate, sample.volume_prostate,
-            sample.frequency, sample.pulse_frequency, sample.pulse_width,
+            sample.alpha_prostate, sample.beta_prostate, prostate_volume,
+            frequency, pulse_frequency, pulse_width,
             sample.pulse_rise_time)
 
     def neutral(self) -> None:
@@ -1925,6 +2220,37 @@ class VectorApp:
                 self.session_ready_status.set("SESSION: ATTENTION")
                 self._set_startup_status("Connection lost after READY: " + ", ".join(missing))
         self._update_variety()
+        self._configure_media_timeline()
+        timeline = self.media_timeline.snapshot(time.monotonic())
+        if timeline.usable and timeline.position_s is not None:
+            duration = ("unknown" if timeline.duration_s is None
+                        else f"{timeline.duration_s:.1f} s")
+            progress = ("--" if timeline.progress is None
+                        else f"{timeline.progress * 100:.1f}%")
+            suffix = " (held)" if timeline.held else ""
+            self.timeline_status.set(
+                f"Media timeline: {timeline.position_s:.1f} s / {duration}  "
+                f"progress={progress}{suffix}")
+        else:
+            self.timeline_status.set("Media timeline: none")
+        if self.media_volume_ramp_enabled.get():
+            gain = media_volume_gain(
+                timeline.progress,
+                self.media_volume_ramp_floor.get(),
+                self.media_volume_ramp_ceiling.get(),
+                self.media_volume_ramp_curve.get())
+            if timeline.progress is None:
+                progress_text = "--"
+            else:
+                progress_text = f"{timeline.progress * 100:.1f}%"
+                if timeline.held:
+                    progress_text += " held"
+            self.media_ramp_status.set(
+                f"Media ramp: media {progress_text} → gain {gain * 100:.1f}% "
+                f"({self.media_volume_ramp_curve.get()})")
+        else:
+            self.media_ramp_status.set("Media ramp: off")
+        self._update_events_status(getattr(timeline, "position_ms", None))
         if self._preset_transition is None and self._preset_active:
             target = (self._baseline_preset() if self._preset_active == "Baseline"
                       else self._preset_slots.get(self._preset_active))
