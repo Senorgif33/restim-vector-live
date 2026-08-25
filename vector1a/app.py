@@ -17,7 +17,7 @@ from .routing import AuthoredAxisRouter
 from .orchestration import SessionOrchestrator, port_is_open, wait_for_port
 from .settings import load_settings, save_settings, settings_path
 from .timeline import (RAMP_CURVE_NAMES, TIMELINE_SCALE_SECONDS, MediaTimeline,
-                       decode_timeline_seconds, media_volume_gain)
+                       decode_timeline_seconds, media_volume_gain, ramp_curve)
 from .controller import (A, B, X, Y, START, LEFT_SHOULDER, RIGHT_SHOULDER, DPAD_UP, DPAD_DOWN,
                          DPAD_LEFT, DPAD_RIGHT, XInputController)
 from .variety import fit_range_for_travel, rolling_offset, rolling_value
@@ -525,15 +525,21 @@ class VectorApp:
         ramp_curve_box = ttk.Combobox(ramp_frame, textvariable=self.media_volume_ramp_curve,
                      values=RAMP_CURVE_NAMES, state="readonly", width=14)
         ramp_curve_box.grid(row=0, column=6, sticky="w")
-        ramp_curve_box.bind("<<ComboboxSelected>>", lambda _event: self._save_settings())
+        ramp_curve_box.bind("<<ComboboxSelected>>", self._on_media_ramp_curve_selected)
+        self.media_ramp_curve_preview = tk.Canvas(
+            ramp_frame, width=108, height=40, highlightthickness=1,
+            highlightbackground="#bbb", background="#f7f7f7")
+        self.media_ramp_curve_preview.grid(row=0, column=7, sticky="w", padx=(12, 0))
+        self._redraw_media_ramp_curve_preview()
         ttk.Label(ramp_frame, textvariable=self.media_ramp_status,
-                  foreground="#555").grid(row=1, column=0, columnspan=7, sticky="w",
+                  foreground="#555").grid(row=1, column=0, columnspan=8, sticky="w",
                                           pady=(4, 0))
         ttk.Label(ramp_frame, text=(
             "Scales primary and prostate volume by media timeline percent "
-            "(T0/T1 from MFP Timeline Absolute). Distinct from motion rest-volume."),
+            "(T0/T1 from MFP Timeline Absolute). Distinct from motion rest-volume. "
+            "Curve preview shows the selected shape only (progress → gain shaping)."),
             foreground="#555", wraplength=900).grid(
-                row=2, column=0, columnspan=7, sticky="w", pady=(2, 0))
+                row=2, column=0, columnspan=8, sticky="w", pady=(2, 0))
 
         events_frame = self._frame("Custom events", 4, 0, 2)
         ttk.Checkbutton(events_frame, text="Enable custom events",
@@ -1126,6 +1132,36 @@ class VectorApp:
         authored_overrides["S1"] = result["sensor_suppression"]
         return (primary_volume, prostate_volume, frequency, pulse_frequency,
                 pulse_width, alpha, beta, electrodes, authored_overrides)
+
+    def _on_media_ramp_curve_selected(self, _event=None) -> None:
+        self._redraw_media_ramp_curve_preview()
+        self._save_settings()
+
+    def _redraw_media_ramp_curve_preview(self) -> None:
+        """Draw a generic 0..1 shape for the selected media ramp curve name."""
+        canvas = getattr(self, "media_ramp_curve_preview", None)
+        if canvas is None:
+            return
+        width = int(canvas.winfo_reqwidth() or 108)
+        height = int(canvas.winfo_reqheight() or 40)
+        pad = 4
+        canvas.delete("all")
+        # Light frame reference (start/end).
+        canvas.create_rectangle(
+            pad, pad, width - pad, height - pad, outline="#ddd", fill="#f7f7f7")
+        name = self.media_volume_ramp_curve.get()
+        points: list[float] = []
+        samples = 48
+        inner_w = max(1, width - 2 * pad)
+        inner_h = max(1, height - 2 * pad)
+        for index in range(samples + 1):
+            progress = index / samples
+            shaped = ramp_curve(progress, name)
+            x = pad + progress * inner_w
+            y = pad + (1.0 - shaped) * inner_h
+            points.extend((x, y))
+        if len(points) >= 4:
+            canvas.create_line(*points, fill="#2a6fdb", width=2, smooth=True)
 
     def _media_volume_gain_at(self, calculated_at: float) -> float | None:
         if not self.media_volume_ramp_enabled.get():

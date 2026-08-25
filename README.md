@@ -58,7 +58,8 @@ second after they begin.
   time live for about 1 s (then briefly holds it for the volume ramp) so quiet
   packets do not flicker to “none” or slam gain to the floor. Optional **Media volume ramp** scales primary and
   prostate volume by media percent between a floor and ceiling using Linear,
-  Exponential, Logarithmic, Smoothstep or Smootherstep curves. Optional **Custom
+  Exponential, Logarithmic, Smoothstep, Smootherstep, Power2, Late Kick or
+  Plateau Rise curves. Optional **Custom
   events** play funscript-tools `.events.yml` files after the volume ramp for
   `volume`, `volume-prostate`, `pulse_frequency`, `pulse_width`, `frequency`,
   `alpha`, `beta`, `e1`–`e4`, and `sensor_suppression` (Restim `S1`). While

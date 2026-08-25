@@ -3,6 +3,7 @@ import unittest
 from vector1a.tcode import TCodeCommand
 from vector1a.timeline import (
     MediaTimeline,
+    RAMP_CURVE_NAMES,
     TIMELINE_FRESHNESS_SECONDS,
     TIMELINE_HOLD_SECONDS,
     TIMELINE_SCALE_SECONDS,
@@ -127,7 +128,7 @@ class MediaVolumeRampTests(unittest.TestCase):
         self.assertAlmostEqual(media_volume_gain(1.0, 0.6, 0.2, "Linear"), 0.6)
 
     def test_named_curves_preserve_endpoints_and_are_monotonic(self):
-        for name in ("Linear", "Exponential", "Logarithmic", "Smoothstep", "Smootherstep"):
+        for name in RAMP_CURVE_NAMES:
             self.assertAlmostEqual(ramp_curve(0.0, name), 0.0)
             self.assertAlmostEqual(ramp_curve(1.0, name), 1.0)
             values = [ramp_curve(step / 100.0, name) for step in range(101)]
@@ -143,6 +144,17 @@ class MediaVolumeRampTests(unittest.TestCase):
 
     def test_logarithmic_rises_early_relative_to_linear(self):
         self.assertGreater(ramp_curve(0.5, "Logarithmic"), ramp_curve(0.5, "Linear"))
+
+    def test_power2_is_quadratic(self):
+        self.assertAlmostEqual(ramp_curve(0.5, "Power2"), 0.25)
+
+    def test_late_kick_stays_soft_then_climbs(self):
+        self.assertLess(ramp_curve(0.5, "Late Kick"), 0.15)
+        self.assertGreater(ramp_curve(0.9, "Late Kick"), ramp_curve(0.75, "Late Kick"))
+
+    def test_plateau_rise_holds_then_climbs(self):
+        self.assertLess(ramp_curve(0.2, "Plateau Rise"), 0.06)
+        self.assertGreater(ramp_curve(0.8, "Plateau Rise"), ramp_curve(0.4, "Plateau Rise"))
 
 
 if __name__ == "__main__":

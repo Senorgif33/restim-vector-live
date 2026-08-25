@@ -23,8 +23,13 @@ RAMP_CURVE_NAMES = (
     "Logarithmic",
     "Smoothstep",
     "Smootherstep",
+    "Power2",
+    "Late Kick",
+    "Plateau Rise",
 )
 _RAMP_CURVE_K = 3.0
+_LATE_KICK_AT = 0.75
+_PLATEAU_HOLD = 0.35
 
 
 @dataclass(frozen=True)
@@ -51,7 +56,8 @@ def decode_timeline_seconds(encoded: float,
 def ramp_curve(progress: float, name: str = "Linear") -> float:
     """Map media progress 0..1 through a named ramp curve with exact endpoints."""
     t = min(1.0, max(0.0, float(progress)))
-    key = str(name).strip().lower()
+    key = str(name).strip().lower().replace("_", " ")
+    key = " ".join(key.split())
     if key == "exponential":
         k = _RAMP_CURVE_K
         return (math.exp(k * t) - 1.0) / (math.exp(k) - 1.0)
@@ -62,6 +68,20 @@ def ramp_curve(progress: float, name: str = "Linear") -> float:
         return t * t * (3.0 - 2.0 * t)
     if key == "smootherstep":
         return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+    if key in ("power2", "power 2", "power n=2", "power n2"):
+        return t * t
+    if key == "late kick":
+        kick = _LATE_KICK_AT
+        if t <= kick:
+            return 0.12 * (t / kick)
+        u = (t - kick) / (1.0 - kick)
+        return 0.12 + 0.88 * (u * u)
+    if key in ("plateau rise", "plateau then rise"):
+        hold = _PLATEAU_HOLD
+        if t <= hold:
+            return 0.05 * (t / hold)
+        u = (t - hold) / (1.0 - hold)
+        return 0.05 + 0.95 * (u * u * (3.0 - 2.0 * u))
     return t
 
 
