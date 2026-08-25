@@ -28,6 +28,8 @@ normalization:
     max: 1200.0
   volume:
     max: 1.0
+  sensor_suppression:
+    max: 100.0
 definitions:
   volume_boost:
     default_params:
@@ -104,6 +106,32 @@ definitions:
           amplitude: 0.5
           max_level_offset: 0.5
           phase: 0
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_ms
+          mode: overwrite
+  suppress_edge:
+    default_params:
+      duration_ms: 1000
+      ramp_ms: 0
+    steps:
+      - operation: apply_linear_change
+        axis: sensor_suppression
+        params:
+          start_value: 50
+          end_value: 50
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_ms
+          mode: overwrite
+  suppress_cum:
+    default_params:
+      duration_ms: 1000
+      ramp_ms: 0
+    steps:
+      - operation: apply_linear_change
+        axis: sensor_suppression
+        params:
+          start_value: 100
+          end_value: 100
           duration_ms: $duration_ms
           ramp_in_ms: $ramp_ms
           mode: overwrite
@@ -294,11 +322,127 @@ class EventEngineTests(unittest.TestCase):
         self.assertNotAlmostEqual(inside["e1"], base)
         self.assertAlmostEqual(outside["e1"], base)
 
+    def test_sensor_suppression_accepted_and_overwrites(self):
+        path = Path(self._tmpdir.name) / "suppress.events.yml"
+        path.write_text(
+            "events:\n"
+            "  - time: 0\n    name: suppress_edge\n"
+            "  - time: 2000\n    name: suppress_cum\n",
+            encoding="utf-8",
+        )
+        self.engine.load_events_file(path)
+        self.assertFalse(self.engine.warnings)
+        baseline = {"sensor_suppression": 0.0}
+        self.assertAlmostEqual(
+            self.engine.apply(500, baseline)["sensor_suppression"], 0.5)
+        self.assertAlmostEqual(
+            self.engine.apply(2500, baseline)["sensor_suppression"], 1.0)
+        self.assertAlmostEqual(
+            self.engine.apply(5000, baseline)["sensor_suppression"], 0.0)
+
+    def test_sensor_suppression_seeds_from_authored_baseline(self):
+        path = Path(self._tmpdir.name) / "suppress_authored.events.yml"
+        path.write_text(
+            "events:\n  - time: 0\n    name: suppress_edge\n",
+            encoding="utf-8",
+        )
+        self.engine.load_events_file(path)
+        # Outside the event window the authored seed is preserved.
+        outside = self.engine.apply(5000, {"sensor_suppression": 0.8})
+        self.assertAlmostEqual(outside["sensor_suppression"], 0.8)
+        inside = self.engine.apply(500, {"sensor_suppression": 0.8})
+        self.assertAlmostEqual(inside["sensor_suppression"], 0.5)
+
+    def test_bundled_edge_and_cum_include_sensor_suppression(self):
+        engine = EventEngine()
+        for name in ("edge", "cum", "CH_edge", "CH_cum_tease",
+                     "mcb_edge", "mcb_edge_ce", "clutch_edge", "ruin"):
+            definition = engine.definitions.get(name)
+            self.assertIsNotNone(definition, name)
+            axes = set()
+            for step in definition.get("steps") or []:
+                axis = str(step.get("axis", ""))
+                axes.update(part.strip() for part in axis.split(","))
+            self.assertIn("sensor_suppression", axes, name)
+        # Spot-check policy values after expansion.
+        edge = expand_user_events(
+            {"events": [{"time": 0, "name": "edge"}]}, engine.definitions)
+        cum = expand_user_events(
+            {"events": [{"time": 0, "name": "cum"}]}, engine.definitions)
+        ruin = expand_user_events(
+            {"events": [{"time": 0, "name": "ruin"}]}, engine.definitions)
+        stay = expand_user_events(
+            {"events": [{"time": 0, "name": "stay"}]}, engine.definitions)
+        edge_s = next(s for s in edge.steps if s.axis == "sensor_suppression")
+        cum_s = next(s for s in cum.steps if s.axis == "sensor_suppression")
+        ruin_s = next(s for s in ruin.steps if s.axis == "sensor_suppression")
+        self.assertEqual(edge_s.params["start_value"], 50)
+        self.assertEqual(cum_s.params["start_value"], 100)
+        self.assertEqual(ruin_s.params["start_value"], 100)
+        self.assertFalse(any(s.axis == "sensor_suppression" for s in stay.steps))
+
     def test_spatial_axes_clip_to_unit_interval(self):
         clipped = apply_linear_change(
             0.9, 500, 0, 1000, 0.5, 0.5, 0, 0, "additive", "e2")
         self.assertLessEqual(clipped, 1.0)
         self.assertGreaterEqual(clipped, 0.0)
+
+    def test_schedule_trigger_before_activate_has_no_effect(self):
+        self.engine.reload_definitions(self.defs_path)
+        activate_at = 100.0
+        self.assertTrue(self.engine.schedule_trigger(
+            "volume_boost", {"duration_ms": 1000, "amount": 0.2}, activate_at))
+        before = self.engine.apply_triggers(99.0, {"volume": 0.5})
+        self.assertAlmostEqual(before["volume"], 0.5)
+        during = self.engine.apply_triggers(100.5, {"volume": 0.5})
+        self.assertAlmostEqual(during["volume"], 0.7)
+
+    def test_schedule_trigger_without_file_or_media_position(self):
+        self.engine.reload_definitions(self.defs_path)
+        self.engine.clear()
+        activate_at = 10.0
+        self.engine.schedule_trigger(
+            "volume_boost", {"duration_ms": 500, "amount": 0.25}, activate_at)
+        # No file steps; apply with None position is a no-op for files.
+        base = {"volume": 0.4}
+        self.assertAlmostEqual(self.engine.apply(None, base)["volume"], 0.4)
+        active = self.engine.apply_triggers(10.2, base)
+        self.assertAlmostEqual(active["volume"], 0.65)
+
+    def test_overlapping_triggers_stack_in_receive_order(self):
+        self.engine.reload_definitions(self.defs_path)
+        self.engine.schedule_trigger(
+            "volume_boost", {"duration_ms": 1000, "amount": 0.1}, 50.0)
+        self.engine.schedule_trigger(
+            "volume_boost", {"duration_ms": 1000, "amount": 0.2}, 50.0)
+        result = self.engine.apply_triggers(50.1, {"volume": 0.5})
+        self.assertAlmostEqual(result["volume"], 0.8)
+
+    def test_unknown_trigger_name_does_not_raise(self):
+        self.engine.reload_definitions(self.defs_path)
+        self.assertFalse(self.engine.schedule_trigger("no_such_event", {}, 1.0))
+        self.assertEqual(self.engine.pending_trigger_count, 0)
+        self.assertTrue(any("no_such_event" in w for w in self.engine.warnings))
+
+    def test_scheduled_edge_mutes_sensor_suppression(self):
+        engine = EventEngine()
+        activate_at = 5.0
+        self.assertTrue(engine.schedule_trigger(
+            "edge", {"duration_ms": 2000, "ramp_up_ms": 0}, activate_at))
+        seed = {"sensor_suppression": 0.0, "volume": 0.5}
+        before = engine.apply_triggers(4.0, seed)
+        self.assertAlmostEqual(before["sensor_suppression"], 0.0)
+        during = engine.apply_triggers(5.1, seed)
+        self.assertAlmostEqual(during["sensor_suppression"], 0.5)
+
+    def test_status_line_shows_triggers_without_file(self):
+        self.engine.reload_definitions(self.defs_path)
+        self.engine.clear()
+        self.engine.schedule_trigger(
+            "volume_boost", {"duration_ms": 1000}, 20.0)
+        line = self.engine.status_line(enabled=True, due_at=20.1)
+        self.assertIn("triggers=", line)
+        self.assertIn("volume_boost", line)
 
 
 if __name__ == "__main__":

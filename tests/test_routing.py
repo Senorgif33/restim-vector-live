@@ -58,6 +58,19 @@ class AuthoredAxisRouterTests(unittest.TestCase):
         self.assertEqual(set(snap), {"L0", "V0"})
         self.assertNotIn("P1", snap)
 
+    def test_auto_mode_routes_s1_with_restim_signature(self):
+        router = AuthoredAxisRouter(clock=lambda: 0.0)
+        router.receive(TCodeCommand("V0", .45), 1.0)
+        router.receive(TCodeCommand("S1", .9), 1.0)
+        snap = router.snapshot_auto(1.0)
+        self.assertAlmostEqual(snap["S1"], .9)
+
+    def test_manual_mode_routes_enabled_s1(self):
+        router = AuthoredAxisRouter(clock=lambda: 0.0)
+        router.set_enabled("S1", True)
+        router.receive(TCodeCommand("S1", .75), 1.0)
+        self.assertAlmostEqual(router.snapshot(1.0)["S1"], .75)
+
     def test_auto_mode_drops_stale_axis_and_uses_vector_fallback(self):
         router = AuthoredAxisRouter(clock=lambda: 0.0)
         router.receive(TCodeCommand("L0", .2), 1.0)

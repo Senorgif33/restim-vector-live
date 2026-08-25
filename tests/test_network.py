@@ -139,6 +139,18 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(l0, [.25])
         self.assertEqual(commands, [("L0", .25), ("L1", .75), ("R0", .5)])
 
+    def test_listener_evt_does_not_drop_subsequent_l0(self):
+        l0 = []
+        events = []
+        listener = MFPListener(
+            lambda value, *_: l0.append(value), lambda _: None,
+            on_evt=lambda trigger, _: events.append(trigger.name))
+        listener._handle("EVT duration_ms=100")  # malformed: no name
+        listener._handle("EVT name=edge duration_ms=500")
+        listener._handle("L05000")
+        self.assertEqual(events, ["edge"])
+        self.assertEqual(l0, [0.5])
+
     def test_quiet_listener_is_not_reported_as_failed(self):
         listener = MFPListener(lambda *_: None, lambda _: None)
         listener._run.set()

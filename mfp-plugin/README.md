@@ -23,7 +23,8 @@ Derived in Vector (not sent on the wire):
 - `progress = position_s / duration_s` when `duration_s > 0` (media volume ramp)
 - `position_ms = round(position_s * 1000)` (Vector live custom events on volume, pulse, frequency, alpha/beta, and e1–e4)
 
-Standard 4-digit T-code gives about **1 second** position resolution at this scale.
+Set device **Output precision** to **5** so timeline axes use 5-digit T-code (~**0.1 s**
+position resolution at this scale). The default TCode-0.3 profile uses 4 digits (~1 s).
 
 `T0` / `T1` are outside ReStim’s usual authored signature set (`V0`, `C0`, `P*`, `E*`), so Vector auto authored routing should not treat them as a ReStim stream.
 
@@ -37,8 +38,9 @@ Standard 4-digit T-code gives about **1 second** position resolution at this sca
 ### Device profile
 
 1. Open MFP **Device** settings.
-2. Add custom axes named **`T0`** and **`T1`** (names must match `^[A-Z][0-9]$`) and enable them.
-3. On the T-code **output that targets Vector**, include **`T0`** and **`T1`** on the same output as `L0`.
+2. Set **Output precision** to **5** (required for sub-second `T0`/`T1` updates).
+3. Add custom axes named **`T0`** and **`T1`** (names must match `^[A-Z][0-9]$`) and enable them.
+4. On the T-code **output that targets Vector**, include **`T0`** and **`T1`** on the same output as `L0`.
 
 If an axis is missing from the device profile, the plugin logs a one-time warning and skips that axis until it is available.
 
@@ -47,7 +49,7 @@ If an axis is missing from the device profile, the plugin logs a one-time warnin
 1. Start Vector’s MFP listener and play media through an MFP-connected player.
 2. Open **MFP axes** diagnostics.
 3. Raw packets should list `T0` and `T1`.
-4. Decode check: `T0 * 10000` ≈ player position in seconds (±1 s); `T1 * 10000` ≈ media duration when known.
+4. Decode check: `T0 * 10000` ≈ player position in seconds (±0.1 s with 5-digit output); `T1 * 10000` ≈ media duration when known.
 
 Commission with ReStim’s graphical display and stimulation hardware disconnected.
 

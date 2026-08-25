@@ -6,6 +6,7 @@ from vector1a.timeline import (
     TIMELINE_FRESHNESS_SECONDS,
     TIMELINE_HOLD_SECONDS,
     TIMELINE_SCALE_SECONDS,
+    TIMELINE_TCODE_DIGITS,
     decode_timeline_seconds,
     media_volume_gain,
     ramp_curve,
@@ -14,6 +15,7 @@ from vector1a.timeline import (
 
 class TimelineDecodeTests(unittest.TestCase):
     def test_decode_round_trip_scale(self):
+        self.assertEqual(TIMELINE_TCODE_DIGITS, 5)
         self.assertAlmostEqual(decode_timeline_seconds(0.0), 0.0)
         self.assertAlmostEqual(decode_timeline_seconds(1.0), TIMELINE_SCALE_SECONDS)
         self.assertAlmostEqual(decode_timeline_seconds(0.1234), 1234.0)
@@ -59,8 +61,18 @@ class TimelineDecodeTests(unittest.TestCase):
         self.assertFalse(state.usable)
         self.assertIsNone(state.progress)
 
+    def test_five_digit_position_resolves_to_tenth_second(self):
+        timeline = MediaTimeline(clock=lambda: 0.0)
+        # 125.3 s position, 5000 s duration — 5-digit wire value 01253
+        timeline.receive(TCodeCommand("T0", 0.01253), 1.0)
+        timeline.receive(TCodeCommand("T1", 0.5000), 1.0)
+        state = timeline.snapshot(1.0)
+        self.assertAlmostEqual(state.position_s, 125.3, places=1)
+        self.assertAlmostEqual(state.progress, 125.3 / 5000.0, places=4)
+
     def test_sparse_t0_updates_remain_fresh_within_default_window(self):
-        # 4-digit T0 at scale 10000 often only changes ~1 media-second apart.
+        # 5-digit T0 at scale 10000 can change every ~0.1 media-second; gaps
+        # longer than freshness should still read as live within the window.
         timeline = MediaTimeline(clock=lambda: 0.0)
         timeline.receive(TCodeCommand("T0", 0.0414), 1.0)
         timeline.receive(TCodeCommand("T1", 0.5000), 1.0)

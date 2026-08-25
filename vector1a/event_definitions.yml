@@ -15,6 +15,7 @@
 #   - volume-prostate       — prostate channel output level (0.0–1.0)
 #   - alpha                 — alpha channel modulation parameter
 #   - beta                  — beta channel modulation parameter
+#   - sensor_suppression    — Restim S1 mute for sensors (0–100; 100 = fully suppressed)
 #   Multiple axes can be targeted simultaneously using comma separation (e.g. "volume,volume-prostate")
 #
 # waveform (apply_modulation only):
@@ -39,6 +40,9 @@ normalization:
     unit: "Hz"
   volume:
     max: 1.0            # Volume already normalized (0.0-1.0)
+  sensor_suppression:
+    max: 100.0          # Restim S1 percent (100 = fully suppressed)
+    unit: "%"
     unit: "normalized"
 
 # Event groups for organization in the UI
@@ -99,6 +103,14 @@ definitions:
           duration_ms: $duration_ms
           ramp_in_ms: $ramp_up_ms
           mode: additive
+      - operation: apply_linear_change
+        axis: sensor_suppression
+        params:
+          start_value: 100
+          end_value: 100
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_up_ms
+          mode: overwrite
 
   stay:
     default_params:
@@ -169,6 +181,14 @@ definitions:
           duration_ms: $duration_ms
           ramp_in_ms: $ramp_up_ms
           mode: additive
+      - operation: apply_linear_change
+        axis: sensor_suppression
+        params:
+          start_value: 50
+          end_value: 50
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_up_ms
+          mode: overwrite
   lube:
     default_params:
       duration_ms: 15000
@@ -263,6 +283,7 @@ definitions:
           duration_ms: $duration_ms
           ramp_in_ms: $ramp_up_ms
           mode: additive
+
   slow:
     default_params:
       duration_ms: 15000
@@ -430,6 +451,15 @@ definitions:
           ramp_in_ms: $ramp_in_ms
           ramp_out_ms: 500
           mode: overwrite
+      - operation: apply_linear_change
+        axis: sensor_suppression
+        params:
+          start_value: 100
+          end_value: 100
+          duration_ms: $duration_ms
+          ramp_in_ms: 0
+          mode: overwrite
+
   stop:
     default_params:
       duration_ms: 30000
@@ -599,7 +629,6 @@ definitions:
           ramp_out_ms: 1000
           mode: additive
 
-  
   CH_slow-tease:
     default_params:
       duration_ms: 15000
@@ -630,7 +659,6 @@ definitions:
           duration_ms: $duration_ms
           ramp_in_ms: $ramp_up_ms
           mode: additive
-
 
   CH_normal:
     default_params:
@@ -677,6 +705,14 @@ definitions:
           duration_ms: $duration_ms
           ramp_in_ms: $ramp_up_ms
           mode: additive
+      - operation: apply_linear_change
+        axis: sensor_suppression
+        params:
+          start_value: 50
+          end_value: 50
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_up_ms
+          mode: overwrite
 
   CH_cum_tease:
     default_params:
@@ -718,6 +754,14 @@ definitions:
           duration_ms: $duration_ms
           ramp_in_ms: $ramp_up_ms
           mode: additive
+      - operation: apply_linear_change
+        axis: sensor_suppression
+        params:
+          start_value: 100
+          end_value: 100
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_up_ms
+          mode: overwrite
 
   # Event Definitions from AquariumParrot's MCB 
   # Based on SuperCollider scripts 
@@ -832,6 +876,16 @@ definitions:
           ramp_out_ms: $ramp_ms
           mode: additive
 
+      - operation: apply_linear_change
+        axis: sensor_suppression
+        params:
+          start_value: 50
+          end_value: 50
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_ms
+          ramp_out_ms: $ramp_ms
+          mode: overwrite
+
   # === EDGE CE (Cock Enslavement) ===
   # Intense edging with dual modulation on alpha and beta
 
@@ -895,6 +949,16 @@ definitions:
           ramp_in_ms: $ramp_ms
           ramp_out_ms: $ramp_ms
           mode: additive
+
+      - operation: apply_linear_change
+        axis: sensor_suppression
+        params:
+          start_value: 50
+          end_value: 50
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_ms
+          ramp_out_ms: $ramp_ms
+          mode: overwrite
 
   # === OBEY EFFECT ===
   # Dual sinusoidal modulation with moderate pulse frequency
@@ -1542,8 +1606,6 @@ definitions:
           ramp_in_ms: $ramp_ms
           mode: overwrite
 
-
-
   clutch_higher_rate:
     default_params:
       duration_ms: 8000
@@ -1611,6 +1673,16 @@ definitions:
           ramp_in_ms: $ramp_ms
           ramp_out_ms: $ramp_ms
           mode: additive
+
+      - operation: apply_linear_change
+        axis: sensor_suppression
+        params:
+          start_value: 50
+          end_value: 50
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_ms
+          ramp_out_ms: $ramp_ms
+          mode: overwrite
 
   # === PULSAR/SPIKE EFFECTS ===
   # Buzzing sensations from high-frequency modulation
@@ -1750,3 +1822,4 @@ definitions:
           ramp_in_ms: $ramp_ms
           ramp_out_ms: $ramp_ms
           mode: additive
+

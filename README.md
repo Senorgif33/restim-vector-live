@@ -6,7 +6,7 @@ ordinary positional `L0` stream, Vector remains the deterministic motion generat
 MFP supplies a clearly authored ReStim axis set, Vector can automatically pass those axes
 through on the same delayed timeline and generate only the missing axes.
 
-Current development build: **1.6.0-alpha50**.
+Current development build: **1.6.0-alpha51**.
 
 > [!CAUTION]
 > Commission with ReStim's graphical display and stimulation hardware
@@ -53,21 +53,32 @@ second after they begin.
   axes currently live, and the active routing mode.
 - Optional **media timeline** consumer decodes absolute media position/`duration` from
   MFP axes `T0`/`T1` (scale 10000 s; see `mfp-plugin/` Timeline Absolute). Timeline axes
-  are never forwarded to ReStim. With ordinary 4-digit T-code, `T0` often updates only
-  about once per media second; Vector keeps the last known time live for a few seconds
-  (and briefly holds it for the volume ramp) so sparse packets do not flicker to “none”
-  or slam gain to the floor. Optional **Media volume ramp** scales primary and
+  are never forwarded to ReStim. Set MFP device **Output precision** to **5** so `T0`/`T1`
+  use 5-digit T-code (~0.1 s steps at the 10000 s scale). Vector keeps the last known
+  time live for about 1 s (then briefly holds it for the volume ramp) so quiet
+  packets do not flicker to “none” or slam gain to the floor. Optional **Media volume ramp** scales primary and
   prostate volume by media percent between a floor and ceiling using Linear,
   Exponential, Logarithmic, Smoothstep or Smootherstep curves. Optional **Custom
   events** play funscript-tools `.events.yml` files after the volume ramp for
   `volume`, `volume-prostate`, `pulse_frequency`, `pulse_width`, `frequency`,
-  `alpha`, `beta`, and `e1`–`e4`. Three-phase defs (alpha/beta) and four-phase
+  `alpha`, `beta`, `e1`–`e4`, and `sensor_suppression` (Restim `S1`). While
+  events are enabled, Vector seeds `S1` from an authored MFP `S1` axis when
+  routed, otherwise `0.0` (sensors fully active); edge-family defs raise mute
+  to `0.5` and cum-family / `ruin` defs to `1.0` for their windows. Authored
+  `sensor_suppression` scripts can also
+  be passed through alone via Manual `S1` or Auto when a ReStim signature axis
+  is live. Three-phase defs (alpha/beta) and four-phase
   defs (e1–e4) require the matching ReStim mode. Events evaluate at **send-time**
   absolute media position (`sample.due_at`, aligned with video / status), not the
-  calculate-time clock used to build the look-ahead queue sample. Definitions are
-  vendored in `vector1a/event_definitions.yml`. Requires Timeline Absolute
-  (`T0`/`T1`). Do not also bake the same events offline into authored funscripts
-  (double apply).
+  calculate-time clock used to build the look-ahead queue sample. Companions such as
+  Fap-Hero may also send live **`EVT name=… key=value…`** lines on the same MFP
+  TCP/UDP port: Vector schedules each trigger at `receive + look-ahead` and merges
+  effects on the send clock (does **not** use `T0` for activation). Leave the
+  `.events.yml` path empty for Journey play; keep definitions loaded. Session
+  `T0`/`T1` remain volume-ramp only. Definitions are
+  vendored in `vector1a/event_definitions.yml`. File-based events require Timeline
+  Absolute (`T0`/`T1`). Do not also bake the same events offline into authored
+  funscripts (double apply). Requires a Restim build that supports sensor suppression.
 - Optional session startup can launch configured MultiFunPlayer, primary ReStim
   and prostate ReStim applications/shortcuts when Vector opens. Launching is kept
   separate from signal generation; Vector still owns its listener, connections,
@@ -233,6 +244,7 @@ Commission visually with stimulation hardware disconnected before connected use.
 | Primary ReStim | E1 / E2 / E3 / E4 | Four-phase electrode potentials |
 | Primary ReStim | C0 | Frequency |
 | Primary ReStim | P0 / P1 / P3 | Pulse frequency / width / rise time |
+| Primary ReStim | S1 | Sensor suppression (authored and/or events) |
 | Prostate ReStim | L0 / L1 / V0 | Alpha-prostate / beta-prostate / volume-prostate |
 | Prostate ReStim | F0 / P0 / P1 / P3 | Shared frequency and pulse controls |
 

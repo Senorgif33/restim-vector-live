@@ -2,13 +2,14 @@
 
 Stdlib-only YAML subset loader (no PyYAML). Matches offline Event Builder
 semantics for supported axes: volume, volume-prostate, pulse_frequency,
-pulse_width, frequency, alpha, beta, e1–e4.
+pulse_width, frequency, alpha, beta, e1–e4, sensor_suppression.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
+import threading
 from typing import Any
 
 SUPPORTED_AXES = frozenset({
@@ -23,6 +24,7 @@ SUPPORTED_AXES = frozenset({
     "e2",
     "e3",
     "e4",
+    "sensor_suppression",
 })
 
 AXIS_AUTHORED = {
@@ -36,6 +38,7 @@ AXIS_AUTHORED = {
     "e2": "E2",
     "e3": "E3",
     "e4": "E4",
+    "sensor_suppression": "S1",
 }
 
 DEFAULT_NORMALIZATION = {
@@ -43,6 +46,7 @@ DEFAULT_NORMALIZATION = {
     "pulse_width": {"max": 100.0},
     "frequency": {"max": 360.0},
     "volume": {"max": 1.0},
+    "sensor_suppression": {"max": 100.0},
 }
 
 _BUNDLED_DEFINITIONS = Path(__file__).with_name("event_definitions.yml")
@@ -347,6 +351,16 @@ class LoadedEvents:
     source_path: str = ""
 
 
+@dataclass
+class ScheduledTrigger:
+    """One live EVT instance scheduled onto the send/due_at clock."""
+    name: str
+    activate_at: float
+    steps: list[ActiveStep]
+    duration_ms: int
+    warnings: list[str] = field(default_factory=list)
+
+
 def load_definitions(path: Path | None = None
                      ) -> tuple[dict[str, Any], dict[str, dict[str, float]]]:
     definitions_path = Path(path) if path else _BUNDLED_DEFINITIONS
@@ -368,6 +382,89 @@ def load_definitions(path: Path | None = None
     return definitions, merged
 
 
+def expand_named_event(
+        event_name: str,
+        params: dict[str, Any] | None,
+        definitions: dict[str, Any],
+        *,
+        event_time_ms: int = 0,
+) -> tuple[list[ActiveStep], list[str]]:
+    """Expand one named definition into ActiveSteps (relative to *event_time_ms*)."""
+    if event_name not in definitions:
+        raise EventError(
+            f"Event '{event_name}' is not defined in event_definitions.yml.")
+    definition = definitions[event_name]
+    if not isinstance(definition, dict):
+        raise EventError(f"Definition for '{event_name}' must be a mapping.")
+
+    final_params = dict(definition.get("default_params") or {})
+    if params:
+        final_params.update(params)
+    _derive_step_ratio_params(final_params, event_name)
+
+    expanded: list[ActiveStep] = []
+    unsupported_seen: set[str] = set()
+    warnings: list[str] = []
+
+    for step_idx, step in enumerate(definition.get("steps") or [], start=1):
+        if not isinstance(step, dict):
+            raise EventError(
+                f"Event '{event_name}': step {step_idx} must be a mapping.")
+        if "operation" not in step:
+            raise EventError(
+                f"Event '{event_name}': step {step_idx} is missing 'operation'.")
+        if "axis" not in step:
+            raise EventError(
+                f"Event '{event_name}': step {step_idx} is missing 'axis'.")
+        operation = step["operation"]
+        step_params_raw = dict(step.get("params") or {})
+        if (operation == "apply_linear_change"
+                and "start_value" not in step_params_raw):
+            raise EventError(
+                f"Event '{event_name}': step {step_idx} uses "
+                f"'apply_linear_change' but is missing 'start_value'.")
+
+        processed_params = {
+            key: _substitute_token(value, final_params, event_name)
+            for key, value in step_params_raw.items()
+        }
+        start_offset = _substitute_token(
+            step.get("start_offset", 0), final_params, event_name)
+        try:
+            start_offset_ms = int(start_offset)
+        except (TypeError, ValueError) as exc:
+            raise EventError(
+                f"Event '{event_name}': invalid start_offset") from exc
+
+        axis_field = str(step["axis"])
+        for axis_name in [name.strip() for name in axis_field.split(",")]:
+            if not axis_name:
+                continue
+            if axis_name not in SUPPORTED_AXES:
+                unsupported_seen.add(axis_name)
+                continue
+            try:
+                duration_ms = int(processed_params["duration_ms"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise EventError(
+                    f"Event '{event_name}': step needs duration_ms") from exc
+            expanded.append(ActiveStep(
+                event_name=event_name,
+                operation=str(operation),
+                axis=axis_name,
+                start_time_ms=event_time_ms + start_offset_ms,
+                duration_ms=duration_ms,
+                params=dict(processed_params),
+            ))
+
+    if unsupported_seen:
+        warnings.append(
+            "Skipped unsupported axis steps: "
+            + ", ".join(sorted(unsupported_seen))
+            + f" (supported: {', '.join(sorted(SUPPORTED_AXES))})")
+    return expanded, warnings
+
+
 def expand_user_events(
         user_data: dict[str, Any],
         definitions: dict[str, Any],
@@ -381,7 +478,7 @@ def expand_user_events(
 
     result = LoadedEvents()
     expanded: list[ActiveStep] = []
-    unsupported_seen: set[str] = set()
+    warning_set: set[str] = set()
 
     for index, user_event in enumerate(user_events):
         if not isinstance(user_event, dict):
@@ -390,81 +487,26 @@ def expand_user_events(
             raise EventError(
                 f"Event #{index + 1} is missing required key: 'time' or 'name'.")
         event_name = str(user_event["name"])
-        if event_name not in definitions:
-            raise EventError(
-                f"Event '{event_name}' at time {user_event['time']} "
-                f"is not defined in event_definitions.yml.")
         time_raw = user_event["time"]
         if not isinstance(time_raw, (int, float)):
             raise EventError(
                 f"Event '{event_name}' has invalid 'time' (must be number ms).")
         event_time_ms = int(time_raw)
-
-        definition = definitions[event_name]
-        if not isinstance(definition, dict):
-            raise EventError(f"Definition for '{event_name}' must be a mapping.")
-        final_params = dict(definition.get("default_params") or {})
-        if "params" in user_event and isinstance(user_event["params"], dict):
-            final_params.update(user_event["params"])
-        _derive_step_ratio_params(final_params, event_name)
-
-        for step_idx, step in enumerate(definition.get("steps") or [], start=1):
-            if not isinstance(step, dict):
+        params = user_event["params"] if isinstance(
+            user_event.get("params"), dict) else None
+        try:
+            steps, warnings = expand_named_event(
+                event_name, params, definitions, event_time_ms=event_time_ms)
+        except EventError as exc:
+            if event_name not in definitions:
                 raise EventError(
-                    f"Event '{event_name}': step {step_idx} must be a mapping.")
-            if "operation" not in step:
-                raise EventError(
-                    f"Event '{event_name}': step {step_idx} is missing 'operation'.")
-            if "axis" not in step:
-                raise EventError(
-                    f"Event '{event_name}': step {step_idx} is missing 'axis'.")
-            operation = step["operation"]
-            step_params_raw = dict(step.get("params") or {})
-            if (operation == "apply_linear_change"
-                    and "start_value" not in step_params_raw):
-                raise EventError(
-                    f"Event '{event_name}': step {step_idx} uses "
-                    f"'apply_linear_change' but is missing 'start_value'.")
+                    f"Event '{event_name}' at time {event_time_ms} "
+                    f"is not defined in event_definitions.yml.") from exc
+            raise
+        expanded.extend(steps)
+        warning_set.update(warnings)
 
-            processed_params = {
-                key: _substitute_token(value, final_params, event_name)
-                for key, value in step_params_raw.items()
-            }
-            start_offset = _substitute_token(
-                step.get("start_offset", 0), final_params, event_name)
-            try:
-                start_offset_ms = int(start_offset)
-            except (TypeError, ValueError) as exc:
-                raise EventError(
-                    f"Event '{event_name}': invalid start_offset") from exc
-
-            axis_field = str(step["axis"])
-            for axis_name in [name.strip() for name in axis_field.split(",")]:
-                if not axis_name:
-                    continue
-                if axis_name not in SUPPORTED_AXES:
-                    unsupported_seen.add(axis_name)
-                    continue
-                try:
-                    duration_ms = int(processed_params["duration_ms"])
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise EventError(
-                        f"Event '{event_name}': step needs duration_ms") from exc
-                expanded.append(ActiveStep(
-                    event_name=event_name,
-                    operation=str(operation),
-                    axis=axis_name,
-                    start_time_ms=event_time_ms + start_offset_ms,
-                    duration_ms=duration_ms,
-                    params=dict(processed_params),
-                ))
-
-    if unsupported_seen:
-        result.warnings.append(
-            "Skipped unsupported axis steps: "
-            + ", ".join(sorted(unsupported_seen))
-            + f" (supported: {', '.join(sorted(SUPPORTED_AXES))})")
-
+    result.warnings.extend(sorted(warning_set))
     expanded.sort(key=lambda step: (step.start_time_ms, step.event_name, step.axis))
     result.steps = expanded
     result.event_count = len(user_events)
@@ -592,6 +634,9 @@ class EventEngine:
         self.normalization: dict[str, dict[str, float]] = dict(DEFAULT_NORMALIZATION)
         self.loaded = LoadedEvents()
         self._load_error = ""
+        self._trigger_lock = threading.Lock()
+        self._triggers: list[ScheduledTrigger] = []
+        self._trigger_warnings: list[str] = []
         try:
             self.reload_definitions()
         except EventError as exc:
@@ -619,10 +664,18 @@ class EventEngine:
     def clear(self) -> None:
         self.loaded = LoadedEvents()
         self._load_error = ""
+        self.clear_triggers()
+
+    def clear_triggers(self) -> None:
+        with self._trigger_lock:
+            self._triggers.clear()
+            self._trigger_warnings.clear()
 
     @property
     def warnings(self) -> list[str]:
-        return list(self.loaded.warnings)
+        with self._trigger_lock:
+            trigger_warns = list(self._trigger_warnings)
+        return list(self.loaded.warnings) + trigger_warns
 
     @property
     def event_count(self) -> int:
@@ -632,9 +685,50 @@ class EventEngine:
     def step_count(self) -> int:
         return len(self.loaded.steps)
 
+    @property
+    def pending_trigger_count(self) -> int:
+        with self._trigger_lock:
+            return len(self._triggers)
+
+    def schedule_trigger(self, name: str, params: dict[str, Any] | None,
+                         activate_at: float) -> bool:
+        """Expand and queue a live trigger. Returns False if expand failed."""
+        if not self.definitions:
+            try:
+                self.reload_definitions()
+            except EventError as exc:
+                with self._trigger_lock:
+                    self._trigger_warnings.append(str(exc))
+                return False
+        try:
+            steps, warnings = expand_named_event(
+                str(name), params or {}, self.definitions, event_time_ms=0)
+        except EventError as exc:
+            with self._trigger_lock:
+                self._trigger_warnings.append(str(exc))
+                if len(self._trigger_warnings) > 20:
+                    self._trigger_warnings = self._trigger_warnings[-20:]
+            return False
+        duration_ms = 0
+        for step in steps:
+            duration_ms = max(duration_ms, step.start_time_ms + max(0, step.duration_ms))
+        trigger = ScheduledTrigger(
+            name=str(name),
+            activate_at=float(activate_at),
+            steps=steps,
+            duration_ms=duration_ms,
+            warnings=list(warnings),
+        )
+        with self._trigger_lock:
+            self._triggers.append(trigger)
+            for warning in warnings:
+                if warning not in self._trigger_warnings:
+                    self._trigger_warnings.append(warning)
+        return True
+
     def apply(self, position_ms: int | None,
               values: dict[str, float]) -> dict[str, float]:
-        """Apply active steps in file order; clip each axis to 0..1.
+        """Apply active file steps in file order; clip each axis to 0..1.
 
         Returns a new dict. Inactive when *position_ms* is None.
         """
@@ -654,6 +748,38 @@ class EventEngine:
                 result[step.axis], position_ms, step, self.normalization)
         return result
 
+    def apply_triggers(self, due_at: float,
+                       values: dict[str, float]) -> dict[str, float]:
+        """Apply scheduled triggers whose windows cover *due_at*; prune expired."""
+        result = {axis: float(value) for axis, value in values.items()}
+        with self._trigger_lock:
+            alive: list[ScheduledTrigger] = []
+            for trigger in self._triggers:
+                end_at = trigger.activate_at + (trigger.duration_ms / 1000.0)
+                if due_at >= end_at and trigger.duration_ms > 0:
+                    continue
+                if due_at >= end_at and trigger.duration_ms == 0:
+                    # Instant triggers only fire at the activate sample.
+                    if abs(due_at - trigger.activate_at) > 1e-9:
+                        continue
+                alive.append(trigger)
+                if due_at < trigger.activate_at:
+                    continue
+                elapsed_ms = int(round((due_at - trigger.activate_at) * 1000.0))
+                for step in trigger.steps:
+                    if step.axis not in result:
+                        continue
+                    end = step.start_time_ms + max(0, step.duration_ms)
+                    if step.duration_ms == 0:
+                        if elapsed_ms != step.start_time_ms:
+                            continue
+                    elif elapsed_ms < step.start_time_ms or elapsed_ms >= end:
+                        continue
+                    result[step.axis] = evaluate_step(
+                        result[step.axis], elapsed_ms, step, self.normalization)
+            self._triggers = alive
+        return result
+
     def active_event_names(self, position_ms: int | None) -> list[str]:
         if position_ms is None:
             return []
@@ -668,21 +794,59 @@ class EventEngine:
                 names.append(step.event_name)
         return names
 
+    def active_trigger_names(self, due_at: float | None) -> list[str]:
+        if due_at is None:
+            return []
+        names: list[str] = []
+        seen: set[str] = set()
+        with self._trigger_lock:
+            for trigger in self._triggers:
+                if due_at < trigger.activate_at:
+                    continue
+                end_at = trigger.activate_at + (trigger.duration_ms / 1000.0)
+                if trigger.duration_ms > 0 and due_at >= end_at:
+                    continue
+                if trigger.duration_ms == 0 and abs(due_at - trigger.activate_at) > 1e-9:
+                    continue
+                if trigger.name not in seen:
+                    seen.add(trigger.name)
+                    names.append(trigger.name)
+        return names
+
     def status_line(self, position_ms: int | None = None,
-                    enabled: bool = True) -> str:
+                    enabled: bool = True,
+                    due_at: float | None = None) -> str:
         if self._load_error:
             return f"Events: error — {self._load_error}"
         if not enabled:
             return "Events: off"
+        with self._trigger_lock:
+            pending = len(self._triggers)
+            trigger_warn = self._trigger_warnings[0] if self._trigger_warnings else ""
+        active_triggers = self.active_trigger_names(due_at)
+        trigger_bit = ""
+        if active_triggers:
+            trigger_bit = f"triggers={', '.join(active_triggers)}"
+        elif pending:
+            trigger_bit = f"triggers pending={pending}"
+
         if not self.loaded.source_path:
-            return "Events: no file loaded"
+            if trigger_bit:
+                warn = f"; {trigger_warn}" if trigger_warn else ""
+                return f"Events: {trigger_bit}{warn}"
+            return "Events: no file loaded (EVT triggers ok)"
         active = self.active_event_names(position_ms)
         warn = f"; {self.loaded.warnings[0]}" if self.loaded.warnings else ""
+        if not warn and trigger_warn:
+            warn = f"; {trigger_warn}"
+        file_bit = f"{self.loaded.event_count} loaded, {self.step_count} steps"
         if position_ms is None:
-            return (f"Events: {self.loaded.event_count} loaded, "
-                    f"{self.step_count} steps (no media position){warn}")
-        if active:
-            return (f"Events: {self.loaded.event_count} loaded, "
-                    f"active={', '.join(active)} @ {position_ms} ms{warn}")
-        return (f"Events: {self.loaded.event_count} loaded, "
-                f"{self.step_count} steps, idle @ {position_ms} ms{warn}")
+            base = f"Events: {file_bit} (no media position)"
+        elif active:
+            base = (f"Events: {file_bit}, active={', '.join(active)} "
+                    f"@ {position_ms} ms")
+        else:
+            base = f"Events: {file_bit}, idle @ {position_ms} ms"
+        if trigger_bit:
+            return f"{base}; {trigger_bit}{warn}"
+        return f"{base}{warn}"

@@ -323,6 +323,7 @@ class VectorApp:
         self.media_timeline = MediaTimeline()
         self.event_engine = EventEngine()
         self._events_last_position_ms: int | None = None
+        self._events_last_due_at: float | None = None
         self.orchestrator = SessionOrchestrator(self._set_startup_status)
         self.restim = ReStimWebSocketClient(self._set_restim_status)
         self.prostate_restim = ReStimWebSocketClient(self._set_prostate_status)
@@ -339,7 +340,9 @@ class VectorApp:
         self._four_phase_live_lock = threading.Lock()
         self._four_phase_live_output = (
             (0.5, 0.5, 0.5, 0.5), "ABCD", "ABCD", 0.0, "stable")
-        self.listener = MFPListener(self.engine.receive_l0, self._set_mfp_status, self._on_mfp_command)
+        self.listener = MFPListener(
+            self.engine.receive_l0, self._set_mfp_status, self._on_mfp_command,
+            on_evt=self._on_evt_trigger)
         self.xinput = XInputController(self._xinput_buttons_threaded, self._xinput_status_threaded)
         self.sections = {}
         self._first_run = self._load_settings()
@@ -554,8 +557,14 @@ class VectorApp:
                                           pady=(4, 0))
         ttk.Label(events_frame, text=(
             "Plays funscript-tools .events.yml on the delayed media timeline (T0/T1) "
-            "after the media volume ramp. Axes: volume, volume-prostate, "
-            "pulse_frequency, pulse_width, frequency, alpha, beta, e1–e4. "
+            "after the media volume ramp, and/or live EVT triggers on the same "
+            "MFP TCP/UDP port (schedule = receive + look-ahead; no T0 needed). "
+            "For Journey/Fap-Hero leave the events file empty and keep definitions loaded. "
+            "Axes: volume, volume-prostate, "
+            "pulse_frequency, pulse_width, frequency, alpha, beta, e1–e4, "
+            "sensor_suppression (S1). While enabled, S1 defaults to 0% "
+            "(sensors active, or authored S1 if routed); edge mutes to 50%, "
+            "cum/ruin to 100%. "
             "3P defs (alpha/beta) and 4P defs (e1–e4) require the matching ReStim mode. "
             "Do not also bake the same events offline into authored funscripts (double apply)."),
             foreground="#555", wraplength=900).grid(
@@ -988,6 +997,14 @@ class VectorApp:
         self.axis_router.receive(command, received_at)
         self.media_timeline.receive(command, received_at)
 
+    def _on_evt_trigger(self, trigger, received_at: float) -> None:
+        """Schedule a live EVT onto the same look-ahead clock as L0 samples."""
+        if not self.events_enabled.get():
+            return
+        activate_at = received_at + float(self.engine.lookahead_seconds)
+        self.event_engine.schedule_trigger(
+            trigger.name, dict(trigger.params), activate_at)
+
     def _configure_media_timeline(self) -> None:
         self.media_timeline.configure(
             self.timeline_position_axis.get().strip() or "T0",
@@ -1007,6 +1024,8 @@ class VectorApp:
 
 
     def _on_events_enabled_changed(self) -> None:
+        if not self.events_enabled.get():
+            self.event_engine.clear_triggers()
         self._save_settings()
         self._update_events_status()
 
@@ -1050,7 +1069,8 @@ class VectorApp:
         if position_ms is None:
             position_ms = self._events_last_position_ms
         self.events_status.set(self.event_engine.status_line(
-            position_ms, enabled=bool(self.events_enabled.get())))
+            position_ms, enabled=bool(self.events_enabled.get()),
+            due_at=self._events_last_due_at))
 
     def _apply_events_to_sample(
             self, at_time: float, primary_volume: float,
@@ -1060,18 +1080,18 @@ class VectorApp:
             authored_overrides: dict[str, float]
             ) -> tuple[float, float, float, float, float, float, float,
                        tuple[float, float, float, float], dict[str, float]]:
-        """Apply live events at send-time media position (*at_time* = sample.due_at)."""
+        """Apply file events (T0) and/or scheduled EVT triggers at sample.due_at."""
         unchanged = (primary_volume, prostate_volume, frequency, pulse_frequency,
                      pulse_width, alpha, beta, electrodes, authored_overrides)
         if not self.events_enabled.get():
             self._events_last_position_ms = None
+            self._events_last_due_at = None
             return unchanged
         self._configure_media_timeline()
         state = self.media_timeline.snapshot(at_time)
         position_ms = state.position_ms
         self._events_last_position_ms = position_ms
-        if position_ms is None:
-            return unchanged
+        self._events_last_due_at = at_time
         values = {
             "volume": authored_overrides.get("V0", primary_volume),
             "volume-prostate": prostate_volume,
@@ -1084,8 +1104,12 @@ class VectorApp:
             "e2": authored_overrides.get("E2", electrodes[1]),
             "e3": authored_overrides.get("E3", electrodes[2]),
             "e4": authored_overrides.get("E4", electrodes[3]),
+            # Authored S1 when routed; otherwise sensors fully active while events are on.
+            "sensor_suppression": authored_overrides.get("S1", 0.0),
         }
-        result = self.event_engine.apply(position_ms, values)
+        if self.event_engine.step_count and position_ms is not None:
+            values = self.event_engine.apply(position_ms, values)
+        result = self.event_engine.apply_triggers(at_time, values)
         primary_volume = result["volume"]
         prostate_volume = result["volume-prostate"]
         frequency = result["frequency"]
@@ -1094,11 +1118,12 @@ class VectorApp:
         alpha = result["alpha"]
         beta = result["beta"]
         electrodes = (result["e1"], result["e2"], result["e3"], result["e4"])
-        if any(key in authored_overrides for key in AXIS_AUTHORED.values()):
-            authored_overrides = dict(authored_overrides)
-            for axis, key in AXIS_AUTHORED.items():
-                if key in authored_overrides:
-                    authored_overrides[key] = result[axis]
+        authored_overrides = dict(authored_overrides)
+        for axis, key in AXIS_AUTHORED.items():
+            if key in authored_overrides:
+                authored_overrides[key] = result[axis]
+        # Always emit S1 while events are active (baseline or event override).
+        authored_overrides["S1"] = result["sensor_suppression"]
         return (primary_volume, prostate_volume, frequency, pulse_frequency,
                 pulse_width, alpha, beta, electrodes, authored_overrides)
 
@@ -1107,7 +1132,7 @@ class VectorApp:
             return None
         self._configure_media_timeline()
         state = self.media_timeline.snapshot(calculated_at)
-        # Use held progress between sparse T0 packets; floor only when unusable.
+        # Use held progress between quiet T0 packets; floor only when unusable.
         return media_volume_gain(
             state.progress,
             self.media_volume_ramp_floor.get(),
@@ -1315,6 +1340,7 @@ class VectorApp:
             "P0": "Pulse frequency", "P1": "Pulse width", "P3": "Pulse rise time",
             "E1": "Electrode A", "E2": "Electrode B", "E3": "Electrode C", "E4": "Electrode D",
             "V1": "Additional volume axis",
+            "S1": "Sensor suppression",
             "T0": "Media absolute position (clock)", "T1": "Media absolute duration (clock)",
         }
 

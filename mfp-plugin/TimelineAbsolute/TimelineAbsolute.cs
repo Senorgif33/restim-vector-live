@@ -12,6 +12,7 @@ using NLog;
 public class TimelineAbsolute : PluginBase
 {
     public const double TimelineScaleSeconds = 10000.0;
+    public const int RequiredOutputPrecision = 5;
     // Values larger than this are treated as milliseconds (common player quirk).
     private const double AssumeMillisecondsAboveSeconds = 12.0 * 3600.0;
 
@@ -56,6 +57,11 @@ public class TimelineAbsolute : PluginBase
         ConfigureTimelineAxes();
         RefreshDurationFromProperty();
         PublishAxes();
+
+        Logger.Info(
+            "Timeline Absolute: set MFP Device Output precision to {0} for sub-second T0/T1 (0.1 s steps at scale {1}).",
+            RequiredOutputPrecision,
+            TimelineScaleSeconds);
 
         // Poll duration only. Position must come from MediaPositionChangedMessage —
         // Media::Position can lag/stick and was overwriting live T0 updates.

@@ -3,7 +3,9 @@ import unittest
 
 from vector1a.engine import VectorEngine
 from vector1a.motion import MotionCalculator, MotionMode, MotionParameters, SegmentState
-from vector1a.tcode import format_command, parse_command, parse_message
+from vector1a.tcode import (
+    format_command, is_evt_line, parse_command, parse_evt_line, parse_message,
+)
 
 
 class TCodeTests(unittest.TestCase):
@@ -12,6 +14,30 @@ class TCodeTests(unittest.TestCase):
         self.assertEqual((cmd.axis, cmd.value, cmd.interval_ms), ("L0", 0.75, 200))
         self.assertEqual(format_command("V0", 0.2), "V02000")
         self.assertEqual(len(parse_message("L05000 L17500\nV02000")), 3)
+
+    def test_five_digit_timeline_wire_parse(self):
+        cmd = parse_command("T001253")
+        self.assertEqual(cmd.axis, "T0")
+        self.assertAlmostEqual(cmd.value, 0.01253)
+        self.assertAlmostEqual(cmd.value * 10000.0, 125.3, places=1)
+        self.assertEqual(parse_message("T001253 T050000"), [cmd, parse_command("T050000")])
+
+    def test_evt_line_parse_name_and_params(self):
+        trigger = parse_evt_line(
+            "EVT name=edge duration_ms=18321 volume_boost=0.15 ramp_up_ms=500")
+        self.assertEqual(trigger.name, "edge")
+        self.assertEqual(trigger.params["duration_ms"], 18321)
+        self.assertAlmostEqual(trigger.params["volume_boost"], 0.15)
+        self.assertEqual(trigger.params["ramp_up_ms"], 500)
+        self.assertTrue(is_evt_line("evt name=fast"))
+        self.assertFalse(is_evt_line("L05000"))
+        self.assertEqual(parse_message("EVT name=edge duration_ms=10"), [])
+
+    def test_evt_line_requires_name(self):
+        with self.assertRaises(ValueError):
+            parse_evt_line("EVT duration_ms=100")
+        with self.assertRaises(ValueError):
+            parse_evt_line("EVT name=")
 
 
 class MotionTests(unittest.TestCase):

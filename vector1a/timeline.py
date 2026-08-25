@@ -9,12 +9,14 @@ from .routing import AxisSegment
 from .tcode import TCodeCommand
 
 TIMELINE_SCALE_SECONDS = 10000.0
-# 4-digit T-code at this scale only changes ~once per media second; keep a
-# wider live window so quiet T0 packets are not treated as stream loss.
-TIMELINE_FRESHNESS_SECONDS = 3.0
+# Timeline axes use 5-digit T-code on the MFP device (Output precision = 5).
+# At this scale that yields ~0.1 s position steps; allow ~1 s without a new
+# packet before treating T0 as stale, then briefly hold for the volume ramp.
+TIMELINE_TCODE_DIGITS = 5
+TIMELINE_FRESHNESS_SECONDS = 1.0
 # After freshness expires, continue reporting last position/progress briefly
 # instead of slamming the media volume ramp to floor.
-TIMELINE_HOLD_SECONDS = 5.0
+TIMELINE_HOLD_SECONDS = 2.0
 RAMP_CURVE_NAMES = (
     "Linear",
     "Exponential",
