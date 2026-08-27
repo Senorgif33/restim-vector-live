@@ -67,16 +67,23 @@ class MotionCalculator:
         return 0.5 * scale
 
     def _direction_for(self, segment: SegmentState, probability: float) -> int:
-        if segment.sequence not in self._segment_directions:
-            if self._random.random() < min(1.0, max(0.0, probability)):
-                self._direction *= -1
-            self._segment_directions[segment.sequence] = self._direction
-            # Bound memory without affecting current/recent segments.
-            if len(self._segment_directions) > 512:
-                oldest = sorted(self._segment_directions)[:-256]
-                for key in oldest:
-                    del self._segment_directions[key]
-        return self._segment_directions[segment.sequence]
+        cached = self._segment_directions.get(segment.sequence)
+        if cached is not None:
+            return cached
+        if self._random.random() < min(1.0, max(0.0, probability)):
+            self._direction *= -1
+        direction = self._direction
+        self._segment_directions[segment.sequence] = direction
+        # Bound memory without dropping the key we just inserted. Completed
+        # strokes use small sequence ids; live Restim-original strokes use
+        # 1e9+ ids, so a naive "delete oldest" prune would KeyError immediately.
+        if len(self._segment_directions) > 512:
+            oldest = sorted(
+                key for key in self._segment_directions if key != segment.sequence
+            )[:-255]
+            for key in oldest:
+                del self._segment_directions[key]
+        return direction
 
     @staticmethod
     def _rotate_about_center(alpha: float, beta: float,

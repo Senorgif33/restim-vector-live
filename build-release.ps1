@@ -8,6 +8,7 @@ if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 $files = @(
     "vector1a",
+    "restim_tcode_proxy",
     "tests",
     "mfp-plugin",
     "README.md",
@@ -17,6 +18,7 @@ $files = @(
     "SECURITY.md",
     "pyproject.toml",
     "start-vector1a.bat",
+    "start-tcode-proxy.bat",
     "build-release.ps1",
     "build-release.bat"
 )

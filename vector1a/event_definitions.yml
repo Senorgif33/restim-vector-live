@@ -837,7 +837,48 @@ definitions:
           end_value: $volume_boost
           duration_ms: $duration_ms
           ramp_in_ms: $ramp_ms
-          mode: additive          
+          mode: additive
+
+  # === GOOD BOY ===
+  # SC ~goodBoy: pulse 27 Hz / width 0.5 for 5s (sibling of ~submit)
+
+  mcb_goodboy:
+    default_params:
+      duration_ms: 5000
+      pulse_rate: 27           # 27 Hz in SC
+      pulse_width: 50          # 0.5 in SC = 50%
+      ramp_ms: 250
+      volume_boost: 0.01
+
+    steps:
+      - operation: apply_linear_change
+        axis: pulse_frequency
+        params:
+          start_value: $pulse_rate
+          end_value: $pulse_rate
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_ms
+          ramp_out_ms: $ramp_ms
+          mode: overwrite
+
+      - operation: apply_linear_change
+        axis: pulse_width
+        params:
+          start_value: $pulse_width
+          end_value: $pulse_width
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_ms
+          ramp_out_ms: $ramp_ms
+          mode: overwrite
+
+      - operation: apply_linear_change
+        axis: volume,volume-prostate
+        params:
+          start_value: $volume_boost
+          end_value: $volume_boost
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_ms
+          mode: additive
 
   # === EDGE EFFECT ===
   # Sinusoidal volume modulation with high pulse frequency
@@ -959,6 +1000,335 @@ definitions:
           ramp_in_ms: $ramp_ms
           ramp_out_ms: $ramp_ms
           mode: overwrite
+
+  # === ORGASM COUNTDOWN (base stroke untouched) ===
+  # Ch3 finale pulse/amp/goodBoy only — leaves α/β/e1–e4 alone so the source
+  # stroke keeps playing. Place on "5"; orgasm cue at +21s.
+  # SC pulse 160 Hz → clamped to tool max 120. Amp ladder ≈ amp(n)/100 additive.
+  # Stretching duration_ms: lead-in + fade stay fixed; climax (seg_orgasm) grows;
+  # goodBoy scales with climax (min 5000 ms; grows as 5000 × seg_orgasm / 25867).
+
+  mcb_orgasm_countdown:
+    default_params:
+      duration_ms: 46867
+      pulse_rate: 120          # SC edgeCE 160 Hz; tool max 120
+      ramp_ms: 1500
+      # Volume ladder (amp 6→5→7→6→8→9) as additive boosts ≈ amp/100
+      amp6: 0.06
+      amp5: 0.05
+      amp7: 0.07
+      amp8: 0.08
+      amp9: 0.09
+      # Segment lengths between countdown cues
+      seg_5_ms: 4400           # "5" → "4"
+      seg_4_ms: 5000           # "4" → "3"
+      seg_3_ms: 4000           # "3" → "2"
+      seg_2_ms: 3167           # "2" → "1"
+      seg_1_ms: 4433           # "1" → orgasm enable
+      seg_orgasm_ms: 25867     # orgasm enable → fade
+      goodboy_offset_ms: 16567
+      goodboy_duration_ms: 5000
+      goodboy_pulse_rate: 27
+      goodboy_pulse_width: 50
+      goodboy_volume_boost: 0.01
+      orgasm_offset_ms: 21000
+
+    steps:
+      - operation: apply_linear_change
+        axis: pulse_frequency
+        params:
+          start_value: $pulse_rate
+          end_value: $pulse_rate
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_ms
+          ramp_out_ms: $ramp_ms
+          mode: overwrite
+
+      # amp(6) at "5"
+      - operation: apply_linear_change
+        axis: volume,volume-prostate
+        start_offset: 0
+        params:
+          start_value: $amp6
+          end_value: $amp6
+          duration_ms: $seg_5_ms
+          ramp_in_ms: $ramp_ms
+          ramp_out_ms: 0
+          mode: additive
+
+      # amp(5) at "4"
+      - operation: apply_linear_change
+        axis: volume,volume-prostate
+        start_offset: 4400
+        params:
+          start_value: $amp5
+          end_value: $amp5
+          duration_ms: $seg_4_ms
+          ramp_in_ms: 0
+          ramp_out_ms: 0
+          mode: additive
+
+      # amp(7) at "3"
+      - operation: apply_linear_change
+        axis: volume,volume-prostate
+        start_offset: 9400
+        params:
+          start_value: $amp7
+          end_value: $amp7
+          duration_ms: $seg_3_ms
+          ramp_in_ms: 0
+          ramp_out_ms: 0
+          mode: additive
+
+      # amp(6) at "2"
+      - operation: apply_linear_change
+        axis: volume,volume-prostate
+        start_offset: 13400
+        params:
+          start_value: $amp6
+          end_value: $amp6
+          duration_ms: $seg_2_ms
+          ramp_in_ms: 0
+          ramp_out_ms: 0
+          mode: additive
+
+      # amp(8) at "1"
+      - operation: apply_linear_change
+        axis: volume,volume-prostate
+        start_offset: 16567
+        params:
+          start_value: $amp8
+          end_value: $amp8
+          duration_ms: $seg_1_ms
+          ramp_in_ms: 0
+          ramp_out_ms: 0
+          mode: additive
+
+      # amp(9) orgasm enable → fade
+      - operation: apply_linear_change
+        axis: volume,volume-prostate
+        start_offset: $orgasm_offset_ms
+        params:
+          start_value: $amp9
+          end_value: $amp9
+          duration_ms: $seg_orgasm_ms
+          ramp_in_ms: 0
+          ramp_out_ms: $ramp_ms
+          mode: additive
+
+      # Inlined goodBoy on "1" (temporarily overrides edge pulse)
+      - operation: apply_linear_change
+        axis: pulse_frequency
+        start_offset: $goodboy_offset_ms
+        params:
+          start_value: $goodboy_pulse_rate
+          end_value: $goodboy_pulse_rate
+          duration_ms: $goodboy_duration_ms
+          ramp_in_ms: 250
+          ramp_out_ms: 250
+          mode: overwrite
+
+      - operation: apply_linear_change
+        axis: pulse_width
+        start_offset: $goodboy_offset_ms
+        params:
+          start_value: $goodboy_pulse_width
+          end_value: $goodboy_pulse_width
+          duration_ms: $goodboy_duration_ms
+          ramp_in_ms: 250
+          ramp_out_ms: 250
+          mode: overwrite
+
+      - operation: apply_linear_change
+        axis: volume,volume-prostate
+        start_offset: $goodboy_offset_ms
+        params:
+          start_value: $goodboy_volume_boost
+          end_value: $goodboy_volume_boost
+          duration_ms: $goodboy_duration_ms
+          ramp_in_ms: 250
+          mode: additive
+
+  # === ORGASM COUNTDOWN (STROKE OVERRIDE) ===
+  # Same as mcb_orgasm_countdown, plus overwrite α/β/e1–e4 with edgeCE motion.
+  # Same stretch rules as mcb_orgasm_countdown.
+
+  mcb_orgasm_countdown_stroke_override:
+    default_params:
+      duration_ms: 46867
+      pulse_rate: 120          # SC edgeCE 160 Hz; tool max 120
+      alpha_freq: 7
+      # Overwrite needs absolute center: peak=max_level, center=max_level-amplitude
+      alpha_amplitude: 0.45
+      alpha_max_level: 0.95    # center 0.50
+      beta_freq: 4
+      beta_amplitude: 0.4
+      beta_max_level: 0.9
+      beta_phase: 90
+      ramp_ms: 1500
+      amp6: 0.06
+      amp5: 0.05
+      amp7: 0.07
+      amp8: 0.08
+      amp9: 0.09
+      seg_5_ms: 4400
+      seg_4_ms: 5000
+      seg_3_ms: 4000
+      seg_2_ms: 3167
+      seg_1_ms: 4433
+      seg_orgasm_ms: 25867
+      goodboy_offset_ms: 16567
+      goodboy_duration_ms: 5000
+      goodboy_pulse_rate: 27
+      goodboy_pulse_width: 50
+      goodboy_volume_boost: 0.01
+      orgasm_offset_ms: 21000
+
+    steps:
+      - operation: apply_linear_change
+        axis: pulse_frequency
+        params:
+          start_value: $pulse_rate
+          end_value: $pulse_rate
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_ms
+          ramp_out_ms: $ramp_ms
+          mode: overwrite
+
+      - operation: apply_modulation
+        axis: alpha
+        params:
+          waveform: sin
+          frequency: $alpha_freq
+          amplitude: $alpha_amplitude
+          max_level_offset: $alpha_max_level
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_ms
+          ramp_out_ms: $ramp_ms
+          mode: overwrite
+
+      - operation: apply_modulation
+        axis: beta
+        params:
+          waveform: sin
+          frequency: $beta_freq
+          amplitude: $beta_amplitude
+          max_level_offset: $beta_max_level
+          phase: $beta_phase
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_ms
+          ramp_out_ms: $ramp_ms
+          mode: overwrite
+
+      - operation: apply_modulation
+        axis: e1,e2,e3,e4
+        params:
+          waveform: sin
+          frequency: $alpha_freq
+          amplitude: $alpha_amplitude
+          max_level_offset: $alpha_max_level
+          duration_ms: $duration_ms
+          ramp_in_ms: $ramp_ms
+          ramp_out_ms: $ramp_ms
+          mode: overwrite
+
+      - operation: apply_linear_change
+        axis: volume,volume-prostate
+        start_offset: 0
+        params:
+          start_value: $amp6
+          end_value: $amp6
+          duration_ms: $seg_5_ms
+          ramp_in_ms: $ramp_ms
+          ramp_out_ms: 0
+          mode: additive
+
+      - operation: apply_linear_change
+        axis: volume,volume-prostate
+        start_offset: 4400
+        params:
+          start_value: $amp5
+          end_value: $amp5
+          duration_ms: $seg_4_ms
+          ramp_in_ms: 0
+          ramp_out_ms: 0
+          mode: additive
+
+      - operation: apply_linear_change
+        axis: volume,volume-prostate
+        start_offset: 9400
+        params:
+          start_value: $amp7
+          end_value: $amp7
+          duration_ms: $seg_3_ms
+          ramp_in_ms: 0
+          ramp_out_ms: 0
+          mode: additive
+
+      - operation: apply_linear_change
+        axis: volume,volume-prostate
+        start_offset: 13400
+        params:
+          start_value: $amp6
+          end_value: $amp6
+          duration_ms: $seg_2_ms
+          ramp_in_ms: 0
+          ramp_out_ms: 0
+          mode: additive
+
+      - operation: apply_linear_change
+        axis: volume,volume-prostate
+        start_offset: 16567
+        params:
+          start_value: $amp8
+          end_value: $amp8
+          duration_ms: $seg_1_ms
+          ramp_in_ms: 0
+          ramp_out_ms: 0
+          mode: additive
+
+      - operation: apply_linear_change
+        axis: volume,volume-prostate
+        start_offset: $orgasm_offset_ms
+        params:
+          start_value: $amp9
+          end_value: $amp9
+          duration_ms: $seg_orgasm_ms
+          ramp_in_ms: 0
+          ramp_out_ms: $ramp_ms
+          mode: additive
+
+      - operation: apply_linear_change
+        axis: pulse_frequency
+        start_offset: $goodboy_offset_ms
+        params:
+          start_value: $goodboy_pulse_rate
+          end_value: $goodboy_pulse_rate
+          duration_ms: $goodboy_duration_ms
+          ramp_in_ms: 250
+          ramp_out_ms: 250
+          mode: overwrite
+
+      - operation: apply_linear_change
+        axis: pulse_width
+        start_offset: $goodboy_offset_ms
+        params:
+          start_value: $goodboy_pulse_width
+          end_value: $goodboy_pulse_width
+          duration_ms: $goodboy_duration_ms
+          ramp_in_ms: 250
+          ramp_out_ms: 250
+          mode: overwrite
+
+      - operation: apply_linear_change
+        axis: volume,volume-prostate
+        start_offset: $goodboy_offset_ms
+        params:
+          start_value: $goodboy_volume_boost
+          end_value: $goodboy_volume_boost
+          duration_ms: $goodboy_duration_ms
+          ramp_in_ms: 250
+          mode: additive
 
   # === OBEY EFFECT ===
   # Dual sinusoidal modulation with moderate pulse frequency

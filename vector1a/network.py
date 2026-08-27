@@ -85,6 +85,10 @@ class MFPListener:
             except OSError as exc:
                 if self._run.is_set():
                     self.status(f"MFP {transport.upper()} recovering: {exc}")
+            except Exception as exc:
+                # Never let a packet-handler bug kill the listen thread.
+                if self._run.is_set():
+                    self.status(f"MFP {transport.upper()} recovering: {exc}")
             finally:
                 self._transport_live[transport] = False
             if self._run.is_set():
@@ -144,9 +148,17 @@ class MFPListener:
                         if not data: break
                         buffer += data.decode("ascii", errors="ignore")
                         while "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1); self._handle(line, "tcp")
+                            line, buffer = buffer.split("\n", 1)
+                            try:
+                                self._handle(line, "tcp")
+                            except Exception as exc:
+                                self.status(f"MFP TCP packet error: {exc}")
                         if " " in buffer:
-                            tokens = buffer.split(" "); buffer = tokens.pop(); self._handle(" ".join(tokens), "tcp")
+                            tokens = buffer.split(" "); buffer = tokens.pop()
+                            try:
+                                self._handle(" ".join(tokens), "tcp")
+                            except Exception as exc:
+                                self.status(f"MFP TCP packet error: {exc}")
         finally:
             self._track(server, False); server.close()
 
@@ -158,14 +170,19 @@ class MFPListener:
             while self._run.is_set():
                 try: data, _ = udp.recvfrom(65535)
                 except socket.timeout: continue
-                self._handle(data.decode("ascii", errors="ignore"), "udp")
+                try:
+                    self._handle(data.decode("ascii", errors="ignore"), "udp")
+                except Exception as exc:
+                    self.status(f"MFP UDP packet error: {exc}")
         finally:
             self._track(udp, False); udp.close()
 
 
 class _ReconnectClient:
-    def __init__(self, status: Callable[[str], None]) -> None:
+    def __init__(self, status: Callable[[str], None],
+                 on_send: Callable[[str], None] | None = None) -> None:
         self.status, self._socket = status, None
+        self.on_send = on_send
         self._lock = threading.Lock()
         self._target: tuple[str, int] | None = None
         self._retry_at = 0.0
@@ -174,6 +191,15 @@ class _ReconnectClient:
         self._monitor = threading.Thread(target=self._monitor_connection,
                                          name="restim-reconnect", daemon=True)
         self._monitor.start()
+
+    def _emit_send(self, message: str) -> None:
+        callback = self.on_send
+        if callback is None:
+            return
+        try:
+            callback(message)
+        except Exception:
+            pass
 
     @property
     def connected(self) -> bool: return self._socket is not None

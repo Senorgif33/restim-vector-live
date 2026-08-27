@@ -6,7 +6,7 @@ ordinary positional `L0` stream, Vector remains the deterministic motion generat
 MFP supplies a clearly authored ReStim axis set, Vector can automatically pass those axes
 through on the same delayed timeline and generate only the missing axes.
 
-Current development build: **1.6.0-alpha51**.
+Current development build: **1.6.0-alpha52**.
 
 > [!CAUTION]
 > Commission with ReStim's graphical display and stimulation hardware
@@ -59,7 +59,15 @@ second after they begin.
   packets do not flicker to “none” or slam gain to the floor. Optional **Media volume ramp** scales primary and
   prostate volume by media percent between a floor and ceiling using Linear,
   Exponential, Logarithmic, Smoothstep, Smootherstep, Power2, Late Kick or
-  Plateau Rise curves. Optional **Custom
+  Plateau Rise curves. Optional **extra time waypoints** target Floor 1–3 /
+  Ceiling 1–3 at absolute media times (`h:mm:ss` / `m:ss`); after the last
+  waypoint, gain holds for the rest of the file, and levels may rise or fall
+  between points. Each waypoint can use its own curve for the segment arriving
+  at that point (global Curve is simple-mode and the default for new points).
+  Floor 2/3 and Ceiling 2/3 gain controls appear when a
+  waypoint uses that level. Waypoints import/export as Vector JSON or as an OFS
+  volume `.funscript` (dense baked actions for playback, bookmarks at Floor/Ceiling
+  points, plus `vector1a_media_ramp` metadata so the curve editor round-trips). Optional **Custom
   events** play funscript-tools `.events.yml` files after the volume ramp for
   `volume`, `volume-prostate`, `pulse_frequency`, `pulse_width`, `frequency`,
   `alpha`, `beta`, `e1`–`e4`, and `sensor_suppression` (Restim `S1`). While

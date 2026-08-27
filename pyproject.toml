@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vector1a"
-version = "1.6.0a51"
+version = "1.6.0a52"
 description = "Live MultiFunPlayer L0 to dual-ReStim motion bridge"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,6 +13,7 @@ dependencies = []
 
 [project.scripts]
 vector1a = "vector1a.app:main"
+restim-tcode-proxy = "restim_tcode_proxy.app:main"
 
 [tool.setuptools.packages.find]
-include = ["vector1a*"]
+include = ["vector1a*", "restim_tcode_proxy*"]

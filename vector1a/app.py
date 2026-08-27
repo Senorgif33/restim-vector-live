@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tkinter as tk
 import time
 import queue
@@ -16,8 +17,16 @@ from .network import MFPListener, ReStimWebSocketClient
 from .routing import AuthoredAxisRouter
 from .orchestration import SessionOrchestrator, port_is_open, wait_for_port
 from .settings import load_settings, save_settings, settings_path
-from .timeline import (RAMP_CURVE_NAMES, TIMELINE_SCALE_SECONDS, MediaTimeline,
-                       decode_timeline_seconds, media_volume_gain, ramp_curve)
+from .timeline import (EXTRA_RAMP_LEVEL_KEYS, RAMP_CURVE_NAMES, RAMP_LEVEL_LABELS,
+                       TIMELINE_HOLD_SECONDS, TIMELINE_SCALE_SECONDS,
+                       MediaTimeline, RampWaypoint,
+                       decode_timeline_seconds, export_ramp_funscript,
+                       export_ramp_waypoints_payload, format_media_time,
+                       import_ramp_funscript, import_ramp_waypoints_payload,
+                       media_volume_gain, media_volume_gain_waypoints,
+                       normalize_curve_name, normalize_level_key,
+                       normalize_waypoints, parse_media_time, ramp_curve,
+                       waypoint_levels_used)
 from .controller import (A, B, X, Y, START, LEFT_SHOULDER, RIGHT_SHOULDER, DPAD_UP, DPAD_DOWN,
                          DPAD_LEFT, DPAD_RIGHT, XInputController)
 from .variety import fit_range_for_travel, rolling_offset, rolling_value
@@ -140,7 +149,10 @@ class VectorApp:
         "variety_pulse_rise", "variety_pulse_width", "variety_phase",
         "timeline_position_axis", "timeline_duration_axis", "timeline_scale_seconds",
         "media_volume_ramp_enabled", "media_volume_ramp_floor",
-        "media_volume_ramp_ceiling", "media_volume_ramp_curve",
+        "media_volume_ramp_floor2", "media_volume_ramp_floor3",
+        "media_volume_ramp_ceiling", "media_volume_ramp_ceiling2",
+        "media_volume_ramp_ceiling3", "media_volume_ramp_curve",
+        "media_volume_ramp_waypoints_enabled",
         "events_enabled", "events_file_path", "events_definitions_path",
     )
 
@@ -179,9 +191,16 @@ class VectorApp:
         self.timeline_duration_axis = tk.StringVar(value="T1")
         self.timeline_scale_seconds = tk.DoubleVar(value=TIMELINE_SCALE_SECONDS)
         self.media_volume_ramp_enabled = tk.BooleanVar(value=False)
-        self.media_volume_ramp_floor = tk.DoubleVar(value=0.40)
-        self.media_volume_ramp_ceiling = tk.DoubleVar(value=1.0)
+        self.media_volume_ramp_floor = tk.DoubleVar(value=0.40)  # Floor 1
+        self.media_volume_ramp_floor2 = tk.DoubleVar(value=0.40)
+        self.media_volume_ramp_floor3 = tk.DoubleVar(value=0.40)
+        self.media_volume_ramp_ceiling = tk.DoubleVar(value=1.0)  # Ceiling 1
+        self.media_volume_ramp_ceiling2 = tk.DoubleVar(value=1.0)
+        self.media_volume_ramp_ceiling3 = tk.DoubleVar(value=1.0)
         self.media_volume_ramp_curve = tk.StringVar(value="Linear")
+        self.media_volume_ramp_waypoints_enabled = tk.BooleanVar(value=False)
+        self._media_ramp_waypoints: list[RampWaypoint] = []
+        self._media_ramp_extra_level_widgets: dict[str, list[tk.Widget]] = {}
         self.events_enabled = tk.BooleanVar(value=False)
         self.events_file_path = tk.StringVar(value="")
         self.events_definitions_path = tk.StringVar(value="")
@@ -324,6 +343,7 @@ class VectorApp:
         self.event_engine = EventEngine()
         self._events_last_position_ms: int | None = None
         self._events_last_due_at: float | None = None
+        self._events_last_s1: float | None = None
         self.orchestrator = SessionOrchestrator(self._set_startup_status)
         self.restim = ReStimWebSocketClient(self._set_restim_status)
         self.prostate_restim = ReStimWebSocketClient(self._set_prostate_status)
@@ -513,33 +533,97 @@ class VectorApp:
         ttk.Checkbutton(ramp_frame, text="Enable media volume ramp",
                         variable=self.media_volume_ramp_enabled,
                         command=self._save_settings).grid(row=0, column=0, sticky="w")
-        ttk.Label(ramp_frame, text="Floor").grid(row=0, column=1, padx=(18, 4))
+        ttk.Label(ramp_frame, text="Floor 1").grid(row=0, column=1, padx=(18, 4))
         ttk.Spinbox(ramp_frame, from_=0, to=1, increment=.05,
                     textvariable=self.media_volume_ramp_floor, width=8,
-                    command=self._save_settings).grid(row=0, column=2, sticky="w")
-        ttk.Label(ramp_frame, text="Ceiling").grid(row=0, column=3, padx=(18, 4))
+                    command=self._on_media_ramp_levels_changed).grid(
+                        row=0, column=2, sticky="w")
+        ttk.Label(ramp_frame, text="Ceiling 1").grid(row=0, column=3, padx=(18, 4))
         ttk.Spinbox(ramp_frame, from_=0, to=1, increment=.05,
                     textvariable=self.media_volume_ramp_ceiling, width=8,
-                    command=self._save_settings).grid(row=0, column=4, sticky="w")
+                    command=self._on_media_ramp_levels_changed).grid(
+                        row=0, column=4, sticky="w")
         ttk.Label(ramp_frame, text="Curve").grid(row=0, column=5, padx=(18, 4))
         ramp_curve_box = ttk.Combobox(ramp_frame, textvariable=self.media_volume_ramp_curve,
                      values=RAMP_CURVE_NAMES, state="readonly", width=14)
         ramp_curve_box.grid(row=0, column=6, sticky="w")
         ramp_curve_box.bind("<<ComboboxSelected>>", self._on_media_ramp_curve_selected)
         self.media_ramp_curve_preview = tk.Canvas(
-            ramp_frame, width=108, height=40, highlightthickness=1,
+            ramp_frame, width=280, height=96, highlightthickness=1,
             highlightbackground="#bbb", background="#f7f7f7")
-        self.media_ramp_curve_preview.grid(row=0, column=7, sticky="w", padx=(12, 0))
-        self._redraw_media_ramp_curve_preview()
+        self.media_ramp_curve_preview.grid(row=0, column=7, rowspan=3, sticky="nw",
+                                           padx=(12, 0))
+
+        ttk.Checkbutton(
+            ramp_frame, text="Use extra time waypoints",
+            variable=self.media_volume_ramp_waypoints_enabled,
+            command=self._on_media_ramp_waypoints_toggled).grid(
+                row=1, column=0, sticky="w", pady=(4, 0))
+
+        extra_levels = (
+            ("floor2", "Floor 2", self.media_volume_ramp_floor2, 1, 1),
+            ("floor3", "Floor 3", self.media_volume_ramp_floor3, 1, 3),
+            ("ceiling2", "Ceiling 2", self.media_volume_ramp_ceiling2, 1, 5),
+            ("ceiling3", "Ceiling 3", self.media_volume_ramp_ceiling3, 2, 1),
+        )
+        self._media_ramp_extra_level_widgets = {}
+        for key, label_text, variable, row, col in extra_levels:
+            label = ttk.Label(ramp_frame, text=label_text)
+            label.grid(row=row, column=col, padx=(18, 4), pady=(4, 0))
+            spin = ttk.Spinbox(
+                ramp_frame, from_=0, to=1, increment=.05,
+                textvariable=variable, width=8,
+                command=self._on_media_ramp_levels_changed)
+            spin.grid(row=row, column=col + 1, sticky="w", pady=(4, 0))
+            self._media_ramp_extra_level_widgets[key] = [label, spin]
+
+        waypoint_box = ttk.Frame(ramp_frame)
+        waypoint_box.grid(row=3, column=0, columnspan=8, sticky="we", pady=(6, 0))
+        self.media_ramp_waypoint_tree = ttk.Treeview(
+            waypoint_box, columns=("time", "level", "curve"), show="headings", height=4)
+        self.media_ramp_waypoint_tree.heading("time", text="Time")
+        self.media_ramp_waypoint_tree.heading("level", text="Level")
+        self.media_ramp_waypoint_tree.heading("curve", text="Curve")
+        self.media_ramp_waypoint_tree.column("time", width=80, anchor="w")
+        self.media_ramp_waypoint_tree.column("level", width=90, anchor="w")
+        self.media_ramp_waypoint_tree.column("curve", width=110, anchor="w")
+        self.media_ramp_waypoint_tree.pack(side="left", fill="x", expand=True)
+        wp_buttons = ttk.Frame(waypoint_box)
+        wp_buttons.pack(side="left", padx=(8, 0))
+        ttk.Button(wp_buttons, text="Add…",
+                   command=self._add_media_ramp_waypoint).pack(fill="x", pady=1)
+        ttk.Button(wp_buttons, text="Edit…",
+                   command=self._edit_media_ramp_waypoint).pack(fill="x", pady=1)
+        ttk.Button(wp_buttons, text="Remove",
+                   command=self._remove_media_ramp_waypoint).pack(fill="x", pady=1)
+        ttk.Button(wp_buttons, text="Move up",
+                   command=lambda: self._move_media_ramp_waypoint(-1)).pack(
+                       fill="x", pady=1)
+        ttk.Button(wp_buttons, text="Move down",
+                   command=lambda: self._move_media_ramp_waypoint(1)).pack(
+                       fill="x", pady=1)
+        ttk.Button(wp_buttons, text="Import…",
+                   command=self._import_media_ramp_waypoints).pack(fill="x", pady=1)
+        ttk.Button(wp_buttons, text="Export…",
+                   command=self._export_media_ramp_waypoints).pack(fill="x", pady=1)
+
         ttk.Label(ramp_frame, textvariable=self.media_ramp_status,
-                  foreground="#555").grid(row=1, column=0, columnspan=8, sticky="w",
+                  foreground="#555").grid(row=4, column=0, columnspan=8, sticky="w",
                                           pady=(4, 0))
         ttk.Label(ramp_frame, text=(
-            "Scales primary and prostate volume by media timeline percent "
-            "(T0/T1 from MFP Timeline Absolute). Distinct from motion rest-volume. "
-            "Curve preview shows the selected shape only (progress → gain shaping)."),
+            "Scales primary and prostate volume from Timeline Absolute (T0/T1). "
+            "Simple mode uses Floor 1 → Ceiling 1 over full media progress with the "
+            "global Curve. Extra time waypoints target Floor 1–3 / Ceiling 1–3 at "
+            "absolute media times; each waypoint's Curve shapes the segment arriving "
+            "at that point. After the last waypoint, gain holds. Floor 2/3 and "
+            "Ceiling 2/3 controls appear when used. Import/Export supports Vector JSON "
+            "or OFS volume .funscript (baked actions + bookmarks + re-edit metadata). "
+            "Distinct from motion rest-volume."),
             foreground="#555", wraplength=900).grid(
-                row=2, column=0, columnspan=8, sticky="w", pady=(2, 0))
+                row=5, column=0, columnspan=8, sticky="w", pady=(2, 0))
+        self._refresh_media_ramp_waypoint_tree()
+        self._refresh_extra_level_controls()
+        self._redraw_media_ramp_curve_preview()
 
         events_frame = self._frame("Custom events", 4, 0, 2)
         ttk.Checkbutton(events_frame, text="Enable custom events",
@@ -558,9 +642,16 @@ class VectorApp:
         ttk.Button(events_frame, text="Browse…",
                    command=self._browse_events_definitions).grid(
                        row=1, column=2, sticky="w", pady=(4, 0))
-        ttk.Label(events_frame, textvariable=self.events_status,
-                  foreground="#555").grid(row=2, column=0, columnspan=4, sticky="w",
-                                          pady=(4, 0))
+        status_row = ttk.Frame(events_frame)
+        status_row.grid(row=2, column=0, columnspan=4, sticky="we", pady=(4, 0))
+        self.events_status_text = tk.Text(
+            status_row, height=2, wrap="word", relief="solid", borderwidth=1,
+            font=("TkDefaultFont", 9), background="#f5f5f5")
+        self.events_status_text.pack(side="left", fill="x", expand=True)
+        self.events_status_text.insert("1.0", self.events_status.get())
+        self.events_status_text.configure(state="disabled")
+        ttk.Button(status_row, text="Copy",
+                   command=self._copy_events_status).pack(side="right", padx=(6, 0))
         ttk.Label(events_frame, text=(
             "Plays funscript-tools .events.yml on the delayed media timeline (T0/T1) "
             "after the media volume ramp, and/or live EVT triggers on the same "
@@ -571,6 +662,7 @@ class VectorApp:
             "sensor_suppression (S1). While enabled, S1 defaults to 0% "
             "(sensors active, or authored S1 if routed); edge mutes to 50%, "
             "cum/ruin to 100%. "
+            "Leave Definitions blank to use Vector's bundled defs (includes S1). "
             "3P defs (alpha/beta) and 4P defs (e1–e4) require the matching ReStim mode. "
             "Do not also bake the same events offline into authored funscripts (double apply)."),
             foreground="#555", wraplength=900).grid(
@@ -1065,18 +1157,45 @@ class VectorApp:
             else:
                 self.event_engine.clear()
         except EventError as exc:
-            self.events_status.set(f"Events: error - {exc}")
+            self._set_events_status_text(f"Events: error - {exc}")
             self._save_settings()
             return
         self._save_settings()
         self._update_events_status()
 
+    def _copy_events_status(self) -> None:
+        text = self.events_status.get()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+
+    def _set_events_status_text(self, line: str) -> None:
+        self.events_status.set(line)
+        widget = getattr(self, "events_status_text", None)
+        if widget is None:
+            return
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", line)
+        widget.configure(state="disabled")
+
     def _update_events_status(self, position_ms: int | None = None) -> None:
         if position_ms is None:
             position_ms = self._events_last_position_ms
-        self.events_status.set(self.event_engine.status_line(
+        line = self.event_engine.status_line(
             position_ms, enabled=bool(self.events_enabled.get()),
-            due_at=self._events_last_due_at))
+            due_at=self._events_last_due_at)
+        if self.events_enabled.get():
+            s1_steps = sum(1 for step in self.event_engine.loaded.steps
+                           if step.axis == "sensor_suppression")
+            if self._events_last_s1 is None:
+                line = f"{line} | out S1=--"
+            else:
+                line = f"{line} | out S1={self._events_last_s1 * 100:.0f}%"
+            if s1_steps == 0 and self.event_engine.step_count:
+                line += " | WARN: no sensor_suppression steps loaded"
+            else:
+                line += f" | S1 steps={s1_steps}"
+        self._set_events_status_text(line)
 
     def _apply_events_to_sample(
             self, at_time: float, primary_volume: float,
@@ -1086,15 +1205,27 @@ class VectorApp:
             authored_overrides: dict[str, float]
             ) -> tuple[float, float, float, float, float, float, float,
                        tuple[float, float, float, float], dict[str, float]]:
-        """Apply file events (T0) and/or scheduled EVT triggers at sample.due_at."""
+        """Apply file events (T0) and/or scheduled EVT triggers at sample.due_at.
+
+        File-event media time must stay usable for the full look-ahead window.
+        Snapshotting only at ``due_at`` with the default 2 s T0 hold drops
+        ``position_ms`` (so cum never writes S1=100) while the Events status
+        line — which snapshots ``now`` — still shows the event as active.
+        """
         unchanged = (primary_volume, prostate_volume, frequency, pulse_frequency,
                      pulse_width, alpha, beta, electrodes, authored_overrides)
         if not self.events_enabled.get():
             self._events_last_position_ms = None
             self._events_last_due_at = None
+            self._events_last_s1 = None
             return unchanged
         self._configure_media_timeline()
-        state = self.media_timeline.snapshot(at_time)
+        # Match the Events status clock (send-time / now) and keep T0 held for
+        # at least look-ahead so file steps still apply when packets are sparse.
+        hold = max(TIMELINE_HOLD_SECONDS, float(self.engine.lookahead_seconds) + 1.0)
+        state = self.media_timeline.snapshot(self.engine.clock(), hold_seconds=hold)
+        if state.position_ms is None:
+            state = self.media_timeline.snapshot(at_time, hold_seconds=hold)
         position_ms = state.position_ms
         self._events_last_position_ms = position_ms
         self._events_last_due_at = at_time
@@ -1130,6 +1261,7 @@ class VectorApp:
                 authored_overrides[key] = result[axis]
         # Always emit S1 while events are active (baseline or event override).
         authored_overrides["S1"] = result["sensor_suppression"]
+        self._events_last_s1 = float(result["sensor_suppression"])
         return (primary_volume, prostate_volume, frequency, pulse_frequency,
                 pulse_width, alpha, beta, electrodes, authored_overrides)
 
@@ -1137,23 +1269,305 @@ class VectorApp:
         self._redraw_media_ramp_curve_preview()
         self._save_settings()
 
+    def _on_media_ramp_levels_changed(self) -> None:
+        self._redraw_media_ramp_curve_preview()
+        self._save_settings()
+
+    def _on_media_ramp_waypoints_toggled(self) -> None:
+        if self.media_volume_ramp_waypoints_enabled.get() and not self._media_ramp_waypoints:
+            self._media_ramp_waypoints = [RampWaypoint(
+                0.0, "floor1",
+                normalize_curve_name(self.media_volume_ramp_curve.get()))]
+        self._refresh_media_ramp_waypoint_tree()
+        self._refresh_extra_level_controls()
+        self._redraw_media_ramp_curve_preview()
+        self._save_settings()
+
+    def _refresh_extra_level_controls(self) -> None:
+        """Show Floor 2/3 and Ceiling 2/3 spinboxes only when waypoints use them."""
+        used = waypoint_levels_used(self._media_ramp_waypoints)
+        for key in EXTRA_RAMP_LEVEL_KEYS:
+            widgets = self._media_ramp_extra_level_widgets.get(key, [])
+            if key in used:
+                for widget in widgets:
+                    widget.grid()
+            else:
+                for widget in widgets:
+                    widget.grid_remove()
+
+    def _media_ramp_level_args(self) -> tuple[float, float, float, float, float, float]:
+        return (
+            self.media_volume_ramp_floor.get(),
+            self.media_volume_ramp_ceiling.get(),
+            self.media_volume_ramp_floor2.get(),
+            self.media_volume_ramp_ceiling2.get(),
+            self.media_volume_ramp_floor3.get(),
+            self.media_volume_ramp_ceiling3.get(),
+        )
+
+    def _refresh_media_ramp_waypoint_tree(self) -> None:
+        tree = getattr(self, "media_ramp_waypoint_tree", None)
+        if tree is None:
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+        default_curve = normalize_curve_name(self.media_volume_ramp_curve.get())
+        self._media_ramp_waypoints = normalize_waypoints(
+            self._media_ramp_waypoints, default_curve)
+        for point in self._media_ramp_waypoints:
+            tree.insert(
+                "", "end",
+                values=(format_media_time(point.time_s),
+                        RAMP_LEVEL_LABELS.get(point.level, point.level),
+                        point.curve))
+
+    def _default_add_waypoint_time(self) -> float:
+        if not self._media_ramp_waypoints:
+            return 0.0
+        return self._media_ramp_waypoints[-1].time_s + 60.0
+
+    def _waypoint_dialog(self, title: str, time_s: float, level: str,
+                         curve: str, on_accept) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        ttk.Label(dialog, text="Time (h:mm:ss, m:ss, or seconds)").grid(
+            row=0, column=0, sticky="w", padx=8, pady=6)
+        time_var = tk.StringVar(value=format_media_time(time_s))
+        ttk.Entry(dialog, textvariable=time_var, width=16).grid(
+            row=0, column=1, sticky="w", padx=8, pady=6)
+        ttk.Label(dialog, text="Level").grid(row=1, column=0, sticky="w", padx=8, pady=6)
+        level_labels = list(RAMP_LEVEL_LABELS.values())
+        level_var = tk.StringVar(
+            value=RAMP_LEVEL_LABELS.get(normalize_level_key(level), "Ceiling 1"))
+        ttk.Combobox(dialog, textvariable=level_var, values=level_labels,
+                     state="readonly", width=14).grid(
+                         row=1, column=1, sticky="w", padx=8, pady=6)
+        ttk.Label(dialog, text="Curve (to this point)").grid(
+            row=2, column=0, sticky="w", padx=8, pady=6)
+        curve_var = tk.StringVar(
+            value=normalize_curve_name(curve, self.media_volume_ramp_curve.get()))
+        ttk.Combobox(dialog, textvariable=curve_var, values=list(RAMP_CURVE_NAMES),
+                     state="readonly", width=14).grid(
+                         row=2, column=1, sticky="w", padx=8, pady=6)
+
+        def accept() -> None:
+            try:
+                parsed_time = parse_media_time(time_var.get())
+            except ValueError as exc:
+                messagebox.showerror("Invalid time", str(exc), parent=dialog)
+                return
+            label_to_key = {label: key for key, label in RAMP_LEVEL_LABELS.items()}
+            parsed_level = label_to_key.get(level_var.get(), "ceiling1")
+            parsed_curve = normalize_curve_name(
+                curve_var.get(), self.media_volume_ramp_curve.get())
+            on_accept(parsed_time, parsed_level, parsed_curve)
+            dialog.destroy()
+
+        buttons = ttk.Frame(dialog)
+        buttons.grid(row=3, column=0, columnspan=2, pady=8)
+        ttk.Button(buttons, text="OK", command=accept).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="left", padx=4)
+
+    def _add_media_ramp_waypoint(self) -> None:
+        def accept(time_s: float, level: str, curve: str) -> None:
+            self._media_ramp_waypoints = normalize_waypoints(
+                list(self._media_ramp_waypoints) + [
+                    RampWaypoint(time_s, level, curve)],
+                self.media_volume_ramp_curve.get())
+            if not self.media_volume_ramp_waypoints_enabled.get():
+                self.media_volume_ramp_waypoints_enabled.set(True)
+            self._refresh_media_ramp_waypoint_tree()
+            self._refresh_extra_level_controls()
+            self._redraw_media_ramp_curve_preview()
+            self._save_settings()
+
+        self._waypoint_dialog(
+            "Add media ramp waypoint",
+            self._default_add_waypoint_time(),
+            "ceiling1",
+            self.media_volume_ramp_curve.get(),
+            accept)
+
+    def _edit_media_ramp_waypoint(self) -> None:
+        tree = getattr(self, "media_ramp_waypoint_tree", None)
+        if tree is None:
+            return
+        selected = tree.selection()
+        if len(selected) != 1:
+            messagebox.showinfo(
+                "Edit waypoint", "Select a single waypoint to edit.", parent=self.root)
+            return
+        index = tree.index(selected[0])
+        if not (0 <= index < len(self._media_ramp_waypoints)):
+            return
+        point = self._media_ramp_waypoints[index]
+
+        def accept(time_s: float, level: str, curve: str) -> None:
+            points = list(self._media_ramp_waypoints)
+            points[index] = RampWaypoint(time_s, level, curve)
+            self._media_ramp_waypoints = normalize_waypoints(
+                points, self.media_volume_ramp_curve.get())
+            self._refresh_media_ramp_waypoint_tree()
+            self._refresh_extra_level_controls()
+            self._redraw_media_ramp_curve_preview()
+            self._save_settings()
+
+        self._waypoint_dialog(
+            "Edit media ramp waypoint", point.time_s, point.level, point.curve, accept)
+
+    def _remove_media_ramp_waypoint(self) -> None:
+        tree = getattr(self, "media_ramp_waypoint_tree", None)
+        if tree is None:
+            return
+        selected = tree.selection()
+        if not selected:
+            return
+        indexes = sorted((tree.index(item) for item in selected), reverse=True)
+        points = list(self._media_ramp_waypoints)
+        for index in indexes:
+            if 0 <= index < len(points):
+                points.pop(index)
+        self._media_ramp_waypoints = normalize_waypoints(points)
+        self._refresh_media_ramp_waypoint_tree()
+        self._refresh_extra_level_controls()
+        self._redraw_media_ramp_curve_preview()
+        self._save_settings()
+
+    def _move_media_ramp_waypoint(self, direction: int) -> None:
+        """Swap selected waypoint with neighbor (useful for same-time ties)."""
+        tree = getattr(self, "media_ramp_waypoint_tree", None)
+        if tree is None:
+            return
+        selected = tree.selection()
+        if len(selected) != 1:
+            return
+        index = tree.index(selected[0])
+        points = list(self._media_ramp_waypoints)
+        target = index + int(direction)
+        if not (0 <= index < len(points) and 0 <= target < len(points)):
+            return
+        points[index], points[target] = points[target], points[index]
+        self._media_ramp_waypoints = normalize_waypoints(points)
+        self._refresh_media_ramp_waypoint_tree()
+        children = tree.get_children()
+        if 0 <= target < len(children):
+            tree.selection_set(children[target])
+            tree.focus(children[target])
+        self._redraw_media_ramp_curve_preview()
+        self._save_settings()
+
+    def _export_media_ramp_waypoints(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Export media ramp",
+            defaultextension=".funscript",
+            filetypes=(
+                ("Funscript / volume", "*.funscript"),
+                ("JSON waypoints", "*.json"),
+                ("All files", "*.*"),
+            ))
+        if not path:
+            return
+        floor1, ceiling1, floor2, ceiling2, floor3, ceiling3 = self._media_ramp_level_args()
+        curve = self.media_volume_ramp_curve.get()
+        end_s = None
+        self._configure_media_timeline()
+        duration = self.media_timeline.snapshot(time.monotonic()).duration_s
+        if duration is not None and duration > 0:
+            end_s = float(duration)
+        if path.lower().endswith(".funscript"):
+            payload = export_ramp_funscript(
+                self._media_ramp_waypoints,
+                floor1, floor2, floor3, ceiling1, ceiling2, ceiling3,
+                curve, end_s=end_s)
+        else:
+            payload = export_ramp_waypoints_payload(
+                self._media_ramp_waypoints,
+                floor1, floor2, floor3, ceiling1, ceiling2, ceiling3, curve)
+        try:
+            Path(path).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Export failed", str(exc), parent=self.root)
+
+    def _import_media_ramp_waypoints(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Import media ramp",
+            filetypes=(
+                ("Funscript / JSON", "*.funscript *.json"),
+                ("Funscript", "*.funscript"),
+                ("JSON waypoints", "*.json"),
+                ("All files", "*.*"),
+            ))
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            waypoints, settings = import_ramp_funscript(data)
+        except (OSError, ValueError, json.JSONDecodeError, TypeError) as exc:
+            messagebox.showerror("Import failed", str(exc), parent=self.root)
+            return
+        self._media_ramp_waypoints = waypoints
+        if not settings.get("gains_from_bookmarks_only"):
+            self.media_volume_ramp_floor.set(settings["floor1"])
+            self.media_volume_ramp_floor2.set(settings["floor2"])
+            self.media_volume_ramp_floor3.set(settings["floor3"])
+            self.media_volume_ramp_ceiling.set(settings["ceiling1"])
+            self.media_volume_ramp_ceiling2.set(settings["ceiling2"])
+            self.media_volume_ramp_ceiling3.set(settings["ceiling3"])
+        curve = settings["curve"]
+        if curve in RAMP_CURVE_NAMES:
+            self.media_volume_ramp_curve.set(curve)
+        if waypoints and not self.media_volume_ramp_waypoints_enabled.get():
+            self.media_volume_ramp_waypoints_enabled.set(True)
+        self._refresh_media_ramp_waypoint_tree()
+        self._refresh_extra_level_controls()
+        self._redraw_media_ramp_curve_preview()
+        self._save_settings()
+
     def _redraw_media_ramp_curve_preview(self) -> None:
-        """Draw a generic 0..1 shape for the selected media ramp curve name."""
+        """Draw selected curve shape, or waypoint gain path when enabled."""
         canvas = getattr(self, "media_ramp_curve_preview", None)
         if canvas is None:
             return
-        width = int(canvas.winfo_reqwidth() or 108)
-        height = int(canvas.winfo_reqheight() or 40)
-        pad = 4
+        width = int(canvas.winfo_reqwidth() or 280)
+        height = int(canvas.winfo_reqheight() or 96)
+        pad = 6
         canvas.delete("all")
-        # Light frame reference (start/end).
         canvas.create_rectangle(
             pad, pad, width - pad, height - pad, outline="#ddd", fill="#f7f7f7")
-        name = self.media_volume_ramp_curve.get()
-        points: list[float] = []
-        samples = 48
         inner_w = max(1, width - 2 * pad)
         inner_h = max(1, height - 2 * pad)
+        samples = 96
+        points: list[float] = []
+        floor1, ceiling1, floor2, ceiling2, floor3, ceiling3 = self._media_ramp_level_args()
+        if (self.media_volume_ramp_waypoints_enabled.get()
+                and self._media_ramp_waypoints):
+            waypoints = normalize_waypoints(self._media_ramp_waypoints)
+            end_s = max(waypoints[-1].time_s * 1.15, waypoints[-1].time_s + 1.0, 1.0)
+            for index in range(samples + 1):
+                position_s = (index / samples) * end_s
+                gain = media_volume_gain_waypoints(
+                    position_s, waypoints,
+                    floor1, ceiling1, floor2, ceiling2, floor3, ceiling3,
+                    self.media_volume_ramp_curve.get())
+                x = pad + (index / samples) * inner_w
+                y = pad + (1.0 - gain) * inner_h
+                points.extend((x, y))
+            if len(points) >= 4:
+                canvas.create_line(*points, fill="#2a6fdb", width=1, smooth=True)
+            for point in waypoints:
+                frac = min(1.0, max(0.0, point.time_s / end_s))
+                x = pad + frac * inner_w
+                y = pad + (1.0 - media_volume_gain_waypoints(
+                    point.time_s, waypoints,
+                    floor1, ceiling1, floor2, ceiling2, floor3, ceiling3,
+                    self.media_volume_ramp_curve.get())) * inner_h
+                # Small tick + dot (not full-height bars).
+                canvas.create_line(x, y - 5, x, y + 5, fill="#c44", width=1)
+                canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#c44", outline="")
+            return
+        name = self.media_volume_ramp_curve.get()
         for index in range(samples + 1):
             progress = index / samples
             shaped = ramp_curve(progress, name)
@@ -1161,13 +1575,22 @@ class VectorApp:
             y = pad + (1.0 - shaped) * inner_h
             points.extend((x, y))
         if len(points) >= 4:
-            canvas.create_line(*points, fill="#2a6fdb", width=2, smooth=True)
+            canvas.create_line(*points, fill="#2a6fdb", width=1, smooth=True)
 
     def _media_volume_gain_at(self, calculated_at: float) -> float | None:
         if not self.media_volume_ramp_enabled.get():
             return None
         self._configure_media_timeline()
         state = self.media_timeline.snapshot(calculated_at)
+        if (self.media_volume_ramp_waypoints_enabled.get()
+                and self._media_ramp_waypoints):
+            floor1, ceiling1, floor2, ceiling2, floor3, ceiling3 = (
+                self._media_ramp_level_args())
+            return media_volume_gain_waypoints(
+                state.position_s if state.usable else None,
+                self._media_ramp_waypoints,
+                floor1, ceiling1, floor2, ceiling2, floor3, ceiling3,
+                self.media_volume_ramp_curve.get())
         # Use held progress between quiet T0 packets; floor only when unusable.
         return media_volume_gain(
             state.progress,
@@ -1911,7 +2334,7 @@ class VectorApp:
             else:
                 self.event_engine.clear()
         except EventError as exc:
-            self.events_status.set(f"Events: error - {exc}")
+            self._set_events_status_text(f"Events: error - {exc}")
         else:
             self._update_events_status()
         routes = saved.get("authored_axis_routes", [])
@@ -1927,6 +2350,14 @@ class VectorApp:
             for slot in ("A", "B"):
                 if isinstance(slots.get(slot), dict):
                     self._preset_slots[slot] = slots[slot]
+        waypoints = saved.get("media_volume_ramp_waypoints", [])
+        default_curve = normalize_curve_name(self.media_volume_ramp_curve.get())
+        self._media_ramp_waypoints = normalize_waypoints(
+            waypoints if isinstance(waypoints, list) else [], default_curve)
+        if (self.media_volume_ramp_waypoints_enabled.get()
+                and not self._media_ramp_waypoints):
+            self._media_ramp_waypoints = [
+                RampWaypoint(0.0, "floor1", default_curve)]
         return not bool(saved.get("first_run_complete"))
 
     def _save_settings(self) -> None:
@@ -1936,6 +2367,11 @@ class VectorApp:
         values["authored_axis_routes"] = sorted(
             axis for axis in self.axis_router.enabled_axes() if axis not in blocked)
         values["authored_routing_mode"] = self.authored_routing_mode.get()
+        default_curve = normalize_curve_name(self.media_volume_ramp_curve.get())
+        values["media_volume_ramp_waypoints"] = [
+            {"time_s": point.time_s, "level": point.level, "curve": point.curve}
+            for point in normalize_waypoints(self._media_ramp_waypoints, default_curve)
+        ]
         values["first_run_complete"] = True
         self._configure_media_timeline()
         save_settings(values)
@@ -2296,20 +2732,40 @@ class VectorApp:
         else:
             self.timeline_status.set("Media timeline: none")
         if self.media_volume_ramp_enabled.get():
-            gain = media_volume_gain(
-                timeline.progress,
-                self.media_volume_ramp_floor.get(),
-                self.media_volume_ramp_ceiling.get(),
-                self.media_volume_ramp_curve.get())
-            if timeline.progress is None:
-                progress_text = "--"
+            if (self.media_volume_ramp_waypoints_enabled.get()
+                    and self._media_ramp_waypoints):
+                floor1, ceiling1, floor2, ceiling2, floor3, ceiling3 = (
+                    self._media_ramp_level_args())
+                gain = media_volume_gain_waypoints(
+                    timeline.position_s if timeline.usable else None,
+                    self._media_ramp_waypoints,
+                    floor1, ceiling1, floor2, ceiling2, floor3, ceiling3,
+                    self.media_volume_ramp_curve.get())
+                if timeline.usable and timeline.position_s is not None:
+                    time_text = format_media_time(timeline.position_s)
+                    if timeline.held:
+                        time_text += " held"
+                else:
+                    time_text = "--"
+                self.media_ramp_status.set(
+                    f"Media ramp: waypoints @ {time_text} → gain {gain * 100:.1f}% "
+                    f"({self.media_volume_ramp_curve.get()}, "
+                    f"{len(self._media_ramp_waypoints)} pts)")
             else:
-                progress_text = f"{timeline.progress * 100:.1f}%"
-                if timeline.held:
-                    progress_text += " held"
-            self.media_ramp_status.set(
-                f"Media ramp: media {progress_text} → gain {gain * 100:.1f}% "
-                f"({self.media_volume_ramp_curve.get()})")
+                gain = media_volume_gain(
+                    timeline.progress,
+                    self.media_volume_ramp_floor.get(),
+                    self.media_volume_ramp_ceiling.get(),
+                    self.media_volume_ramp_curve.get())
+                if timeline.progress is None:
+                    progress_text = "--"
+                else:
+                    progress_text = f"{timeline.progress * 100:.1f}%"
+                    if timeline.held:
+                        progress_text += " held"
+                self.media_ramp_status.set(
+                    f"Media ramp: media {progress_text} → gain {gain * 100:.1f}% "
+                    f"({self.media_volume_ramp_curve.get()})")
         else:
             self.media_ramp_status.set("Media ramp: off")
         self._update_events_status(getattr(timeline, "position_ms", None))

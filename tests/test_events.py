@@ -8,8 +8,11 @@ from pathlib import Path
 
 from vector1a.events import (
     EventEngine,
+    EventError,
+    _derive_orgasm_countdown_params,
     apply_linear_change,
     apply_modulation,
+    expand_named_event,
     expand_user_events,
     normalize_value,
     parse_yaml_subset,
@@ -443,6 +446,121 @@ class EventEngineTests(unittest.TestCase):
         line = self.engine.status_line(enabled=True, due_at=20.1)
         self.assertIn("triggers=", line)
         self.assertIn("volume_boost", line)
+
+
+class TestOrgasmCountdownEvents(unittest.TestCase):
+    def test_bundled_new_mcb_names_exist(self):
+        engine = EventEngine()
+        for name in ("mcb_goodboy", "mcb_orgasm_countdown",
+                     "mcb_orgasm_countdown_stroke_override"):
+            self.assertIn(name, engine.definitions)
+
+    def test_default_countdown_expand_axes_and_durations(self):
+        engine = EventEngine()
+        steps, warnings = expand_named_event(
+            "mcb_orgasm_countdown", None, engine.definitions)
+        self.assertEqual(warnings, [])
+        axes = {step.axis for step in steps}
+        self.assertEqual(
+            axes, {"pulse_frequency", "pulse_width", "volume", "volume-prostate"})
+        self.assertFalse(any(step.axis in ("alpha", "beta") for step in steps))
+        climax = [
+            s for s in steps
+            if s.axis == "volume" and s.start_time_ms == 21000
+            and s.params.get("start_value") == 0.09
+        ]
+        self.assertEqual(len(climax), 1)
+        self.assertEqual(climax[0].duration_ms, 25867)
+        goodboy_pulse = [
+            s for s in steps
+            if s.axis == "pulse_frequency" and s.start_time_ms == 16567
+        ]
+        self.assertEqual(len(goodboy_pulse), 1)
+        self.assertEqual(goodboy_pulse[0].duration_ms, 5000)
+
+    def test_stroke_override_includes_alpha_beta_e(self):
+        engine = EventEngine()
+        steps, warnings = expand_named_event(
+            "mcb_orgasm_countdown_stroke_override", None, engine.definitions)
+        self.assertEqual(warnings, [])
+        axes = {step.axis for step in steps}
+        self.assertIn("alpha", axes)
+        self.assertIn("beta", axes)
+        self.assertTrue({"e1", "e2", "e3", "e4"}.issubset(axes))
+        self.assertFalse(any(
+            "prostate" in str(step.axis) and step.axis != "volume-prostate"
+            for step in steps))
+
+    def test_stretch_default_duration_unchanged(self):
+        params = {
+            "duration_ms": 46867,
+            "orgasm_offset_ms": 21000,
+            "ramp_ms": 1500,
+            "seg_orgasm_ms": 999,
+            "goodboy_duration_ms": 999,
+        }
+        _derive_orgasm_countdown_params(params, "mcb_orgasm_countdown")
+        self.assertEqual(params["seg_orgasm_ms"], 25867)
+        self.assertEqual(params["goodboy_duration_ms"], 5000)
+
+    def test_stretch_double_climax_doubles_goodboy(self):
+        params = {
+            "duration_ms": 46867 + 25867,
+            "orgasm_offset_ms": 21000,
+            "ramp_ms": 1500,
+        }
+        _derive_orgasm_countdown_params(
+            params, "mcb_orgasm_countdown_stroke_override")
+        self.assertEqual(params["seg_orgasm_ms"], 51734)
+        self.assertEqual(params["goodboy_duration_ms"], 10000)
+
+    def test_stretch_short_climax_keeps_goodboy_min(self):
+        params = {
+            "duration_ms": 36000,
+            "orgasm_offset_ms": 21000,
+            "ramp_ms": 1500,
+        }
+        _derive_orgasm_countdown_params(params, "mcb_orgasm_countdown")
+        self.assertEqual(params["seg_orgasm_ms"], 15000)
+        self.assertEqual(params["goodboy_duration_ms"], 5000)
+
+    def test_stretch_too_short_raises(self):
+        params = {
+            "duration_ms": 21000,
+            "orgasm_offset_ms": 21000,
+            "ramp_ms": 1500,
+        }
+        with self.assertRaises(EventError):
+            _derive_orgasm_countdown_params(params, "mcb_orgasm_countdown")
+
+    def test_stretch_other_events_untouched(self):
+        params = {
+            "duration_ms": 99999,
+            "seg_orgasm_ms": 1,
+            "goodboy_duration_ms": 2,
+        }
+        _derive_orgasm_countdown_params(params, "mcb_goodboy")
+        self.assertEqual(params["seg_orgasm_ms"], 1)
+        self.assertEqual(params["goodboy_duration_ms"], 2)
+
+    def test_stretch_applies_through_expand(self):
+        engine = EventEngine()
+        steps, _ = expand_named_event(
+            "mcb_orgasm_countdown",
+            {"duration_ms": 46867 + 25867},
+            engine.definitions,
+        )
+        climax = [
+            s for s in steps
+            if s.axis == "volume" and s.start_time_ms == 21000
+            and s.params.get("start_value") == 0.09
+        ]
+        self.assertEqual(climax[0].duration_ms, 51734)
+        goodboy = [
+            s for s in steps
+            if s.axis == "pulse_frequency" and s.start_time_ms == 16567
+        ]
+        self.assertEqual(goodboy[0].duration_ms, 10000)
 
 
 if __name__ == "__main__":
