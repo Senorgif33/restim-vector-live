@@ -17,6 +17,11 @@ from vector1a.events import (
     normalize_value,
     parse_yaml_subset,
 )
+from vector1a.extract_composite import (
+    EXTRACT_BASE_MS,
+    build_extract_motion_steps,
+    derive_extract_params,
+)
 from vector1a.tcode import TCodeCommand
 from vector1a.timeline import MediaTimeline, media_volume_gain
 
@@ -462,7 +467,8 @@ class TestOrgasmCountdownEvents(unittest.TestCase):
         self.assertEqual(warnings, [])
         axes = {step.axis for step in steps}
         self.assertEqual(
-            axes, {"pulse_frequency", "pulse_width", "volume", "volume-prostate"})
+            axes, {"pulse_frequency", "pulse_width", "volume", "volume-prostate",
+                   "sensor_suppression"})
         self.assertFalse(any(step.axis in ("alpha", "beta") for step in steps))
         climax = [
             s for s in steps
@@ -561,6 +567,135 @@ class TestOrgasmCountdownEvents(unittest.TestCase):
             if s.axis == "pulse_frequency" and s.start_time_ms == 16567
         ]
         self.assertEqual(goodboy[0].duration_ms, 10000)
+
+    def test_orgasm_countdown_s1_starts_at_orgasm_offset(self):
+        engine = EventEngine()
+        steps, _ = expand_named_event(
+            "mcb_orgasm_countdown", None, engine.definitions)
+        s1 = [s for s in steps if s.axis == "sensor_suppression"]
+        self.assertEqual(len(s1), 1)
+        self.assertEqual(s1[0].start_time_ms, 21000)
+        self.assertEqual(s1[0].params["start_value"], 100)
+        self.assertEqual(s1[0].duration_ms, 25867)
+        self.assertFalse(any(
+            s.axis == "sensor_suppression" and s.start_time_ms < 21000
+            for s in steps))
+
+    def test_stroke_override_s1_edge_then_orgasm(self):
+        engine = EventEngine()
+        steps, _ = expand_named_event(
+            "mcb_orgasm_countdown_stroke_override", None, engine.definitions)
+        s1 = sorted(
+            [s for s in steps if s.axis == "sensor_suppression"],
+            key=lambda s: s.start_time_ms,
+        )
+        self.assertEqual(len(s1), 2)
+        self.assertEqual(s1[0].params["start_value"], 50)
+        self.assertEqual(s1[0].start_time_ms, 0)
+        self.assertEqual(s1[0].duration_ms, 21000)
+        self.assertEqual(s1[1].params["start_value"], 100)
+        self.assertEqual(s1[1].start_time_ms, 21000)
+        self.assertEqual(s1[1].duration_ms, 25867)
+
+    def test_goodboy_has_no_sensor_suppression(self):
+        engine = EventEngine()
+        steps, _ = expand_named_event("mcb_goodboy", None, engine.definitions)
+        self.assertFalse(any(s.axis == "sensor_suppression" for s in steps))
+
+
+class TestExtractCompositeEvents(unittest.TestCase):
+    def test_bundled_extract_names(self):
+        engine = EventEngine()
+        self.assertIn("mcb_extract", engine.definitions)
+        self.assertIn("mcb_extract_4p", engine.definitions)
+        self.assertNotIn("mcb_extract_additive", engine.definitions)
+        self.assertNotIn("mcb_extract_4p_additive", engine.definitions)
+
+    def test_default_pulse_amp_offsets(self):
+        params = {"duration_ms": EXTRACT_BASE_MS}
+        derive_extract_params(params, "mcb_extract")
+        self.assertEqual(params["offset_pulse_0_ms"], 0)
+        self.assertEqual(params["hz_pulse_0"], 60.0)
+        self.assertEqual(params["hz_pulse_4"], 120.0)
+        self.assertEqual(params["amp_0"], 0.01)
+        self.assertEqual(params["amp_9"], 0.04)
+        self.assertEqual(
+            params["offset_amp_9_ms"] + params["seg_amp_9_ms"],
+            EXTRACT_BASE_MS,
+        )
+
+    def test_half_duration_scales(self):
+        params = {"duration_ms": EXTRACT_BASE_MS // 2}
+        derive_extract_params(params, "mcb_extract_4p")
+        self.assertEqual(
+            params["offset_pulse_1_ms"],
+            int(round((EXTRACT_BASE_MS // 2) * 0.353)),
+        )
+
+    def test_too_short_raises(self):
+        with self.assertRaises(ValueError):
+            derive_extract_params({"duration_ms": 59999}, "mcb_extract")
+
+    def test_motion_3p_seeded_axes(self):
+        import random
+        params = {"duration_ms": 60000, "ramp_ms": 500, "seed": 1}
+        steps = build_extract_motion_steps(
+            params, "mcb_extract", rng=random.Random(1))
+        self.assertGreater(len(steps), 10)
+        axes = {step["axis"] for step in steps}
+        self.assertEqual(axes, {"alpha", "beta"})
+
+    def test_motion_4p_seeded_axes(self):
+        import random
+        params = {"duration_ms": 60000, "ramp_ms": 500}
+        steps = build_extract_motion_steps(
+            params, "mcb_extract_4p", rng=random.Random(2))
+        self.assertEqual({step["axis"] for step in steps},
+                         {"e1", "e2", "e3", "e4"})
+
+    def test_other_events_untouched(self):
+        params = {"duration_ms": 1000}
+        derive_extract_params(params, "mcb_goodboy")
+        self.assertNotIn("hz_pulse_0", params)
+        self.assertEqual(build_extract_motion_steps(params, "mcb_goodboy"), [])
+
+    def test_expand_includes_shell_and_motion(self):
+        engine = EventEngine()
+        steps, warnings = expand_named_event(
+            "mcb_extract",
+            {"duration_ms": 60000, "seed": 7},
+            engine.definitions,
+        )
+        self.assertEqual(warnings, [])
+        axes = {step.axis for step in steps}
+        self.assertTrue(
+            {"pulse_width", "pulse_frequency", "volume", "volume-prostate",
+             "alpha", "beta"}.issubset(axes))
+        pulse = [
+            s for s in steps
+            if s.axis == "pulse_frequency" and s.start_time_ms == 0
+        ]
+        self.assertEqual(pulse[0].params["start_value"], 60.0)
+
+    def test_seed_makes_expand_deterministic(self):
+        engine = EventEngine()
+        params = {"duration_ms": 60000, "seed": 42}
+        a, _ = expand_named_event("mcb_extract", params, engine.definitions)
+        b, _ = expand_named_event("mcb_extract", params, engine.definitions)
+        key = lambda s: (s.axis, s.start_time_ms, s.duration_ms,
+                         s.params.get("start_value"), s.params.get("end_value"))
+        self.assertEqual([key(s) for s in a], [key(s) for s in b])
+
+    def test_extract_s1_edge_mute_full_duration(self):
+        engine = EventEngine()
+        for name in ("mcb_extract", "mcb_extract_4p"):
+            steps, _ = expand_named_event(
+                name, {"duration_ms": 60000, "seed": 1}, engine.definitions)
+            s1 = [s for s in steps if s.axis == "sensor_suppression"]
+            self.assertEqual(len(s1), 1, name)
+            self.assertEqual(s1[0].params["start_value"], 50, name)
+            self.assertEqual(s1[0].start_time_ms, 0, name)
+            self.assertEqual(s1[0].duration_ms, 60000, name)
 
 
 if __name__ == "__main__":

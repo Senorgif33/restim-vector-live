@@ -2,7 +2,8 @@
 
 Stdlib-only YAML subset loader (no PyYAML). Matches offline Event Builder
 semantics for supported axes: volume, volume-prostate, pulse_frequency,
-pulse_width, frequency, alpha, beta, e1–e4, sensor_suppression.
+pulse_width, frequency, alpha, beta, e1–e4, sensor_suppression. Extract
+composites bake hub–spoke motion at expand time via extract_composite.
 """
 from __future__ import annotations
 
@@ -11,6 +12,11 @@ import math
 from pathlib import Path
 import threading
 from typing import Any
+
+from .extract_composite import (
+    build_extract_motion_steps,
+    derive_extract_params,
+)
 
 SUPPORTED_AXES = frozenset({
     "volume",
@@ -428,6 +434,70 @@ def load_definitions(path: Path | None = None
     return definitions, merged
 
 
+def _append_resolved_step(
+        expanded: list[ActiveStep],
+        unsupported_seen: set[str],
+        *,
+        event_name: str,
+        step: dict[str, Any],
+        step_idx: int,
+        final_params: dict[str, Any],
+        event_time_ms: int,
+        substitute: bool,
+) -> None:
+    """Resolve one YAML/motion step dict into ActiveSteps (axis-split)."""
+    if "operation" not in step:
+        raise EventError(
+            f"Event '{event_name}': step {step_idx} is missing 'operation'.")
+    if "axis" not in step:
+        raise EventError(
+            f"Event '{event_name}': step {step_idx} is missing 'axis'.")
+    operation = step["operation"]
+    step_params_raw = dict(step.get("params") or {})
+    if (operation == "apply_linear_change"
+            and "start_value" not in step_params_raw):
+        raise EventError(
+            f"Event '{event_name}': step {step_idx} uses "
+            f"'apply_linear_change' but is missing 'start_value'.")
+
+    if substitute:
+        processed_params = {
+            key: _substitute_token(value, final_params, event_name)
+            for key, value in step_params_raw.items()
+        }
+        start_offset = _substitute_token(
+            step.get("start_offset", 0), final_params, event_name)
+    else:
+        processed_params = dict(step_params_raw)
+        start_offset = step.get("start_offset", 0)
+    try:
+        start_offset_ms = int(start_offset)
+    except (TypeError, ValueError) as exc:
+        raise EventError(
+            f"Event '{event_name}': invalid start_offset") from exc
+
+    axis_field = str(step["axis"])
+    for axis_name in [name.strip() for name in axis_field.split(",")]:
+        if not axis_name:
+            continue
+        if axis_name not in SUPPORTED_AXES:
+            unsupported_seen.add(axis_name)
+            continue
+        try:
+            duration_ms = int(processed_params["duration_ms"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EventError(
+                f"Event '{event_name}': step needs duration_ms") from exc
+        expanded.append(ActiveStep(
+            event_name=event_name,
+            operation=str(operation),
+            axis=axis_name,
+            start_time_ms=event_time_ms + start_offset_ms,
+            duration_ms=duration_ms,
+            params=dict(processed_params),
+        ))
+
+
 def expand_named_event(
         event_name: str,
         params: dict[str, Any] | None,
@@ -448,6 +518,10 @@ def expand_named_event(
         final_params.update(params)
     _derive_step_ratio_params(final_params, event_name)
     _derive_orgasm_countdown_params(final_params, event_name)
+    try:
+        derive_extract_params(final_params, event_name)
+    except ValueError as exc:
+        raise EventError(str(exc)) from exc
 
     expanded: list[ActiveStep] = []
     unsupported_seen: set[str] = set()
@@ -457,52 +531,31 @@ def expand_named_event(
         if not isinstance(step, dict):
             raise EventError(
                 f"Event '{event_name}': step {step_idx} must be a mapping.")
-        if "operation" not in step:
-            raise EventError(
-                f"Event '{event_name}': step {step_idx} is missing 'operation'.")
-        if "axis" not in step:
-            raise EventError(
-                f"Event '{event_name}': step {step_idx} is missing 'axis'.")
-        operation = step["operation"]
-        step_params_raw = dict(step.get("params") or {})
-        if (operation == "apply_linear_change"
-                and "start_value" not in step_params_raw):
-            raise EventError(
-                f"Event '{event_name}': step {step_idx} uses "
-                f"'apply_linear_change' but is missing 'start_value'.")
+        _append_resolved_step(
+            expanded, unsupported_seen,
+            event_name=event_name,
+            step=step,
+            step_idx=step_idx,
+            final_params=final_params,
+            event_time_ms=event_time_ms,
+            substitute=True,
+        )
 
-        processed_params = {
-            key: _substitute_token(value, final_params, event_name)
-            for key, value in step_params_raw.items()
-        }
-        start_offset = _substitute_token(
-            step.get("start_offset", 0), final_params, event_name)
-        try:
-            start_offset_ms = int(start_offset)
-        except (TypeError, ValueError) as exc:
+    motion_steps = build_extract_motion_steps(final_params, event_name)
+    shell_count = len(definition.get("steps") or [])
+    for motion_idx, step in enumerate(motion_steps, start=1):
+        if not isinstance(step, dict):
             raise EventError(
-                f"Event '{event_name}': invalid start_offset") from exc
-
-        axis_field = str(step["axis"])
-        for axis_name in [name.strip() for name in axis_field.split(",")]:
-            if not axis_name:
-                continue
-            if axis_name not in SUPPORTED_AXES:
-                unsupported_seen.add(axis_name)
-                continue
-            try:
-                duration_ms = int(processed_params["duration_ms"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise EventError(
-                    f"Event '{event_name}': step needs duration_ms") from exc
-            expanded.append(ActiveStep(
-                event_name=event_name,
-                operation=str(operation),
-                axis=axis_name,
-                start_time_ms=event_time_ms + start_offset_ms,
-                duration_ms=duration_ms,
-                params=dict(processed_params),
-            ))
+                f"Event '{event_name}': motion step {motion_idx} must be a mapping.")
+        _append_resolved_step(
+            expanded, unsupported_seen,
+            event_name=event_name,
+            step=step,
+            step_idx=shell_count + motion_idx,
+            final_params=final_params,
+            event_time_ms=event_time_ms,
+            substitute=False,
+        )
 
     if unsupported_seen:
         warnings.append(
