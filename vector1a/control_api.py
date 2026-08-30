@@ -250,19 +250,21 @@ class ControlApiServer:
         while self._run.is_set():
             started = time.monotonic()
             try:
-                payload = json.dumps(
-                    {"type": "snapshot", "state": self.backend.control_state()},
-                    separators=(",", ":"))
-                frame = encode_text(payload)
                 with self._clients_lock:
                     clients = list(self._clients)
-                dead: list[_StreamClient] = []
-                for client in clients:
-                    if not client.send_raw(frame):
-                        dead.append(client)
-                for client in dead:
-                    client.close()
-                    self.remove_stream_client(client)
+                # Idle API with no subscribers must not poll the UI/backend.
+                if clients:
+                    payload = json.dumps(
+                        {"type": "snapshot", "state": self.backend.control_state()},
+                        separators=(",", ":"))
+                    frame = encode_text(payload)
+                    dead: list[_StreamClient] = []
+                    for client in clients:
+                        if not client.send_raw(frame):
+                            dead.append(client)
+                    for client in dead:
+                        client.close()
+                        self.remove_stream_client(client)
             except Exception:
                 pass
             elapsed = time.monotonic() - started

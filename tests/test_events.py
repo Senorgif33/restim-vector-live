@@ -21,6 +21,9 @@ from vector1a.extract_composite import (
     EXTRACT_BASE_MS,
     build_extract_motion_steps,
     derive_extract_params,
+    detect_l0_beats,
+    every_nth_beat,
+    switch_offsets_to_segments,
 )
 from vector1a.tcode import TCodeCommand
 from vector1a.timeline import MediaTimeline, media_volume_gain
@@ -608,6 +611,8 @@ class TestExtractCompositeEvents(unittest.TestCase):
         engine = EventEngine()
         self.assertIn("mcb_extract", engine.definitions)
         self.assertIn("mcb_extract_4p", engine.definitions)
+        self.assertIn("mcb_extract_beat", engine.definitions)
+        self.assertIn("mcb_extract_4p_beat", engine.definitions)
         self.assertNotIn("mcb_extract_additive", engine.definitions)
         self.assertNotIn("mcb_extract_4p_additive", engine.definitions)
 
@@ -688,7 +693,8 @@ class TestExtractCompositeEvents(unittest.TestCase):
 
     def test_extract_s1_edge_mute_full_duration(self):
         engine = EventEngine()
-        for name in ("mcb_extract", "mcb_extract_4p"):
+        for name in ("mcb_extract", "mcb_extract_4p",
+                     "mcb_extract_beat", "mcb_extract_4p_beat"):
             steps, _ = expand_named_event(
                 name, {"duration_ms": 60000, "seed": 1}, engine.definitions)
             s1 = [s for s in steps if s.axis == "sensor_suppression"]
@@ -696,6 +702,46 @@ class TestExtractCompositeEvents(unittest.TestCase):
             self.assertEqual(s1[0].params["start_value"], 50, name)
             self.assertEqual(s1[0].start_time_ms, 0, name)
             self.assertEqual(s1[0].duration_ms, 60000, name)
+
+    def test_l0_beats_every_second(self):
+        # Triangle: valleys at integers, peaks at n+0.5
+        t = [i * 0.05 for i in range(201)]
+        y = [abs((x % 1.0) - 0.5) for x in t]
+        beats = detect_l0_beats(t, y, 0, 10000, min_interval_ms=50)
+        self.assertGreater(len(beats), 5)
+        switches = every_nth_beat(beats, 2)
+        self.assertEqual(switches, beats[::2])
+        segs = switch_offsets_to_segments(switches, 10000)
+        self.assertEqual(segs[0][0], 0)
+        self.assertEqual(segs[-1][0] + segs[-1][1], 10000)
+
+    def test_beat_motion_uses_switch_offsets(self):
+        import random
+        params = {
+            "duration_ms": 60000,
+            "ramp_ms": 500,
+            "switch_offsets_ms": [0, 2000, 4000, 8000, 16000, 32000],
+        }
+        steps = build_extract_motion_steps(
+            params, "mcb_extract_4p_beat", rng=random.Random(3))
+        self.assertEqual({s["axis"] for s in steps}, {"e1", "e2", "e3", "e4"})
+        motion = [s for s in steps if s["axis"] == "e1"]
+        self.assertTrue(any(s["start_offset"] == 2000 for s in motion))
+
+    def test_expand_beat_with_switch_offsets(self):
+        engine = EventEngine()
+        steps, warnings = expand_named_event(
+            "mcb_extract_beat",
+            {
+                "duration_ms": 60000,
+                "seed": 1,
+                "switch_offsets_ms": [1000, 3000, 5000, 9000],
+            },
+            engine.definitions,
+        )
+        self.assertEqual(warnings, [])
+        alpha = [s for s in steps if s.axis == "alpha"]
+        self.assertTrue(any(s.start_time_ms == 1000 for s in alpha))
 
 
 if __name__ == "__main__":

@@ -3,19 +3,32 @@
 Vendored from funscript-tools for Vector live expand. Hub–spoke motion is baked
 at expand time (optional seed). Vector uses primary alpha/beta only (no -2 /
 prostate position axes).
+
+Beat-sync siblings (mcb_extract_beat / mcb_extract_4p_beat): same shell; pole
+dwells advance every 2nd L0 beat (or switch_offsets_ms from the events file).
+Fallback to SCD ~dur when no beats. Stdlib-only (no numpy).
 """
 from __future__ import annotations
 
 import math
 import random
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 # Default SCD span: Relentless start → end of pleasure overload (Ch2).
 EXTRACT_BASE_MS = 265367
 EXTRACT_MIN_MS = 60_000
 
+EXTRACT_SCD_EVENTS = frozenset({"mcb_extract", "mcb_extract_4p"})
+EXTRACT_BEAT_EVENTS = frozenset({"mcb_extract_beat", "mcb_extract_4p_beat"})
+EXTRACT_EVENTS = EXTRACT_SCD_EVENTS | EXTRACT_BEAT_EVENTS
+
 # Soft glide ≈ SCD thetaLag 0.9s (capped per dwell).
 _SOFT_LAG_MS = 900
+
+# L0 turnaround beats: skip chatter closer than this.
+_MIN_BEAT_INTERVAL_MS = 80
+# Advance to next pole/pad on every Nth L0 beat.
+_BEAT_EVERY_N = 2
 
 # poles @ ρ=1 → α/β with α=(x+1)/2, β=(y+1)/2 from ρ·(cos θ, sin θ)
 _ZETA = 2.0 * math.pi / 3.0
@@ -113,9 +126,181 @@ def _linear_step(
     }
 
 
+def _is_4p(event_name: str) -> bool:
+    return event_name in ("mcb_extract_4p", "mcb_extract_4p_beat")
+
+
+def _pick_spoke(
+    rng: random.Random,
+    options: Sequence[str],
+    previous: Optional[str],
+) -> str:
+    """Random spoke that is never the same as the previous burst's spoke."""
+    choices = list(options)
+    if previous is not None and len(choices) > 1:
+        filtered = [c for c in choices if c != previous]
+        if filtered:
+            choices = filtered
+    return rng.choice(choices)
+
+
+def detect_l0_beats(
+    times_s: Union[Sequence[float], List[float]],
+    values: Union[Sequence[float], List[float]],
+    t0_ms: int,
+    t1_ms: int,
+    *,
+    min_interval_ms: int = _MIN_BEAT_INTERVAL_MS,
+) -> List[int]:
+    """Detect L0 turnarounds in [t0_ms, t1_ms); return offsets ms from t0_ms."""
+    if t1_ms <= t0_ms:
+        return []
+
+    x = [float(v) for v in times_s]
+    y = [float(v) for v in values]
+    if len(x) < 3 or len(y) != len(x):
+        return []
+
+    t0_s = t0_ms / 1000.0
+    t1_s = t1_ms / 1000.0
+    in_win = [i for i, t in enumerate(x) if t0_s <= t <= t1_s]
+    if len(in_win) < 3:
+        return []
+
+    i0 = max(0, in_win[0] - 1)
+    i1 = min(len(x) - 1, in_win[-1] + 1)
+    xs = x[i0 : i1 + 1]
+    ys = y[i0 : i1 + 1]
+
+    raw: List[int] = []
+    for i in range(1, len(ys) - 1):
+        left = ys[i] - ys[i - 1]
+        right = ys[i + 1] - ys[i]
+        is_peak = left > 0 and right <= 0
+        is_valley = left < 0 and right >= 0
+        if not (is_peak or is_valley):
+            continue
+        off = int(round((xs[i] - t0_s) * 1000.0))
+        if 0 <= off < (t1_ms - t0_ms):
+            raw.append(off)
+
+    if not raw:
+        return []
+
+    raw.sort()
+    filtered = [raw[0]]
+    for b in raw[1:]:
+        if b - filtered[-1] >= min_interval_ms:
+            filtered.append(b)
+    return filtered
+
+
+def every_nth_beat(beats: Sequence[int], n: int = _BEAT_EVERY_N) -> List[int]:
+    if n < 1:
+        n = 1
+    return [int(b) for b in beats[::n]]
+
+
+def switch_offsets_to_segments(
+    switch_offsets_ms: Sequence[int],
+    duration_ms: int,
+) -> List[Tuple[int, int]]:
+    """Build (start_offset, dwell_ms) covering [0, duration_ms) from switch times."""
+    bounds = [0]
+    for s in switch_offsets_ms:
+        try:
+            si = int(s)
+        except (TypeError, ValueError):
+            continue
+        if 0 < si < duration_ms:
+            bounds.append(si)
+    bounds.append(int(duration_ms))
+    bounds = sorted(set(bounds))
+    segs: List[Tuple[int, int]] = []
+    for i in range(len(bounds) - 1):
+        dwell = bounds[i + 1] - bounds[i]
+        if dwell > 0:
+            segs.append((bounds[i], dwell))
+    return segs
+
+
+def _scd_segments(duration_ms: int) -> List[Tuple[int, int]]:
+    """Hub+spoke pairs with SCD ~dur (same timing as original extract bake)."""
+    segs: List[Tuple[int, int]] = []
+    t = 0
+    while t < duration_ms:
+        frac = t / duration_ms
+        dwell_ms = max(1, int(round(_dwell_s_at(frac) * 1000.0)))
+        for _ in range(2):
+            if t >= duration_ms:
+                break
+            this_dwell = min(dwell_ms, duration_ms - t)
+            segs.append((t, this_dwell))
+            t += this_dwell
+    return segs
+
+
+def _parse_switch_offsets(final_params: dict) -> Optional[List[int]]:
+    raw = final_params.get("switch_offsets_ms")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+        try:
+            return [int(float(p)) for p in parts]
+        except ValueError:
+            return None
+    if isinstance(raw, (list, tuple)):
+        out: List[int] = []
+        for v in raw:
+            try:
+                out.append(int(v))
+            except (TypeError, ValueError):
+                continue
+        return out
+    return None
+
+
+def resolve_extract_segments(
+    final_params: dict,
+    event_name: str,
+    *,
+    l0_times_s: Optional[Sequence[float]] = None,
+    l0_values: Optional[Sequence[float]] = None,
+    event_start_ms: int = 0,
+) -> List[Tuple[int, int]]:
+    """Dwell schedule for motion bake. Beat events prefer L0 / switch_offsets_ms."""
+    duration_ms = int(round(float(final_params["duration_ms"])))
+
+    if event_name not in EXTRACT_BEAT_EVENTS:
+        return _scd_segments(duration_ms)
+
+    baked = _parse_switch_offsets(final_params)
+    if baked is not None:
+        segs = switch_offsets_to_segments(baked, duration_ms)
+        if segs:
+            return segs
+
+    if l0_times_s is not None and l0_values is not None:
+        beats = detect_l0_beats(
+            l0_times_s,
+            l0_values,
+            event_start_ms,
+            event_start_ms + duration_ms,
+        )
+        switches = every_nth_beat(beats, _BEAT_EVERY_N)
+        final_params["switch_offsets_ms"] = list(switches)
+        segs = switch_offsets_to_segments(switches, duration_ms)
+        if len(segs) >= 2:
+            return segs
+
+    # Sparse / missing L0 → SCD ~dur fallback
+    return _scd_segments(duration_ms)
+
+
 def derive_extract_params(final_params: dict, event_name: str) -> None:
     """Fill proportional pulse/amp segment tokens; enforce min duration."""
-    if event_name not in ("mcb_extract", "mcb_extract_4p"):
+    if event_name not in EXTRACT_EVENTS:
         return
 
     try:
@@ -153,9 +338,12 @@ def build_extract_motion_steps(
     event_name: str,
     *,
     rng: Optional[random.Random] = None,
+    l0_times_s: Optional[Sequence[float]] = None,
+    l0_values: Optional[Sequence[float]] = None,
+    event_start_ms: int = 0,
 ) -> List[Dict[str, Any]]:
     """Bake hub–spoke overwrite steps for the full duration (Apply/expand-time RNG)."""
-    if event_name not in ("mcb_extract", "mcb_extract_4p"):
+    if event_name not in EXTRACT_EVENTS:
         return []
 
     duration_ms = int(round(float(final_params["duration_ms"])))
@@ -163,75 +351,76 @@ def build_extract_motion_steps(
         seed = final_params.get("seed", None)
         rng = random.Random(seed) if seed is not None else random.Random()
 
-    if event_name == "mcb_extract":
-        return _build_3p_motion(duration_ms, rng, final_params)
-    return _build_4p_motion(duration_ms, rng, final_params)
+    segments = resolve_extract_segments(
+        final_params,
+        event_name,
+        l0_times_s=l0_times_s,
+        l0_values=l0_values,
+        event_start_ms=event_start_ms,
+    )
+
+    if _is_4p(event_name):
+        return _build_4p_motion(duration_ms, rng, final_params, segments)
+    return _build_3p_motion(duration_ms, rng, final_params, segments)
 
 
 def _build_3p_motion(
     duration_ms: int,
     rng: random.Random,
     final_params: dict,
+    segments: List[Tuple[int, int]],
 ) -> List[Dict[str, Any]]:
     steps: List[Dict[str, Any]] = []
-    t = 0
     prev_a, prev_b = _pole_ab("N", 0.85)
     first = True
     ramp_ms = int(final_params.get("ramp_ms", 500))
+    next_spoke = "L"
+    prev_spoke: Optional[str] = None
 
-    while t < duration_ms:
-        frac = t / duration_ms
-        dwell_ms = max(1, int(round(_dwell_s_at(frac) * 1000.0)))
-        # Hub then spoke (SCD Pseq hub→spoke, 2 dwells)
-        spoke = rng.choice(("L", "R"))
-        for pole in ("N", spoke):
-            if t >= duration_ms:
-                break
-            remaining = duration_ms - t
-            this_dwell = min(dwell_ms, remaining)
-            rho = rng.uniform(0.75, 0.95)
-            a, b = _pole_ab(pole, rho)
-            soft = 0 if first else _soft_ms(this_dwell)
-            first = False
+    for idx, (t, this_dwell) in enumerate(segments):
+        if idx % 2 == 0:
+            next_spoke = _pick_spoke(rng, ("L", "R"), prev_spoke)
+            prev_spoke = next_spoke
+            pole = "N"
+        else:
+            pole = next_spoke
 
-            if soft > 0:
-                steps.append(_linear_step(_ALPHA_AXES, t, soft, prev_a, a))
-                steps.append(_linear_step(_BETA_AXES, t, soft, prev_b, b))
-                hold_off = t + soft
-                hold_dur = this_dwell - soft
-            else:
-                hold_off = t
-                hold_dur = this_dwell
-                # First segment: blend in from base stroke
-                steps.append(
-                    _linear_step(
-                        _ALPHA_AXES, hold_off, hold_dur, a, a,
-                        ramp_in_ms=min(ramp_ms, hold_dur),
-                        ramp_out_ms=0,
-                    )
+        rho = rng.uniform(0.75, 0.95)
+        a, b = _pole_ab(pole, rho)
+        soft = 0 if first else _soft_ms(this_dwell)
+        first = False
+
+        if soft > 0:
+            steps.append(_linear_step(_ALPHA_AXES, t, soft, prev_a, a))
+            steps.append(_linear_step(_BETA_AXES, t, soft, prev_b, b))
+            hold_off = t + soft
+            hold_dur = this_dwell - soft
+        else:
+            hold_off = t
+            hold_dur = this_dwell
+            steps.append(
+                _linear_step(
+                    _ALPHA_AXES, hold_off, hold_dur, a, a,
+                    ramp_in_ms=min(ramp_ms, hold_dur),
+                    ramp_out_ms=0,
                 )
-                steps.append(
-                    _linear_step(
-                        _BETA_AXES, hold_off, hold_dur, b, b,
-                        ramp_in_ms=min(ramp_ms, hold_dur),
-                        ramp_out_ms=0,
-                    )
+            )
+            steps.append(
+                _linear_step(
+                    _BETA_AXES, hold_off, hold_dur, b, b,
+                    ramp_in_ms=min(ramp_ms, hold_dur),
+                    ramp_out_ms=0,
                 )
-                prev_a, prev_b = a, b
-                t += this_dwell
-                continue
-
-            if hold_dur > 0:
-                steps.append(_linear_step(_ALPHA_AXES, hold_off, hold_dur, a, a))
-                steps.append(_linear_step(_BETA_AXES, hold_off, hold_dur, b, b))
-
+            )
             prev_a, prev_b = a, b
-            t += this_dwell
+            continue
 
-        # Refresh dwell after each 2-note burst using time at burst end
-        # (already advanced inside loop)
+        if hold_dur > 0:
+            steps.append(_linear_step(_ALPHA_AXES, hold_off, hold_dur, a, a))
+            steps.append(_linear_step(_BETA_AXES, hold_off, hold_dur, b, b))
 
-    # Final ramp-out toward center on last soft edge of event
+        prev_a, prev_b = a, b
+
     if steps:
         out = min(int(final_params.get("ramp_ms", 500)), 1500)
         end_t = max(0, duration_ms - out)
@@ -251,53 +440,52 @@ def _build_4p_motion(
     duration_ms: int,
     rng: random.Random,
     final_params: dict,
+    segments: List[Tuple[int, int]],
 ) -> List[Dict[str, Any]]:
     steps: List[Dict[str, Any]] = []
-    t = 0
     prev = _e_levels("e1", 0.85)
     first = True
     ramp_ms = int(final_params.get("ramp_ms", 500))
     spokes: Sequence[str] = ("e2", "e3", "e4")
+    next_spoke = "e2"
+    prev_spoke: Optional[str] = None
 
-    while t < duration_ms:
-        frac = t / duration_ms
-        dwell_ms = max(1, int(round(_dwell_s_at(frac) * 1000.0)))
-        spoke = rng.choice(tuple(spokes))
-        for pad in ("e1", spoke):
-            if t >= duration_ms:
-                break
-            remaining = duration_ms - t
-            this_dwell = min(dwell_ms, remaining)
-            rho = rng.uniform(0.75, 0.95)
-            curr = _e_levels(pad, rho)
-            soft = 0 if first else _soft_ms(this_dwell)
-            first = False
+    for idx, (t, this_dwell) in enumerate(segments):
+        if idx % 2 == 0:
+            next_spoke = _pick_spoke(rng, spokes, prev_spoke)
+            prev_spoke = next_spoke
+            pad = "e1"
+        else:
+            pad = next_spoke
 
-            if soft > 0:
-                for ax in _E_AXES:
-                    steps.append(_linear_step(ax, t, soft, prev[ax], curr[ax]))
-                hold_off = t + soft
-                hold_dur = this_dwell - soft
-            else:
-                hold_off = t
-                hold_dur = this_dwell
-                for ax in _E_AXES:
-                    steps.append(
-                        _linear_step(
-                            ax, hold_off, hold_dur, curr[ax], curr[ax],
-                            ramp_in_ms=min(ramp_ms, hold_dur) if ax == "e1" else 0,
-                        )
+        rho = rng.uniform(0.75, 0.95)
+        curr = _e_levels(pad, rho)
+        soft = 0 if first else _soft_ms(this_dwell)
+        first = False
+
+        if soft > 0:
+            for ax in _E_AXES:
+                steps.append(_linear_step(ax, t, soft, prev[ax], curr[ax]))
+            hold_off = t + soft
+            hold_dur = this_dwell - soft
+        else:
+            hold_off = t
+            hold_dur = this_dwell
+            for ax in _E_AXES:
+                steps.append(
+                    _linear_step(
+                        ax, hold_off, hold_dur, curr[ax], curr[ax],
+                        ramp_in_ms=min(ramp_ms, hold_dur) if ax == "e1" else 0,
                     )
-                prev = curr
-                t += this_dwell
-                continue
-
-            if hold_dur > 0:
-                for ax in _E_AXES:
-                    steps.append(_linear_step(ax, hold_off, hold_dur, curr[ax], curr[ax]))
-
+                )
             prev = curr
-            t += this_dwell
+            continue
+
+        if hold_dur > 0:
+            for ax in _E_AXES:
+                steps.append(_linear_step(ax, hold_off, hold_dur, curr[ax], curr[ax]))
+
+        prev = curr
 
     if steps:
         out = min(int(final_params.get("ramp_ms", 500)), 1500)

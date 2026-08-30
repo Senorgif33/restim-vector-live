@@ -3,17 +3,20 @@
 Stdlib-only YAML subset loader (no PyYAML). Matches offline Event Builder
 semantics for supported axes: volume, volume-prostate, pulse_frequency,
 pulse_width, frequency, alpha, beta, e1–e4, sensor_suppression. Extract
-composites bake hub–spoke motion at expand time via extract_composite.
+composites bake hub–spoke motion at expand time via extract_composite
+(SCD ~dur or L0 beat-sync siblings).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import math
 from pathlib import Path
 import threading
-from typing import Any
+from typing import Any, Sequence
 
 from .extract_composite import (
+    EXTRACT_BEAT_EVENTS,
     build_extract_motion_steps,
     derive_extract_params,
 )
@@ -498,12 +501,52 @@ def _append_resolved_step(
         ))
 
 
+def resolve_l0_funscript_path(events_path: Path) -> Path | None:
+    """Companion L0 stroke next to ``*.events.yml`` (same rules as funscript-tools)."""
+    name = events_path.name
+    base = name
+    for suffix in (".events.yml", ".events.yaml"):
+        if base.lower().endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    parent = events_path.parent
+    for candidate in (
+        parent / f"{base}.funscript",
+        parent / f"{base}.L0.funscript",
+        parent / f"{base}.l0.funscript",
+        parent / "L0.funscript",
+        parent / "l0.funscript",
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_l0_series(path: Path | str) -> tuple[list[float], list[float]]:
+    """Load funscript actions as (times_s, values_0_1)."""
+    with Path(path).open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    actions = payload.get("actions") or []
+    if not isinstance(actions, list):
+        raise EventError(f"Funscript '{path}' actions must be a list.")
+    sorted_actions = sorted(
+        (a for a in actions if isinstance(a, dict) and "at" in a and "pos" in a),
+        key=lambda a: float(a["at"]),
+    )
+    times_s = [float(a["at"]) / 1000.0 for a in sorted_actions]
+    values = [float(a["pos"]) * 0.01 for a in sorted_actions]
+    return times_s, values
+
+
 def expand_named_event(
         event_name: str,
         params: dict[str, Any] | None,
         definitions: dict[str, Any],
         *,
         event_time_ms: int = 0,
+        l0_times_s: Sequence[float] | None = None,
+        l0_values: Sequence[float] | None = None,
+        warn_missing_l0: bool = False,
 ) -> tuple[list[ActiveStep], list[str]]:
     """Expand one named definition into ActiveSteps (relative to *event_time_ms*)."""
     if event_name not in definitions:
@@ -541,7 +584,24 @@ def expand_named_event(
             substitute=True,
         )
 
-    motion_steps = build_extract_motion_steps(final_params, event_name)
+    motion_kwargs: dict[str, Any] = {}
+    if event_name in EXTRACT_BEAT_EVENTS:
+        motion_kwargs = {
+            "l0_times_s": l0_times_s,
+            "l0_values": l0_values,
+            "event_start_ms": event_time_ms,
+        }
+        if (
+            warn_missing_l0
+            and l0_times_s is None
+            and final_params.get("switch_offsets_ms") is None
+        ):
+            warnings.append(
+                f"Event '{event_name}' has no L0 funscript and no "
+                "switch_offsets_ms; pole dwells fall back to SCD ~dur."
+            )
+    motion_steps = build_extract_motion_steps(
+        final_params, event_name, **motion_kwargs)
     shell_count = len(definition.get("steps") or [])
     for motion_idx, step in enumerate(motion_steps, start=1):
         if not isinstance(step, dict):
@@ -568,6 +628,10 @@ def expand_named_event(
 def expand_user_events(
         user_data: dict[str, Any],
         definitions: dict[str, Any],
+        *,
+        l0_times_s: Sequence[float] | None = None,
+        l0_values: Sequence[float] | None = None,
+        warn_missing_l0: bool = False,
 ) -> LoadedEvents:
     """Parse user events mapping; drop unsupported-axis steps with warnings."""
     if "events" not in user_data:
@@ -596,7 +660,14 @@ def expand_user_events(
             user_event.get("params"), dict) else None
         try:
             steps, warnings = expand_named_event(
-                event_name, params, definitions, event_time_ms=event_time_ms)
+                event_name,
+                params,
+                definitions,
+                event_time_ms=event_time_ms,
+                l0_times_s=l0_times_s,
+                l0_values=l0_values,
+                warn_missing_l0=warn_missing_l0,
+            )
         except EventError as exc:
             if event_name not in definitions:
                 raise EventError(
@@ -755,7 +826,18 @@ class EventEngine:
             raise EventError("User event file root must be a mapping.")
         if not self.definitions:
             self.reload_definitions()
-        loaded = expand_user_events(data, self.definitions)
+        l0_times_s: list[float] | None = None
+        l0_values: list[float] | None = None
+        l0_path = resolve_l0_funscript_path(events_path)
+        if l0_path is not None:
+            l0_times_s, l0_values = load_l0_series(l0_path)
+        loaded = expand_user_events(
+            data,
+            self.definitions,
+            l0_times_s=l0_times_s,
+            l0_values=l0_values,
+            warn_missing_l0=True,
+        )
         loaded.source_path = str(events_path)
         self.loaded = loaded
         self._load_error = ""

@@ -30,6 +30,7 @@ class FakeBackend:
             "meters": {"e1": 0.5, "e2": 0.5, "e3": 0.5, "e4": 0.5},
         }
         self.actions: list[str] = []
+        self.state_calls = 0
 
     def control_schema(self) -> dict:
         return {
@@ -39,6 +40,7 @@ class FakeBackend:
         }
 
     def control_state(self) -> dict:
+        self.state_calls += 1
         return self.state
 
     def control_patch(self, patch: dict) -> dict:
@@ -139,6 +141,13 @@ class ControlApiHttpTests(unittest.TestCase):
         status, body = _http_json("POST", f"{self.base}/v1/actions/not-a-thing")
         self.assertEqual(status, 400)
         self.assertFalse(body["ok"])
+
+    def test_idle_broadcast_skips_state_when_no_clients(self):
+        # setUp already did one GET /v1/state. With no WS clients the 20 Hz
+        # stream loop must not keep calling control_state.
+        before = self.backend.state_calls
+        time.sleep(0.25)
+        self.assertEqual(self.backend.state_calls, before)
 
     def test_websocket_stream_sends_snapshot(self):
         key = "dGhlIHNhbXBsZSBub25jZQ=="

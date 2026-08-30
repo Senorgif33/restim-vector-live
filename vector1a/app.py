@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import tkinter as tk
 import time
@@ -275,6 +276,9 @@ class VectorApp:
         self.control_api_status = tk.StringVar(value="Off")
         self.ui_dark_mode = tk.BooleanVar(value=False)
         self._control_api: ControlApiServer | None = None
+        self._control_state_cache: dict | None = None
+        self._control_state_cache_lock = threading.Lock()
+        self._control_schema_cache: dict | None = None
         self._theme = THEME_COLORS["light"]
         self._range_bars: list[RangeBar] = []
         self.rate = tk.IntVar(value=50)
@@ -502,6 +506,10 @@ class VectorApp:
         self._apply_theme()
         self._save_settings()
 
+    def _on_remote_api_toggle(self) -> None:
+        self._sync_control_api_server()
+        self._save_settings()
+
     def _apply_theme(self) -> None:
         mode = "dark" if self.ui_dark_mode.get() else "light"
         colors = THEME_COLORS[mode]
@@ -608,6 +616,9 @@ class VectorApp:
         ttk.Button(toolbar, text="Session startup", command=self.show_session_startup).pack(side="left", padx=6)
         right_bar = ttk.Frame(toolbar)
         right_bar.pack(side="right")
+        ttk.Checkbutton(
+            right_bar, text="Remote API", width=12, variable=self.control_api_enabled,
+            command=self._on_remote_api_toggle).pack(side="left", padx=(8, 4))
         ttk.Checkbutton(
             right_bar, text="Dark mode", width=11, variable=self.ui_dark_mode,
             command=self._on_theme_toggle).pack(side="left", padx=(8, 4))
@@ -1294,20 +1305,24 @@ class VectorApp:
         ttk.Checkbutton(
             remote, text="Enable LAN control API (no auth — trusted LAN only)",
             variable=self.control_api_enabled,
-            command=self._sync_control_api_server).grid(row=0, column=0, columnspan=4, sticky="w", padx=6)
+            command=self._on_remote_api_toggle).grid(row=0, column=0, columnspan=4, sticky="w", padx=6)
         ttk.Label(remote, text="Bind address").grid(row=1, column=0, sticky="w", padx=6, pady=4)
         ttk.Entry(remote, textvariable=self.control_api_host, width=16).grid(row=1, column=1, padx=4)
         ttk.Label(remote, text="Port").grid(row=1, column=2, sticky="e")
         ttk.Spinbox(remote, from_=1, to=65535, textvariable=self.control_api_port, width=7).grid(
             row=1, column=3, padx=4, sticky="w")
-        ttk.Button(remote, text="Apply bind", command=self._sync_control_api_server).grid(
+        ttk.Button(remote, text="Apply bind", command=self._on_remote_api_toggle).grid(
             row=1, column=4, padx=8)
         ttk.Label(remote, textvariable=self.control_api_status).grid(
             row=2, column=0, columnspan=5, sticky="w", padx=6, pady=(2, 4))
         ttk.Label(
             remote,
+            text="Toolbar “Remote API” also toggles this. Leave off when not using the phone UI.",
+            style="Muted.TLabel").grid(row=3, column=0, columnspan=5, sticky="w", padx=6, pady=(0, 2))
+        ttk.Label(
+            remote,
             text="Phone browser: GET/POST http://<pc-lan-ip>:<port>/v1/state  ·  WS /v1/stream",
-            style="Muted.TLabel").grid(row=3, column=0, columnspan=5, sticky="w", padx=6, pady=(0, 4))
+            style="Muted.TLabel").grid(row=4, column=0, columnspan=5, sticky="w", padx=6, pady=(0, 4))
 
         self._apply_theme()
         self.root.after_idle(self._refresh_scroll_region)
@@ -3228,7 +3243,18 @@ class VectorApp:
             section = self.sections.get(title)
             if section is not None:
                 section.summary.set(summary)
+        if self._control_api is not None:
+            self._publish_control_state_cache()
         self.root.after(100, self._refresh)
+
+    def _publish_control_state_cache(self) -> None:
+        """UI-thread only: refresh the snapshot served to HTTP/WS readers."""
+        try:
+            state = self._control_state_ui()
+        except Exception:
+            return
+        with self._control_state_cache_lock:
+            self._control_state_cache = state
 
     def _sync_control_api_server(self) -> None:
         if self._control_api is not None:
@@ -3236,6 +3262,8 @@ class VectorApp:
             self._control_api = None
         if not self.control_api_enabled.get():
             self.control_api_status.set("Off")
+            with self._control_state_cache_lock:
+                self._control_state_cache = None
             return
         host = self.control_api_host.get().strip() or "0.0.0.0"
         try:
@@ -3244,11 +3272,11 @@ class VectorApp:
             self.control_api_status.set("Invalid port")
             return
         try:
+            self._publish_control_state_cache()
             server = ControlApiServer(self, host, port)
             server.start()
             self._control_api = server
             self.control_api_status.set(f"Listening on {host}:{port}")
-            self._save_settings()
         except OSError as exc:
             self.control_api_status.set(f"Bind failed: {exc}")
 
@@ -3394,12 +3422,15 @@ class VectorApp:
             # Defer restart — must not shutdown the HTTP server from inside a request.
             self.root.after(50, self._sync_control_api_server)
         ok = not errors
+        state = self._control_state_ui()
+        with self._control_state_cache_lock:
+            self._control_state_cache = state
         return {
             "ok": ok,
             "applied": applied,
             "unknown": unknown,
             "errors": errors,
-            "state": self._control_state_ui(),
+            "state": state,
         }
 
     def _control_action_ui(self, name: str) -> dict:
@@ -3424,13 +3455,30 @@ class VectorApp:
         if handler is None:
             return {"ok": False, "error": f"unknown action: {name}", "actions": list(ACTIONS)}
         handler()
-        return {"ok": True, "action": name, "state": self._control_state_ui()}
+        state = self._control_state_ui()
+        with self._control_state_cache_lock:
+            self._control_state_cache = state
+        return {"ok": True, "action": name, "state": state}
 
     def control_schema(self) -> dict:
-        return run_on_ui(self.root, self._control_schema_ui)
+        cached = self._control_schema_cache
+        if cached is not None:
+            return cached
+        schema = run_on_ui(self.root, self._control_schema_ui)
+        self._control_schema_cache = schema
+        return schema
 
     def control_state(self) -> dict:
-        return run_on_ui(self.root, self._control_state_ui)
+        # Prefer the UI-thread cache so HTTP/WS polls never contend with the
+        # engine send path via run_on_ui / Tcl lock marshaling.
+        with self._control_state_cache_lock:
+            cached = self._control_state_cache
+        if cached is not None:
+            return copy.deepcopy(cached)
+        state = run_on_ui(self.root, self._control_state_ui)
+        with self._control_state_cache_lock:
+            self._control_state_cache = state
+        return copy.deepcopy(state)
 
     def control_patch(self, patch: dict) -> dict:
         return run_on_ui(self.root, lambda: self._control_patch_ui(patch))

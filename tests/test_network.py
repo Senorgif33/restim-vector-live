@@ -188,6 +188,17 @@ class NetworkTests(unittest.TestCase):
         finally:
             client.close()
 
+    def test_send_fails_fast_when_disconnected(self):
+        # Unreachable target: background monitor may block on connect, but send must not.
+        client = ReStimWebSocketClient(lambda _: None)
+        client._manual_disconnect = False
+        client._target = ("127.0.0.1", 1)
+        client._retry_at = 0.0
+        started = time.monotonic()
+        client.send_prostate(.1, .2, .3, .4, .5, .6, .7)
+        self.assertLess(time.monotonic() - started, 0.25)
+        client.close()
+
 
 if __name__ == "__main__":
     unittest.main()

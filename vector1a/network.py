@@ -206,14 +206,15 @@ class _ReconnectClient:
 
     def connect(self, host: str, port: int) -> None:
         self.disconnect(False)
-        self._target = (host, port)
+        target = (host, port)
+        self._target = target
         self._manual_disconnect = False
         try:
-            with self._lock:
-                self._connect_now()
+            sock = self._open_connection(target)
         except OSError:
             self._retry_at = time.monotonic() + 1.0
             raise
+        self._install_socket(sock, target)
 
     def disconnect(self, manual: bool = True) -> None:
         with self._lock:
@@ -225,30 +226,59 @@ class _ReconnectClient:
         if manual: self._target = None
         self.status("Disconnected")
 
-    def _ensure_connected(self) -> bool:
-        if self._socket: return True
-        if self._manual_disconnect or not self._target or time.monotonic() < self._retry_at: return False
-        try: self._connect_now()
+    def _open_connection(self, target: tuple[str, int]):
+        raise NotImplementedError
+
+    def _install_socket(self, sock, target: tuple[str, int]) -> None:
+        """Attach a live socket, or discard it if the target changed mid-connect."""
+        with self._lock:
+            if self._manual_disconnect or self._target != target or self._socket is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                return
+            self._socket = sock
+            self._on_socket_installed(target)
+
+    def _on_socket_installed(self, target: tuple[str, int]) -> None:
+        host, port = target
+        self.status(f"Connected to {host}:{port}")
+
+    def _attempt_reconnect(self) -> None:
+        """Background reconnect; never holds the send lock during blocking I/O."""
+        target = self._target
+        if self._manual_disconnect or not target or time.monotonic() < self._retry_at:
+            return
+        with self._lock:
+            if self._socket is not None or self._manual_disconnect or self._target != target:
+                return
+        try:
+            sock = self._open_connection(target)
         except OSError as exc:
             self._retry_at = time.monotonic() + 2.0
             self.status(f"Reconnecting: {exc}")
-        return self._socket is not None
+            return
+        self._install_socket(sock, target)
 
     def _monitor_connection(self) -> None:
         """Reconnect independently of output flow and notice silent peer closure."""
         while not self._closed.wait(0.5):
+            should_reconnect = False
             with self._lock:
                 if self._manual_disconnect or not self._target:
-                    continue
-                if self._socket is None:
-                    self._ensure_connected()
-                    continue
-                try:
-                    readable, _, _ = select.select([self._socket], [], [], 0)
-                    if readable and self._socket.recv(1, socket.MSG_PEEK) == b"":
-                        raise ConnectionResetError("ReStim closed the connection")
-                except (OSError, ValueError) as exc:
-                    self._failed(exc)
+                    pass
+                elif self._socket is not None:
+                    try:
+                        readable, _, _ = select.select([self._socket], [], [], 0)
+                        if readable and self._socket.recv(1, socket.MSG_PEEK) == b"":
+                            raise ConnectionResetError("ReStim closed the connection")
+                    except (OSError, ValueError) as exc:
+                        self._failed(exc)
+                elif time.monotonic() >= self._retry_at:
+                    should_reconnect = True
+            if should_reconnect:
+                self._attempt_reconnect()
 
     def close(self) -> None:
         self._closed.set()
@@ -265,11 +295,11 @@ class _ReconnectClient:
 
 
 class ReStimClient(_ReconnectClient):
-    def _connect_now(self) -> None:
-        assert self._target
-        host, port = self._target
-        sock = socket.create_connection((host, port), timeout=2.0); sock.settimeout(2.0)
-        self._socket = sock; self.status(f"Connected to {host}:{port}")
+    def _open_connection(self, target: tuple[str, int]):
+        host, port = target
+        sock = socket.create_connection((host, port), timeout=2.0)
+        sock.settimeout(2.0)
+        return sock
 
     def send(self, alpha: float, beta: float, volume: float, frequency=None,
              pulse_frequency=None, pulse_rise_time=None, pulse_width=None) -> None:
@@ -278,17 +308,20 @@ class ReStimClient(_ReconnectClient):
                             ("P3", pulse_rise_time), ("P1", pulse_width)):
             if value is not None: commands.append(format_command(axis, value))
         with self._lock:
-            if not self._ensure_connected(): return
-            try: self._socket.sendall((" ".join(commands) + "\n").encode("ascii"))
-            except OSError as exc: self._failed(exc)
+            if self._socket is None:
+                return
+            try:
+                self._socket.sendall((" ".join(commands) + "\n").encode("ascii"))
+            except OSError as exc:
+                self._failed(exc)
 
 
 class ReStimWebSocketClient(_ReconnectClient):
     """Dependency-free RFC 6455 client for ReStim's /tcode endpoint."""
-    def _connect_now(self) -> None:
-        assert self._target
-        host, port = self._target
-        sock = socket.create_connection((host, port), timeout=2.0); sock.settimeout(2.0)
+    def _open_connection(self, target: tuple[str, int]):
+        host, port = target
+        sock = socket.create_connection((host, port), timeout=2.0)
+        sock.settimeout(2.0)
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         request = (f"GET /tcode HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
                    f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
@@ -300,9 +333,12 @@ class ReStimWebSocketClient(_ReconnectClient):
         expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
         if not response.startswith(b"HTTP/1.1 101") or expected.lower() not in response.lower():
             sock.close(); raise OSError("ReStim rejected the WebSocket handshake")
-        self._socket = sock
+        return sock
+
+    def _on_socket_installed(self, target: tuple[str, int]) -> None:
         self._needs_neutral = getattr(self, "_has_connected", False)
         self._has_connected = True
+        host, port = target
         self.status(f"Connected to ws://{host}:{port}/tcode")
 
     @staticmethod
@@ -313,8 +349,10 @@ class ReStimWebSocketClient(_ReconnectClient):
         return bytes(header) + mask + bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
 
     def _send_message(self, message: str, neutral: str) -> None:
+        # Fail-fast: never reconnect from the send path. A dead peer (e.g. prostate
+        # ReStim closed) must not stall primary output on a 2s connect timeout.
         with self._lock:
-            if not self._ensure_connected():
+            if self._socket is None:
                 return
             try:
                 if getattr(self, "_needs_neutral", False):
