@@ -37,36 +37,96 @@ from .fourphase import (ELECTRODE_ORDERS, SPATIAL_MODELS, adaptive_crossover_wid
                         proportional_reversal_boost, reversal_emphasis_envelope,
                         stroke_phase_crossover, restim_crossfade, vertical_crossfade)
 from . import __version__
+from .control_api import (ACTIONS, CONTROL_META_FIELDS, PANEL_FIELDS, STATUS_KEYS,
+                          ControlApiServer, run_on_ui, writable_fields)
+
+
+THEME_COLORS = {
+    "light": {
+        "bg": "#f0f0f0",
+        "fg": "#1a1a1a",
+        "muted": "#555555",
+        "warning": "#9b4b00",
+        "canvas_bg": "#e6e6e6",
+        "canvas_highlight": "#999999",
+        "bar_fill": "#08ae2a",
+        "bar_marker": "#173b8f",
+        "preview_bg": "#f7f7f7",
+        "preview_outline": "#dddddd",
+        "preview_highlight": "#bbbbbb",
+        "preview_line": "#2a6fdb",
+        "preview_marker": "#cc4444",
+        "text_bg": "#f5f5f5",
+        "text_fg": "#1a1a1a",
+        "entry_bg": "#ffffff",
+        "button_bg": "#e1e1e1",
+        "select_bg": "#0078d7",
+    },
+    "dark": {
+        "bg": "#1e1e1e",
+        "fg": "#e0e0e0",
+        "muted": "#a0a0a0",
+        "warning": "#e0a060",
+        "canvas_bg": "#2d2d2d",
+        "canvas_highlight": "#555555",
+        "bar_fill": "#2ecc71",
+        "bar_marker": "#6db3f2",
+        "preview_bg": "#2a2a2a",
+        "preview_outline": "#555555",
+        "preview_highlight": "#666666",
+        "preview_line": "#5b9bd5",
+        "preview_marker": "#e07070",
+        "text_bg": "#2a2a2a",
+        "text_fg": "#e0e0e0",
+        "entry_bg": "#2d2d2d",
+        "button_bg": "#3a3a3a",
+        "select_bg": "#0a64a8",
+    },
+}
 
 
 class RangeBar(tk.Canvas):
     def __init__(self, parent, width=520, height=24):
+        colors = THEME_COLORS["light"]
         super().__init__(parent, width=width, height=height, highlightthickness=1,
-                         highlightbackground="#999", background="#e6e6e6")
+                         highlightbackground=colors["canvas_highlight"],
+                         background=colors["canvas_bg"])
         self._width, self._height = width, height
+        self._colors = colors
+        self._last: tuple[float, float, float] | None = None
+
+    def apply_theme(self, colors: dict) -> None:
+        self._colors = colors
+        self.configure(background=colors["canvas_bg"],
+                       highlightbackground=colors["canvas_highlight"])
+        if self._last is not None:
+            self.set(*self._last)
 
     def set(self, minimum: float, maximum: float, value: float) -> None:
         minimum, maximum, value = (min(1.0, max(0.0, x)) for x in (minimum, maximum, value))
+        self._last = (minimum, maximum, value)
         self.delete("all")
         self.create_rectangle(minimum * self._width, 1, maximum * self._width,
-                              self._height - 1, fill="#08ae2a", outline="")
+                              self._height - 1, fill=self._colors["bar_fill"], outline="")
         x = value * self._width
-        self.create_line(x, 0, x, self._height, fill="#173b8f", width=3)
+        self.create_line(x, 0, x, self._height, fill=self._colors["bar_marker"], width=3)
 
 
 class CollapsibleSection(ttk.Frame):
-    def __init__(self, parent, title: str, collapsed: bool = False):
+    def __init__(self, parent, title: str, collapsed: bool = False, on_toggle=None):
         super().__init__(parent, padding=(2, 2))
         self.title = title
         self.collapsed = collapsed
+        self.on_toggle = on_toggle
         self.summary = tk.StringVar(value="")
         self.button = ttk.Button(self, width=3, command=self.toggle)
-        self.button.grid(row=0, column=0, padx=(2, 5))
+        self.button.grid(row=0, column=0, padx=(2, 5), sticky="nw")
         ttk.Label(self, text=title, font=("TkDefaultFont", 10, "bold")) \
-            .grid(row=0, column=1, sticky="w")
-        ttk.Label(self, textvariable=self.summary, foreground="#555") \
-            .grid(row=0, column=2, sticky="w", padx=12)
+            .grid(row=0, column=1, sticky="nw")
+        self._summary_label = ttk.Label(self, textvariable=self.summary, style="Muted.TLabel")
+        self._summary_label.grid(row=0, column=2, sticky="ew", padx=12)
         self.columnconfigure(2, weight=1)
+        self.rowconfigure(1, weight=1)
         self.body = ttk.Frame(self, padding=(10, 6))
         self.body.grid(row=1, column=0, columnspan=3, sticky="nsew")
         ttk.Separator(self, orient="horizontal").grid(row=2, column=0, columnspan=3, sticky="ew")
@@ -75,6 +135,8 @@ class CollapsibleSection(ttk.Frame):
     def toggle(self) -> None:
         self.collapsed = not self.collapsed
         self._render()
+        if self.on_toggle is not None:
+            self.on_toggle()
 
     def _render(self) -> None:
         self.button.configure(text="▶" if self.collapsed else "▼")
@@ -154,12 +216,14 @@ class VectorApp:
         "media_volume_ramp_ceiling3", "media_volume_ramp_curve",
         "media_volume_ramp_waypoints_enabled",
         "events_enabled", "events_file_path", "events_definitions_path",
+        "control_api_enabled", "control_api_host", "control_api_port",
+        "ui_dark_mode",
     )
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title(f"Vector 1A {__version__} - MFP to ReStim")
-        root.geometry("1360x900")
+        root.geometry("1480x900")
         root.minsize(980, 720)
 
         self.mfp_status = tk.StringVar(value="Disconnected")
@@ -205,6 +269,14 @@ class VectorApp:
         self.events_file_path = tk.StringVar(value="")
         self.events_definitions_path = tk.StringVar(value="")
         self.events_status = tk.StringVar(value="Events: off")
+        self.control_api_enabled = tk.BooleanVar(value=False)
+        self.control_api_host = tk.StringVar(value="0.0.0.0")
+        self.control_api_port = tk.IntVar(value=8787)
+        self.control_api_status = tk.StringVar(value="Off")
+        self.ui_dark_mode = tk.BooleanVar(value=False)
+        self._control_api: ControlApiServer | None = None
+        self._theme = THEME_COLORS["light"]
+        self._range_bars: list[RangeBar] = []
         self.rate = tk.IntVar(value=50)
         self.lookahead = tk.DoubleVar(value=2.0)
         self.volume = tk.DoubleVar(value=0.70)
@@ -373,28 +445,157 @@ class VectorApp:
         self.engine.start()
         self.root.after(100, self._refresh)
         self.root.after(350, self._auto_start_session)
+        self.root.after(0, self._sync_control_api_server)
         if self._first_run:
             self.root.after(500, self.show_setup_guide)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
-    def _frame(self, title: str, row: int, column: int = 0, span: int = 1) -> ttk.Frame:
+    def _frame(self, title: str, row: int, column: int = 0, span: int = 1,
+               parent: ttk.Frame | None = None) -> ttk.Frame:
         collapsed_titles = {
             "Frequency", "Pulse frequency", "Pulse rise time", "Pulse width",
             "Prostate controls", "Four-phase primary motion",
             "Xbox controller", "Rolling Variety", "Live diagnostics",
+            "Remote control API",
         }
-        section = CollapsibleSection(self.root, title, collapsed=(title in collapsed_titles))
-        section.grid(row=row + 1, column=column, columnspan=span, sticky="nsew", padx=10, pady=3)
+        host = parent if parent is not None else self._scroll_body
+        section = CollapsibleSection(
+            host, title, collapsed=(title in collapsed_titles),
+            on_toggle=self._refresh_scroll_region)
+        section.grid(row=row, column=column, columnspan=span, sticky="nsew", padx=10, pady=3)
         self.sections[title] = section
         return section.body
 
+    def _refresh_scroll_region(self) -> None:
+        canvas = getattr(self, "_scroll_canvas", None)
+        if canvas is None:
+            return
+        self.root.update_idletasks()
+        bbox = canvas.bbox("all")
+        if bbox is not None:
+            canvas.configure(scrollregion=bbox)
+
+    def _on_mousewheel(self, event) -> None:
+        canvas = getattr(self, "_scroll_canvas", None)
+        shell = getattr(self, "_scroll_shell", None)
+        if canvas is None or shell is None:
+            return
+        try:
+            x, y = event.x_root, event.y_root
+            if not (shell.winfo_rootx() <= x < shell.winfo_rootx() + shell.winfo_width()
+                    and shell.winfo_rooty() <= y < shell.winfo_rooty() + shell.winfo_height()):
+                return
+        except tk.TclError:
+            return
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        if widget is not None and widget.winfo_class() in (
+                "Text", "Listbox", "Treeview", "TCombobox", "TSpinbox", "Spinbox"):
+            return
+        if getattr(event, "delta", 0):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        elif getattr(event, "num", None) == 4:
+            canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5:
+            canvas.yview_scroll(1, "units")
+
+    def _on_theme_toggle(self) -> None:
+        self._apply_theme()
+        self._save_settings()
+
+    def _apply_theme(self) -> None:
+        mode = "dark" if self.ui_dark_mode.get() else "light"
+        colors = THEME_COLORS[mode]
+        self._theme = colors
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        self.root.configure(background=colors["bg"])
+        style.configure(".", background=colors["bg"], foreground=colors["fg"],
+                        fieldbackground=colors["entry_bg"], bordercolor=colors["canvas_highlight"],
+                        troughcolor=colors["canvas_bg"], darkcolor=colors["bg"],
+                        lightcolor=colors["bg"], focuscolor=colors["select_bg"])
+        style.configure("TFrame", background=colors["bg"])
+        style.configure("TLabel", background=colors["bg"], foreground=colors["fg"])
+        style.configure("TButton", background=colors["button_bg"], foreground=colors["fg"])
+        style.configure("TCheckbutton", background=colors["bg"], foreground=colors["fg"],
+                        indicatorcolor=colors["entry_bg"])
+        style.configure("TRadiobutton", background=colors["bg"], foreground=colors["fg"],
+                        indicatorcolor=colors["entry_bg"])
+        style.configure("TEntry", fieldbackground=colors["entry_bg"], foreground=colors["fg"],
+                        insertcolor=colors["fg"])
+        style.configure("TSpinbox", fieldbackground=colors["entry_bg"], foreground=colors["fg"],
+                        insertcolor=colors["fg"], arrowcolor=colors["fg"])
+        style.configure("TCombobox", fieldbackground=colors["entry_bg"], foreground=colors["fg"],
+                        arrowcolor=colors["fg"])
+        style.configure("TScrollbar", background=colors["button_bg"], troughcolor=colors["canvas_bg"],
+                        arrowcolor=colors["fg"])
+        style.configure("TSeparator", background=colors["muted"])
+        style.configure("TLabelframe", background=colors["bg"], foreground=colors["fg"])
+        style.configure("TLabelframe.Label", background=colors["bg"], foreground=colors["fg"])
+        style.configure("Muted.TLabel", background=colors["bg"], foreground=colors["muted"])
+        style.configure("Warning.TLabel", background=colors["bg"], foreground=colors["warning"])
+        style.configure(
+            "Treeview",
+            background=colors["entry_bg"],
+            foreground=colors["fg"],
+            fieldbackground=colors["entry_bg"],
+            bordercolor=colors["canvas_highlight"],
+            lightcolor=colors["entry_bg"],
+            darkcolor=colors["entry_bg"])
+        style.configure(
+            "Treeview.Heading",
+            background=colors["button_bg"],
+            foreground=colors["fg"],
+            bordercolor=colors["canvas_highlight"],
+            relief="flat")
+        style.map(
+            "Treeview",
+            background=[("selected", colors["select_bg"])],
+            foreground=[("selected", "#ffffff")])
+        style.map(
+            "Treeview.Heading",
+            background=[("active", colors["canvas_highlight"])],
+            foreground=[("active", colors["fg"])])
+        style.map("TButton",
+                  background=[("active", colors["canvas_highlight"]), ("pressed", colors["select_bg"])],
+                  foreground=[("disabled", colors["muted"])])
+        style.map("TCheckbutton",
+                  background=[("active", colors["bg"])],
+                  foreground=[("disabled", colors["muted"])])
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", colors["entry_bg"])],
+                  foreground=[("readonly", colors["fg"])],
+                  selectbackground=[("readonly", colors["select_bg"])],
+                  selectforeground=[("readonly", "#ffffff")])
+        canvas = getattr(self, "_scroll_canvas", None)
+        if canvas is not None:
+            canvas.configure(background=colors["bg"], highlightbackground=colors["bg"])
+        preview = getattr(self, "media_ramp_curve_preview", None)
+        if preview is not None:
+            preview.configure(background=colors["preview_bg"],
+                              highlightbackground=colors["preview_highlight"])
+            self._redraw_media_ramp_curve_preview()
+        events_text = getattr(self, "events_status_text", None)
+        if events_text is not None:
+            events_text.configure(background=colors["text_bg"], foreground=colors["text_fg"],
+                                  insertbackground=colors["text_fg"],
+                                  highlightbackground=colors["canvas_highlight"])
+        for bar in getattr(self, "_range_bars", []):
+            bar.apply_theme(colors)
+        tree = getattr(self, "media_ramp_waypoint_tree", None)
+        if tree is not None:
+            tree.tag_configure(
+                "row", background=colors["entry_bg"], foreground=colors["fg"])
+            self._refresh_media_ramp_waypoint_tree()
+
     def _build(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(13, weight=1)
+        self.root.rowconfigure(1, weight=1)
 
         toolbar = ttk.Frame(self.root, padding=(12, 6))
-        toolbar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        toolbar.grid(row=0, column=0, sticky="ew")
         ttk.Label(toolbar, text="ReStim Vector Live", font=("TkDefaultFont", 10, "bold")).pack(side="left")
         ttk.Button(toolbar, text="START / RESUME", command=self.resume).pack(side="left", padx=(24, 6))
         ttk.Button(toolbar, text="Neutral", command=self.neutral).pack(side="left", padx=6)
@@ -405,10 +606,54 @@ class VectorApp:
         ttk.Button(toolbar, text="Connection log", command=self.show_connection_log).pack(side="left", padx=6)
         ttk.Button(toolbar, text="MFP axes", command=self.show_axis_routing).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Session startup", command=self.show_session_startup).pack(side="left", padx=6)
-        ttk.Label(toolbar, textvariable=self.diag_vars["state"]).pack(side="right", padx=8)
-        ttk.Label(toolbar, textvariable=self.session_ready_status, font=("TkDefaultFont", 9, "bold")).pack(side="right", padx=12)
+        right_bar = ttk.Frame(toolbar)
+        right_bar.pack(side="right")
+        ttk.Checkbutton(
+            right_bar, text="Dark mode", width=11, variable=self.ui_dark_mode,
+            command=self._on_theme_toggle).pack(side="left", padx=(8, 4))
+        ttk.Label(
+            right_bar, textvariable=self.session_ready_status,
+            font=("TkDefaultFont", 9, "bold")).pack(side="left", padx=8)
+        ttk.Label(right_bar, textvariable=self.diag_vars["state"]).pack(side="left", padx=(4, 8))
 
-        mfp = self._frame("MultiFunPlayer input", 0, 0)
+        self._scroll_shell = ttk.Frame(self.root)
+        self._scroll_shell.grid(row=1, column=0, sticky="nsew")
+        self._scroll_shell.columnconfigure(0, weight=1)
+        self._scroll_shell.rowconfigure(0, weight=1)
+
+        self._scroll_canvas = tk.Canvas(self._scroll_shell, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(
+            self._scroll_shell, orient="vertical", command=self._scroll_canvas.yview)
+        self._scroll_canvas.configure(yscrollcommand=scrollbar.set)
+        self._scroll_canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        self._scroll_body = ttk.Frame(self._scroll_canvas)
+        self._scroll_body.columnconfigure(0, weight=1, uniform="main")
+        self._scroll_body.columnconfigure(1, weight=1, uniform="main")
+        self._scroll_window = self._scroll_canvas.create_window(
+            (0, 0), window=self._scroll_body, anchor="nw")
+
+        def _on_body_configure(_event=None) -> None:
+            self._refresh_scroll_region()
+
+        def _on_canvas_configure(event) -> None:
+            self._scroll_canvas.itemconfigure(self._scroll_window, width=event.width)
+
+        self._scroll_body.bind("<Configure>", _on_body_configure)
+        self._scroll_canvas.bind("<Configure>", _on_canvas_configure)
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.root.bind_all("<Button-4>", self._on_mousewheel)
+        self.root.bind_all("<Button-5>", self._on_mousewheel)
+
+        io_row = ttk.Frame(self._scroll_body)
+        io_row.grid(row=0, column=0, columnspan=2, sticky="ew")
+        io_row.columnconfigure(0, weight=1, uniform="io")
+        io_row.columnconfigure(1, weight=1, uniform="io")
+        io_row.rowconfigure(0, weight=1)
+
+        mfp = self._frame("MultiFunPlayer input", 0, 0, parent=io_row)
+        mfp.columnconfigure(0, minsize=88)
         ttk.Label(mfp, text="Bind address").grid(row=0, column=0, sticky="w")
         ttk.Entry(mfp, textvariable=self.mfp_host, width=16).grid(row=0, column=1, padx=5)
         ttk.Label(mfp, text="Port").grid(row=0, column=2)
@@ -416,12 +661,13 @@ class VectorApp:
         ttk.Button(mfp, text="Start listener", command=self.start_listener).grid(row=1, column=0, pady=8)
         ttk.Button(mfp, text="Stop listener", command=self.listener.stop).grid(row=1, column=1, pady=8)
         ttk.Label(mfp, textvariable=self.mfp_status).grid(row=1, column=2, columnspan=2, sticky="w")
-        ttk.Label(mfp, textvariable=self.authored_axes_status, foreground="#555").grid(
+        ttk.Label(mfp, textvariable=self.authored_axes_status, style="Muted.TLabel").grid(
             row=2, column=0, columnspan=4, sticky="w", pady=(0, 4))
-        ttk.Label(mfp, textvariable=self.timeline_status, foreground="#555").grid(
-            row=3, column=0, columnspan=4, sticky="w", pady=(0, 4))
+        ttk.Label(mfp, textvariable=self.timeline_status, style="Muted.TLabel").grid(
+            row=3, column=0, columnspan=4, sticky="nw", pady=(0, 4))
 
-        restim = self._frame("ReStim output", 0, 1)
+        restim = self._frame("ReStim output", 0, 1, parent=io_row)
+        restim.columnconfigure(0, minsize=88)
         ttk.Label(restim, text="Primary WS").grid(row=0, column=0, sticky="w")
         ttk.Entry(restim, textvariable=self.restim_host, width=16).grid(row=0, column=1, padx=5)
         ttk.Label(restim, text="Port").grid(row=0, column=2)
@@ -480,7 +726,7 @@ class VectorApp:
                     textvariable=self.variation_fade_seconds, width=8,
                     command=self.apply_config).grid(row=4, column=4, sticky="w")
         ttk.Label(motion, textvariable=self.variation_depth_live,
-                  foreground="#555").grid(row=4, column=5, sticky="w", padx=8)
+                  style="Muted.TLabel").grid(row=4, column=5, sticky="w", padx=8)
         ttk.Label(motion, text="Spatial response").grid(row=5, column=0, sticky="w", pady=(4, 0))
         ttk.Combobox(motion, textvariable=self.four_phase_spatial_curve,
                      values=("Linear", "S-curve", "Endpoint emphasis", "Centre emphasis"),
@@ -498,7 +744,7 @@ class VectorApp:
         ttk.Spinbox(motion, from_=0, to=1, increment=.05,
                     textvariable=self.four_phase_reversal_strength, width=8).grid(row=6, column=4, sticky="w")
         ttk.Label(motion, textvariable=self.four_phase_reversal_live,
-                  foreground="#555").grid(row=6, column=5, sticky="w", padx=8)
+                  style="Muted.TLabel").grid(row=6, column=5, sticky="w", padx=8)
         ttk.Checkbutton(motion, text="Stroke-phase texture",
                         variable=self.four_phase_stroke_phase_texture).grid(row=7, column=0, sticky="w")
         ttk.Label(motion, text="L0 rising volume ×").grid(row=7, column=1, sticky="e")
@@ -508,7 +754,7 @@ class VectorApp:
         ttk.Spinbox(motion, from_=.8, to=1, increment=.01,
                     textvariable=self.motion_falling_volume_multiplier, width=8).grid(row=7, column=4, sticky="w")
         ttk.Label(motion, text="Shared by 3-phase and 4-phase",
-                   foreground="#555").grid(row=7, column=5, sticky="w", padx=8)
+                   style="Muted.TLabel").grid(row=7, column=5, sticky="w", padx=8)
         ttk.Button(motion, text="Explain these controls", command=self.show_motion_guide).grid(
             row=8, column=5, sticky="e", pady=(5, 0))
 
@@ -550,7 +796,8 @@ class VectorApp:
         ramp_curve_box.bind("<<ComboboxSelected>>", self._on_media_ramp_curve_selected)
         self.media_ramp_curve_preview = tk.Canvas(
             ramp_frame, width=280, height=96, highlightthickness=1,
-            highlightbackground="#bbb", background="#f7f7f7")
+            highlightbackground=THEME_COLORS["light"]["preview_highlight"],
+            background=THEME_COLORS["light"]["preview_bg"])
         self.media_ramp_curve_preview.grid(row=0, column=7, rowspan=3, sticky="nw",
                                            padx=(12, 0))
 
@@ -608,7 +855,7 @@ class VectorApp:
                    command=self._export_media_ramp_waypoints).pack(fill="x", pady=1)
 
         ttk.Label(ramp_frame, textvariable=self.media_ramp_status,
-                  foreground="#555").grid(row=4, column=0, columnspan=8, sticky="w",
+                  style="Muted.TLabel").grid(row=4, column=0, columnspan=8, sticky="w",
                                           pady=(4, 0))
         ttk.Label(ramp_frame, text=(
             "Scales primary and prostate volume from Timeline Absolute (T0/T1). "
@@ -619,7 +866,7 @@ class VectorApp:
             "Ceiling 2/3 controls appear when used. Import/Export supports Vector JSON "
             "or OFS volume .funscript (baked actions + bookmarks + re-edit metadata). "
             "Distinct from motion rest-volume."),
-            foreground="#555", wraplength=900).grid(
+            style="Muted.TLabel", wraplength=900).grid(
                 row=5, column=0, columnspan=8, sticky="w", pady=(2, 0))
         self._refresh_media_ramp_waypoint_tree()
         self._refresh_extra_level_controls()
@@ -646,7 +893,9 @@ class VectorApp:
         status_row.grid(row=2, column=0, columnspan=4, sticky="we", pady=(4, 0))
         self.events_status_text = tk.Text(
             status_row, height=2, wrap="word", relief="solid", borderwidth=1,
-            font=("TkDefaultFont", 9), background="#f5f5f5")
+            font=("TkDefaultFont", 9),
+            background=THEME_COLORS["light"]["text_bg"],
+            foreground=THEME_COLORS["light"]["text_fg"])
         self.events_status_text.pack(side="left", fill="x", expand=True)
         self.events_status_text.insert("1.0", self.events_status.get())
         self.events_status_text.configure(state="disabled")
@@ -665,7 +914,7 @@ class VectorApp:
             "Leave Definitions blank to use Vector's bundled defs (includes S1). "
             "3P defs (alpha/beta) and 4P defs (e1–e4) require the matching ReStim mode. "
             "Do not also bake the same events offline into authored funscripts (double apply)."),
-            foreground="#555", wraplength=900).grid(
+            style="Muted.TLabel", wraplength=900).grid(
                 row=3, column=0, columnspan=4, sticky="w", pady=(2, 0))
         events_frame.columnconfigure(1, weight=1)
 
@@ -690,6 +939,7 @@ class VectorApp:
         pulse_frame = self._frame("Pulse frequency", 6, 0, 2)
         ttk.Label(pulse_frame, text="0").grid(row=0, column=0)
         self.pulse_frequency_bar = RangeBar(pulse_frame)
+        self._range_bars.append(self.pulse_frequency_bar)
         self.pulse_frequency_bar.grid(row=0, column=1, padx=8)
         ttk.Label(pulse_frame, text="1").grid(row=0, column=2)
         self.pulse_frequency_value = tk.StringVar(value="0.0000")
@@ -709,6 +959,7 @@ class VectorApp:
         rise_frame = self._frame("Pulse rise time", 7, 0, 2)
         ttk.Label(rise_frame, text="0 sharp").grid(row=0, column=0)
         self.pulse_rise_bar = RangeBar(rise_frame)
+        self._range_bars.append(self.pulse_rise_bar)
         self.pulse_rise_bar.grid(row=0, column=1, padx=8)
         ttk.Label(rise_frame, text="1 soft").grid(row=0, column=2)
         self.pulse_rise_value = tk.StringVar(value="0.0000")
@@ -726,6 +977,7 @@ class VectorApp:
         width_frame = self._frame("Pulse width", 8, 0, 2)
         ttk.Label(width_frame, text="0 narrow").grid(row=0, column=0)
         self.pulse_width_bar = RangeBar(width_frame)
+        self._range_bars.append(self.pulse_width_bar)
         self.pulse_width_bar.grid(row=0, column=1, padx=8)
         ttk.Label(width_frame, text="1 wide").grid(row=0, column=2)
         self.pulse_width_value = tk.StringVar(value="0.0000")
@@ -793,7 +1045,7 @@ class VectorApp:
             self.four_phase_bars.append(bar); self.four_phase_values.append(value)
         ttk.Label(four_phase,
                   text="Last transmitted E1-E4 Primary output.",
-                  foreground="#9b4b00").grid(row=0, column=5, rowspan=4, sticky="w", padx=18)
+                  style="Warning.TLabel").grid(row=0, column=5, rowspan=4, sticky="w", padx=18)
         ttk.Label(four_phase, text="Return depth").grid(row=4, column=0, sticky="w")
         ttk.Spinbox(four_phase, from_=0, to=1, increment=.05,
                     textvariable=self.four_phase_return_depth, width=7).grid(
@@ -875,7 +1127,7 @@ class VectorApp:
                     textvariable=self.four_phase_full_depth_capture, width=7).grid(
                         row=11, column=1, sticky="w")
         ttk.Label(four_phase, textvariable=self.four_phase_model_live,
-                  foreground="#9b4b00").grid(
+                  style="Warning.TLabel").grid(
                       row=11, column=2, columnspan=4, sticky="w", pady=(2, 4))
         ttk.Label(four_phase, text="Change width through each stroke").grid(row=12, column=0, sticky="w")
         ttk.Label(four_phase, text="Accelerating width ×").grid(row=12, column=1, sticky="e")
@@ -899,7 +1151,7 @@ class VectorApp:
                     textvariable=self.four_phase_group_delay_transition, width=7).grid(
                         row=13, column=4, sticky="w")
         ttk.Label(four_phase, textvariable=self.four_phase_group_delay_live,
-                  foreground="#555").grid(row=13, column=5, sticky="w")
+                  style="Muted.TLabel").grid(row=13, column=5, sticky="w")
         ttk.Checkbutton(four_phase, text="Bias sequence within each stroke",
                         variable=self.four_phase_moving_sequence).grid(row=14, column=0, sticky="w")
         ttk.Label(four_phase, text="Maximum blend").grid(row=14, column=1, sticky="e")
@@ -911,7 +1163,7 @@ class VectorApp:
                     textvariable=self.four_phase_moving_sequence_width, width=7).grid(
                         row=14, column=4, sticky="w")
         ttk.Label(four_phase, textvariable=self.four_phase_moving_sequence_live,
-                   foreground="#555").grid(row=14, column=5, sticky="w")
+                   style="Muted.TLabel").grid(row=14, column=5, sticky="w")
         ttk.Button(four_phase, text="Explain these controls",
                    command=self.show_four_phase_guide).grid(
                        row=5, column=1, columnspan=2, sticky="w", padx=(8, 0))
@@ -944,7 +1196,7 @@ class VectorApp:
             self.four_phase_potential_values.append(value)
         self.four_phase_roles = tk.StringVar(value="Primary -- | preferred return --")
         ttk.Label(four_phase, textvariable=self.four_phase_roles,
-                  foreground="#9b4b00").grid(row=20, column=5, rowspan=4, sticky="w", padx=18)
+                  style="Warning.TLabel").grid(row=20, column=5, rowspan=4, sticky="w", padx=18)
         ttk.Checkbutton(four_phase,
                         text="Send E1–E4 visual test (FOC-Stim hardware MUST be disconnected)",
                         variable=self.send_four_phase_visual,
@@ -1038,9 +1290,45 @@ class VectorApp:
             ttk.Label(diagnostics, textvariable=self.diag_vars[key], font=("TkDefaultFont", 10, "bold")) \
                 .grid(row=row, column=col + 1, sticky="w", padx=8, pady=5)
 
+        remote = self._frame("Remote control API", 15, 0, 2)
+        ttk.Checkbutton(
+            remote, text="Enable LAN control API (no auth — trusted LAN only)",
+            variable=self.control_api_enabled,
+            command=self._sync_control_api_server).grid(row=0, column=0, columnspan=4, sticky="w", padx=6)
+        ttk.Label(remote, text="Bind address").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(remote, textvariable=self.control_api_host, width=16).grid(row=1, column=1, padx=4)
+        ttk.Label(remote, text="Port").grid(row=1, column=2, sticky="e")
+        ttk.Spinbox(remote, from_=1, to=65535, textvariable=self.control_api_port, width=7).grid(
+            row=1, column=3, padx=4, sticky="w")
+        ttk.Button(remote, text="Apply bind", command=self._sync_control_api_server).grid(
+            row=1, column=4, padx=8)
+        ttk.Label(remote, textvariable=self.control_api_status).grid(
+            row=2, column=0, columnspan=5, sticky="w", padx=6, pady=(2, 4))
+        ttk.Label(
+            remote,
+            text="Phone browser: GET/POST http://<pc-lan-ip>:<port>/v1/state  ·  WS /v1/stream",
+            style="Muted.TLabel").grid(row=3, column=0, columnspan=5, sticky="w", padx=6, pady=(0, 4))
+
+        self._apply_theme()
+        self.root.after_idle(self._refresh_scroll_region)
+
     def _set_mfp_status(self, text: str) -> None:
         self._record_connection_event("MFP", text)
         self.root.after(0, self.mfp_status.set, text)
+
+    @staticmethod
+    def _brief_conn_status(text: str) -> str:
+        value = (text or "").strip()
+        lower = value.lower()
+        if lower.startswith("connected"):
+            return "Connected"
+        if lower.startswith("disconnected"):
+            return "Disconnected"
+        if lower.startswith("connecting"):
+            return "Connecting"
+        if lower.startswith("error"):
+            return "Error"
+        return value.split(" ", 1)[0] if value else "—"
 
     def _set_restim_status(self, text: str) -> None:
         self._record_connection_event("Primary", text)
@@ -1319,7 +1607,8 @@ class VectorApp:
                 "", "end",
                 values=(format_media_time(point.time_s),
                         RAMP_LEVEL_LABELS.get(point.level, point.level),
-                        point.curve))
+                        point.curve),
+                tags=("row",))
 
     def _default_add_waypoint_time(self) -> float:
         if not self._media_ramp_waypoints:
@@ -1530,12 +1819,14 @@ class VectorApp:
         canvas = getattr(self, "media_ramp_curve_preview", None)
         if canvas is None:
             return
+        colors = getattr(self, "_theme", THEME_COLORS["light"])
         width = int(canvas.winfo_reqwidth() or 280)
         height = int(canvas.winfo_reqheight() or 96)
         pad = 6
         canvas.delete("all")
         canvas.create_rectangle(
-            pad, pad, width - pad, height - pad, outline="#ddd", fill="#f7f7f7")
+            pad, pad, width - pad, height - pad,
+            outline=colors["preview_outline"], fill=colors["preview_bg"])
         inner_w = max(1, width - 2 * pad)
         inner_h = max(1, height - 2 * pad)
         samples = 96
@@ -1555,7 +1846,7 @@ class VectorApp:
                 y = pad + (1.0 - gain) * inner_h
                 points.extend((x, y))
             if len(points) >= 4:
-                canvas.create_line(*points, fill="#2a6fdb", width=1, smooth=True)
+                canvas.create_line(*points, fill=colors["preview_line"], width=1, smooth=True)
             for point in waypoints:
                 frac = min(1.0, max(0.0, point.time_s / end_s))
                 x = pad + frac * inner_w
@@ -1564,8 +1855,9 @@ class VectorApp:
                     floor1, ceiling1, floor2, ceiling2, floor3, ceiling3,
                     self.media_volume_ramp_curve.get())) * inner_h
                 # Small tick + dot (not full-height bars).
-                canvas.create_line(x, y - 5, x, y + 5, fill="#c44", width=1)
-                canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#c44", outline="")
+                canvas.create_line(x, y - 5, x, y + 5, fill=colors["preview_marker"], width=1)
+                canvas.create_oval(
+                    x - 2, y - 2, x + 2, y + 2, fill=colors["preview_marker"], outline="")
             return
         name = self.media_volume_ramp_curve.get()
         for index in range(samples + 1):
@@ -1575,7 +1867,7 @@ class VectorApp:
             y = pad + (1.0 - shaped) * inner_h
             points.extend((x, y))
         if len(points) >= 4:
-            canvas.create_line(*points, fill="#2a6fdb", width=1, smooth=True)
+            canvas.create_line(*points, fill=colors["preview_line"], width=1, smooth=True)
 
     def _media_volume_gain_at(self, calculated_at: float) -> float | None:
         if not self.media_volume_ramp_enabled.get():
@@ -1638,7 +1930,7 @@ class VectorApp:
             ttk.Button(body, text="Browse…",
                        command=lambda v=target: self._browse_launch_target(v)).grid(
                            row=row, column=3, sticky="e")
-        ttk.Label(body, textvariable=self.startup_status, foreground="#555").grid(
+        ttk.Label(body, textvariable=self.startup_status, style="Muted.TLabel").grid(
             row=5, column=0, columnspan=4, sticky="w", pady=(12, 6))
         buttons = ttk.Frame(body)
         buttons.grid(row=6, column=0, columnspan=4, sticky="ew")
@@ -1760,10 +2052,10 @@ class VectorApp:
         ttk.Label(state_frame, textvariable=discovered_text).pack(anchor="w")
         ttk.Label(state_frame, textvariable=live_text).pack(anchor="w", pady=(2, 0))
         ttk.Label(state_frame, textvariable=mode_text, font=("TkDefaultFont", 9, "bold")).pack(anchor="w", pady=(2, 0))
-        ttk.Label(state_frame, textvariable=timeline_text, foreground="#555").pack(anchor="w", pady=(2, 0))
+        ttk.Label(state_frame, textvariable=timeline_text, style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
         ttk.Label(state_frame, text=(
             "T0/T1 (or configured timeline axes) are media clock only and cannot be routed to ReStim."),
-            foreground="#555", wraplength=840).pack(anchor="w", pady=(4, 0))
+            style="Muted.TLabel", wraplength=840).pack(anchor="w", pady=(4, 0))
 
         frame = ttk.Frame(outer)
         frame.pack(fill="x", expand=False)
@@ -2486,9 +2778,9 @@ class VectorApp:
         ttk.Spinbox(body, from_=.1, to=10, increment=.1,
                     textvariable=self.preset_transition_seconds, width=7).grid(row=3, column=3)
         ttk.Label(body, textvariable=self.preset_status,
-                  foreground="#555").grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 2))
+                  style="Muted.TLabel").grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 2))
         ttk.Label(body, text="Keyboard: [ applies A, ] applies B. Direct Xbox: hold LB and press RB to toggle A/B.",
-                  foreground="#555").grid(row=5, column=0, columnspan=4, sticky="w")
+                  style="Muted.TLabel").grid(row=5, column=0, columnspan=4, sticky="w")
 
     def show_setup_guide(self) -> None:
         messagebox.showinfo(
@@ -2906,7 +3198,9 @@ class VectorApp:
                 self.mfp_status.set(current)
         summaries = {
             "MultiFunPlayer input": f"{self.mfp_status.get()} | {self.mfp_host.get()}:{self.mfp_port.get()}",
-            "ReStim output": f"Primary: {self.restim_status.get()} | Prostate: {self.prostate_status.get()}",
+            "ReStim output": (
+                f"Primary: {self._brief_conn_status(self.restim_status.get())} | "
+                f"Prostate: {self._brief_conn_status(self.prostate_status.get())}"),
             "Motion": f"{self.mode.get()} | {self.rate.get()} Hz | {self.lookahead.get():.2f} s delay",
             "Volume response": (
                 f"Base {self.volume.get() * 100:.0f}% | "
@@ -2928,13 +3222,227 @@ class VectorApp:
             "Live diagnostics": (f"{diag.state} | buffer {diag.buffer_fill} | delay {diag.actual_queue_delay:.4f} s"
                                  if diag.output_samples else
                                  f"{diag.state} | buffer {diag.buffer_fill} | waiting for output"),
+            "Remote control API": self.control_api_status.get(),
         }
         for title, summary in summaries.items():
-            self.sections[title].summary.set(summary)
+            section = self.sections.get(title)
+            if section is not None:
+                section.summary.set(summary)
         self.root.after(100, self._refresh)
+
+    def _sync_control_api_server(self) -> None:
+        if self._control_api is not None:
+            self._control_api.stop()
+            self._control_api = None
+        if not self.control_api_enabled.get():
+            self.control_api_status.set("Off")
+            return
+        host = self.control_api_host.get().strip() or "0.0.0.0"
+        try:
+            port = int(self.control_api_port.get())
+        except (tk.TclError, TypeError, ValueError):
+            self.control_api_status.set("Invalid port")
+            return
+        try:
+            server = ControlApiServer(self, host, port)
+            server.start()
+            self._control_api = server
+            self.control_api_status.set(f"Listening on {host}:{port}")
+            self._save_settings()
+        except OSError as exc:
+            self.control_api_status.set(f"Bind failed: {exc}")
+
+    def _writable_control_fields(self) -> tuple[str, ...]:
+        return writable_fields(self.SETTINGS_FIELDS)
+
+    def _coerce_control_value(self, var: tk.Variable, value: object) -> object:
+        if isinstance(var, tk.BooleanVar):
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on")
+            return bool(value)
+        if isinstance(var, tk.IntVar):
+            return int(value)
+        if isinstance(var, tk.DoubleVar):
+            return float(value)
+        return str(value)
+
+    def _control_state_ui(self) -> dict:
+        settings = {}
+        for name in self._writable_control_fields():
+            try:
+                settings[name] = getattr(self, name).get()
+            except (tk.TclError, AttributeError):
+                continue
+        status = {}
+        for name in STATUS_KEYS:
+            try:
+                status[name] = getattr(self, name).get()
+            except (tk.TclError, AttributeError):
+                status[name] = None
+        diag = self.engine.diagnostics()
+        diagnostics = {
+            "raw_l0": diag.raw_l0,
+            "output_l0": diag.output_l0,
+            "speed_percent": diag.speed_percent,
+            "alpha": diag.alpha,
+            "beta": diag.beta,
+            "buffer_fill": diag.buffer_fill,
+            "lookahead_seconds": diag.lookahead_seconds,
+            "actual_queue_delay": diag.actual_queue_delay,
+            "input_samples": diag.input_samples,
+            "output_samples": diag.output_samples,
+            "state": diag.state,
+            "output_mode": diag.output_mode,
+            "output_volume": diag.output_volume,
+            "frequency": diag.frequency,
+            "pulse_frequency": diag.pulse_frequency,
+            "pulse_rise_time": diag.pulse_rise_time,
+            "pulse_width": diag.pulse_width,
+            "alpha_prostate": diag.alpha_prostate,
+            "beta_prostate": diag.beta_prostate,
+            "volume_prostate": diag.volume_prostate,
+            "variation_depth": diag.variation_depth,
+            "active_mode": self.engine.mode.value,
+        }
+        with self._four_phase_live_lock:
+            electrodes, morph_source, morph_target, morph_amount, profile_kind = (
+                self._four_phase_live_output)
+        meters = {
+            "frequency": diag.frequency,
+            "pulse_frequency": diag.pulse_frequency,
+            "pulse_rise_time": diag.pulse_rise_time,
+            "pulse_width": diag.pulse_width,
+            "alpha": diag.alpha,
+            "beta": diag.beta,
+            "output_volume": diag.output_volume,
+            "alpha_prostate": diag.alpha_prostate,
+            "beta_prostate": diag.beta_prostate,
+            "volume_prostate": diag.volume_prostate,
+            "e1": electrodes[0],
+            "e2": electrodes[1],
+            "e3": electrodes[2],
+            "e4": electrodes[3],
+            "four_phase_morph_source": morph_source,
+            "four_phase_morph_target": morph_target,
+            "four_phase_morph_amount": morph_amount,
+            "four_phase_profile": profile_kind,
+        }
+        return {
+            "version": __version__,
+            "settings": settings,
+            "status": status,
+            "diagnostics": diagnostics,
+            "meters": meters,
+            "presets": {
+                "active": self._preset_active,
+                "a_filled": "A" in self._preset_slots,
+                "b_filled": "B" in self._preset_slots,
+                "a_name": self.preset_a_name.get(),
+                "b_name": self.preset_b_name.get(),
+                "transition_seconds": self.preset_transition_seconds.get(),
+                "status": self.preset_status.get(),
+            },
+        }
+
+    def _control_schema_ui(self) -> dict:
+        writable = list(self._writable_control_fields())
+        return {
+            "version": 1,
+            "app_version": __version__,
+            "writable": writable,
+            "readonly_status": list(STATUS_KEYS),
+            "actions": list(ACTIONS),
+            "panels": {name: list(fields) for name, fields in PANEL_FIELDS.items()},
+        }
+
+    def _control_patch_ui(self, patch: dict) -> dict:
+        if not isinstance(patch, dict):
+            return {"ok": False, "error": "body must be a JSON object"}
+        # Accept either flat {field: value} or {settings: {...}}
+        values = patch.get("settings") if isinstance(patch.get("settings"), dict) else patch
+        allowed = set(self._writable_control_fields())
+        applied: list[str] = []
+        unknown: list[str] = []
+        errors: list[str] = []
+        for key, value in values.items():
+            if key in ("settings", "status", "diagnostics", "meters", "version"):
+                continue
+            if key not in allowed:
+                unknown.append(key)
+                continue
+            var = getattr(self, key, None)
+            if var is None:
+                unknown.append(key)
+                continue
+            try:
+                var.set(self._coerce_control_value(var, value))
+                applied.append(key)
+            except (tk.TclError, TypeError, ValueError) as exc:
+                errors.append(f"{key}: {exc}")
+        if applied:
+            self.apply_config()
+        if any(name.startswith("variety_") for name in applied):
+            self._variety_toggle()
+        if "controller_enabled" in applied or "direct_controller_enabled" in applied:
+            self._controller_enabled_changed()
+        if any(name.startswith("media_volume_ramp_") for name in applied):
+            self._on_media_ramp_levels_changed()
+            self._save_settings()
+        if "events_enabled" in applied:
+            self._on_events_enabled_changed()
+        if any(name in CONTROL_META_FIELDS for name in applied):
+            # Defer restart — must not shutdown the HTTP server from inside a request.
+            self.root.after(50, self._sync_control_api_server)
+        ok = not errors
+        return {
+            "ok": ok,
+            "applied": applied,
+            "unknown": unknown,
+            "errors": errors,
+            "state": self._control_state_ui(),
+        }
+
+    def _control_action_ui(self, name: str) -> dict:
+        actions = {
+            "neutral": self.neutral,
+            "stop": self.stop,
+            "resume": self.resume,
+            "start_listener": self.start_listener,
+            "stop_listener": self.listener.stop,
+            "connect_restim": self.connect_restim,
+            "disconnect_restim": self.restim.disconnect,
+            "connect_prostate": self.connect_prostate,
+            "disconnect_prostate": self.prostate_restim.disconnect,
+            "apply_preset_a": lambda: self._apply_preset("A"),
+            "apply_preset_b": lambda: self._apply_preset("B"),
+            "apply_preset_baseline": lambda: self._apply_preset("Baseline"),
+            "capture_preset_a": lambda: self._capture_preset("A"),
+            "capture_preset_b": lambda: self._capture_preset("B"),
+            "toggle_preset_ab": self._toggle_ab_preset,
+        }
+        handler = actions.get(name)
+        if handler is None:
+            return {"ok": False, "error": f"unknown action: {name}", "actions": list(ACTIONS)}
+        handler()
+        return {"ok": True, "action": name, "state": self._control_state_ui()}
+
+    def control_schema(self) -> dict:
+        return run_on_ui(self.root, self._control_schema_ui)
+
+    def control_state(self) -> dict:
+        return run_on_ui(self.root, self._control_state_ui)
+
+    def control_patch(self, patch: dict) -> dict:
+        return run_on_ui(self.root, lambda: self._control_patch_ui(patch))
+
+    def control_action(self, name: str) -> dict:
+        return run_on_ui(self.root, lambda: self._control_action_ui(name))
 
     def close(self) -> None:
         self._save_settings()
+        if self._control_api is not None:
+            self._control_api.stop()
+            self._control_api = None
         self.xinput.close()
         self.engine.close()
         self.listener.stop()
