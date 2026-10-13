@@ -8,3 +8,8 @@ build/
 .idea/
 .vscode/
 settings.json
+
+# Local debug tool. Not part of the release.
+restim_tcode_proxy/
+start-tcode-proxy.bat
+tests/test_tcode_proxy.py

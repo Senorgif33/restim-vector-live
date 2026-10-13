@@ -3,7 +3,10 @@ import unittest
 
 from vector1a.engine import VectorEngine
 from vector1a.motion import MotionCalculator, MotionMode, MotionParameters, SegmentState
-from vector1a.tcode import format_command, parse_command, parse_message
+from vector1a.tcode import (
+    format_command, is_evt_line, is_path_line, parse_command, parse_evt_line,
+    parse_message, parse_path_line,
+)
 
 
 class TCodeTests(unittest.TestCase):
@@ -12,6 +15,34 @@ class TCodeTests(unittest.TestCase):
         self.assertEqual((cmd.axis, cmd.value, cmd.interval_ms), ("L0", 0.75, 200))
         self.assertEqual(format_command("V0", 0.2), "V02000")
         self.assertEqual(len(parse_message("L05000 L17500\nV02000")), 3)
+
+    def test_evt_line_parse_name_and_params(self):
+        trigger = parse_evt_line(
+            "EVT name=edge duration_ms=18321 volume_boost=0.15 ramp_up_ms=500")
+        self.assertEqual(trigger.name, "edge")
+        self.assertEqual(trigger.params["duration_ms"], 18321)
+        self.assertAlmostEqual(trigger.params["volume_boost"], 0.15)
+        self.assertEqual(trigger.params["ramp_up_ms"], 500)
+        self.assertTrue(is_evt_line("evt name=fast"))
+        self.assertFalse(is_evt_line("L05000"))
+        self.assertEqual(parse_message("EVT name=edge duration_ms=10"), [])
+
+    def test_evt_line_requires_name(self):
+        with self.assertRaises(ValueError):
+            parse_evt_line("EVT duration_ms=100")
+        with self.assertRaises(ValueError):
+            parse_evt_line("EVT name=")
+
+
+    def test_path_line_parse_windows_quoted_path(self):
+        path = parse_path_line(r'PATH path="D:\clips\chapter.mp4"')
+        self.assertEqual(path, r"D:\clips\chapter.mp4")
+        self.assertTrue(is_path_line('path path=""'))
+        self.assertEqual(parse_path_line('PATH path=""'), "")
+        self.assertFalse(is_path_line("L05000"))
+        self.assertEqual(parse_message(r'PATH path="D:\clips\chapter.mp4"'), [])
+        with self.assertRaises(ValueError):
+            parse_path_line("PATH")
 
 
 class MotionTests(unittest.TestCase):
@@ -392,6 +423,218 @@ class QueueTests(unittest.TestCase):
         engine._last_input_time = 0.0
         expected = 0.7 * (29.0 / 30.0) * 0.7
         self.assertAlmostEqual(engine._calculate_prostate_volume(1.0, 0.0), expected)
+
+    def test_normalize_prostate_stroke_axis(self):
+        from vector1a.engine import normalize_prostate_stroke_axis
+        self.assertEqual(normalize_prostate_stroke_axis("l3"), "L3")
+        self.assertEqual(normalize_prostate_stroke_axis("L0"), "")
+        self.assertEqual(normalize_prostate_stroke_axis(""), "")
+        self.assertEqual(normalize_prostate_stroke_axis("surge"), "")
+
+    def test_independent_l3_drives_prostate_not_primary(self):
+        samples = []
+        engine = VectorEngine(samples.append, lookahead_seconds=0.05, clock=lambda: 0.0)
+        engine.configure(
+            rate_hz=50, lookahead_seconds=0.05, volume=0.7,
+            mode=MotionMode.CIRCULAR, params=MotionParameters(),
+            prostate_stroke_axis="L3", prostate_arc_depth=1.0)
+        engine.resume()
+        # Primary L0 stays mid; L3 does a full outward (1→0) stroke.
+        engine.receive_l0(0.5, 0, 0.00)
+        engine.receive_prostate_axis(1.0, 0, 0.00)
+        engine.receive_prostate_axis(0.0, 0, 0.20)
+        engine.step(0.10, 0.10)
+        engine.step(0.15, 0.15)
+        # Release due samples (lookahead 0.05 → due at calculated+0.05).
+        engine.step(0.20, 0.20)
+        released = [s for s in samples if s.calculated_at >= 0.10]
+        self.assertTrue(released)
+        # Inverted L3 mid-stroke (source 1→0 at progress 0.5) → alpha_prostate 0.5,
+        # beta bows away from 0.5 because arc depth is full.
+        mid = next(s for s in released if abs(s.calculated_at - 0.10) < 1e-9)
+        self.assertAlmostEqual(mid.alpha_prostate, 0.5, places=3)
+        self.assertNotAlmostEqual(mid.beta_prostate, 0.5)
+        # Primary still reflects L0 mid position geometry, not L3.
+        self.assertAlmostEqual(mid.raw_l0, 0.5)
+
+    def test_independent_l3_holds_last_position_without_timeout(self):
+        engine = VectorEngine(lambda sample: None, lookahead_seconds=0.05, clock=lambda: 0.0)
+        engine.configure(
+            rate_hz=50, lookahead_seconds=0.05, volume=0.7,
+            mode=MotionMode.CIRCULAR, params=MotionParameters(),
+            prostate_stroke_axis="L3", prostate_arc_depth=1.0)
+        engine.resume()
+        engine.receive_l0(1.0, 0, 0.00)
+        engine.receive_l0(0.0, 0, 0.20)
+        self.assertTrue(engine.prostate_axis_live(0.00))
+        self.assertEqual(engine.prostate_source_label(0.00), "L3 live")
+        engine.step(1.00, 1.00)
+        before = engine._queue[0][2]
+        # No L3 sample yet. Still must not follow the L0 stroke.
+        self.assertAlmostEqual(before.alpha_prostate, 0.5, places=2)
+        engine.receive_prostate_axis(0.2, 0, 1.00)
+        engine.step(1.10, 1.10)
+        queued = next(item[2] for item in engine._queue
+                      if abs(item[2].calculated_at - 1.10) < 1e-9)
+        self.assertAlmostEqual(queued.alpha_prostate, 0.8, places=2)
+
+    def test_l0_reversal_does_not_overwrite_live_l3_prostate(self):
+        engine = VectorEngine(lambda sample: None, lookahead_seconds=1.0, clock=lambda: 0.0)
+        engine.configure(
+            rate_hz=50, lookahead_seconds=1.0, volume=0.7,
+            mode=MotionMode.CIRCULAR, params=MotionParameters(),
+            prostate_stroke_axis="L3", prostate_arc_depth=1.0)
+        engine.resume()
+        engine.receive_l0(0.0, 0, 0.00)
+        engine.receive_l0(0.5, 0, 0.10)
+        engine.receive_prostate_axis(1.0, 0, 0.00)
+        engine.receive_prostate_axis(0.5, 0, 0.10)
+        engine.step(0.10, 0.10)
+        before = engine._queue[0][2].alpha_prostate
+        # L0 reverses; L3 remains live and should keep its prostate sample.
+        engine.receive_l0(1.0, 0, 0.20)
+        engine.receive_l0(0.9, 0, 0.30)
+        engine.receive_prostate_axis(0.4, 0, 0.30)
+        after = next(item[2] for item in engine._queue
+                     if abs(item[2].calculated_at - 0.10) < 1e-9)
+        self.assertAlmostEqual(after.alpha_prostate, before)
+
+    def test_prostate_volume_uses_secondary_axis_idle_when_live(self):
+        engine = VectorEngine(lambda sample: None, volume=0.7, clock=lambda: 0.0)
+        engine.configure(
+            rate_hz=50, lookahead_seconds=0.05, volume=0.7,
+            mode=MotionMode.CIRCULAR, params=MotionParameters(),
+            prostate_stroke_axis="L3")
+        engine._primary.last_input_time = 0.0  # primary idle
+        engine._prostate.last_input_time = 10.0  # secondary fresh
+        # Active because idle clock follows secondary when provided.
+        active = engine._calculate_prostate_volume(
+            10.1, 100.0, idle_reference_time=engine._prostate.last_input_time)
+        idle = engine._calculate_prostate_volume(
+            10.1, 100.0, idle_reference_time=engine._primary.last_input_time)
+        self.assertGreater(active, idle)
+
+    def _release_prostate_sample(self, **configure):
+        sent = []
+        now = [0.0]
+        engine = VectorEngine(sent.append, lookahead_seconds=0.05, clock=lambda: now[0])
+        engine.configure(
+            rate_hz=50, lookahead_seconds=0.05, volume=0.7,
+            mode=MotionMode.CIRCULAR, params=MotionParameters(),
+            volume_ramp_up_seconds=0.0,
+            pulse_frequency_min=0.0, pulse_frequency_max=1.0,
+            pulse_frequency_ratio=1.0,
+            **configure)
+        engine.resume()
+        return engine, sent, now
+
+    def test_follow_primary_copies_main_pulse(self):
+        engine, sent, now = self._release_prostate_sample()
+        engine.receive_l0(0.0, 0, 0.0)
+        engine.receive_l0(1.0, 0, 1.0)
+        now[0] = 0.5
+        engine.step(0.5, 0.6)
+        sample = sent[-1]
+        self.assertAlmostEqual(sample.pulse_frequency_prostate, sample.pulse_frequency)
+        self.assertAlmostEqual(sample.pulse_width_prostate, sample.pulse_width)
+        self.assertAlmostEqual(sample.pulse_rise_time_prostate, sample.pulse_rise_time)
+
+    def test_live_prostate_pulse_uses_prostate_motion_not_main(self):
+        engine, sent, now = self._release_prostate_sample(
+            prostate_stroke_axis="L3", volume_rest_level=0.4, prostate_rest_level=0.7,
+            prostate_arc_depth=0.0)
+        engine.receive_l0(0.5, 0, 0.0)
+        engine.receive_l0(0.5, 0, 1.0)
+        engine.receive_prostate_axis(0.0, 0, 0.0)
+        engine.receive_prostate_axis(1.0, 0, 1.0)
+        now[0] = 0.5
+        engine.step(0.5, 0.6)
+        moving = sent[-1]
+        self.assertGreater(moving.pulse_frequency_prostate, moving.pulse_frequency + 0.1)
+
+        engine, sent, now = self._release_prostate_sample(
+            prostate_stroke_axis="L3", volume_rest_level=0.4, prostate_rest_level=0.7,
+            prostate_arc_depth=0.0)
+        engine.receive_l0(0.0, 0, 0.0)
+        engine.receive_l0(1.0, 0, 1.0)
+        engine.receive_prostate_axis(0.5, 0, 0.0)
+        engine.receive_prostate_axis(0.5, 0, 1.0)
+        now[0] = 0.5
+        engine.step(0.5, 0.6)
+        held = sent[-1]
+        self.assertGreater(held.pulse_frequency, held.pulse_frequency_prostate + 0.05)
+
+    def test_prostate_pulse_latches_do_not_clear_main(self):
+        engine, sent, now = self._release_prostate_sample(
+            prostate_stroke_axis="L3", prostate_arc_depth=0.0)
+        engine.receive_l0(0.0, 0, 0.0)
+        engine.receive_l0(1.0, 0, 1.0)
+        engine.receive_prostate_axis(0.5, 0, 0.0)
+        engine.receive_prostate_axis(0.5, 0, 1.0)
+        now[0] = 0.5
+        engine.step(0.5, 0.6)
+        self.assertTrue(engine._pulse_was_active)
+        self.assertTrue(engine._width_was_active)
+        self.assertFalse(engine._prostate_pulse_was_active)
+        self.assertFalse(engine._prostate_width_was_active)
+        self.assertGreater(sent[-1].pulse_frequency, sent[-1].pulse_frequency_prostate)
+
+    def test_teardrop_mode_matches_current_teardrop_geometry(self):
+        engine, sent, now = self._release_prostate_sample(
+            prostate_stroke_axis="L3", prostate_motion_mode="Teardrop", prostate_arc_depth=1.0)
+        engine.receive_prostate_axis(1.0, 0, 0.0)
+        engine.receive_prostate_axis(0.0, 0, 0.2)
+        engine.receive_l0(0.2, 0, 0.0)
+        now[0] = 0.1
+        engine.step(0.1, 0.2)
+        sample = sent[-1]
+        alpha, beta = engine._calculate_prostate(
+            engine._prostate.stroke_for_time(0.1), 0.1)
+        self.assertAlmostEqual(sample.alpha_prostate, alpha)
+        self.assertAlmostEqual(sample.beta_prostate, beta)
+
+    def test_prostate_circular_min_radius_does_not_move_main(self):
+        def run(radius: float):
+            engine, sent, now = self._release_prostate_sample(
+                prostate_stroke_axis="L3",
+                prostate_motion_mode=MotionMode.CIRCULAR.value,
+                prostate_minimum_radius=radius,
+                prostate_speed_threshold=100.0)
+            engine.receive_l0(0.5, 0, 0.0)
+            engine.receive_l0(0.5, 0, 1.0)
+            engine.receive_prostate_axis(0.0, 0, 0.0)
+            engine.receive_prostate_axis(0.2, 0, 1.0)
+            now[0] = 0.05
+            engine.step(0.05, 0.2)
+            return sent[-1]
+
+        tight = run(0.05)
+        wide = run(0.8)
+        self.assertAlmostEqual(tight.alpha, wide.alpha, places=3)
+        self.assertAlmostEqual(tight.beta, wide.beta, places=3)
+        self.assertGreater(abs(tight.alpha_prostate - wide.alpha_prostate), 0.05)
+
+    def test_prostate_jitter_does_not_move_main_stroke(self):
+        def run(amplitude: float):
+            engine, sent, now = self._release_prostate_sample(
+                prostate_stroke_axis="L3",
+                prostate_jitter_enabled=True,
+                prostate_jitter_amplitude=amplitude,
+                prostate_jitter_cycle_seconds=1.0,
+                prostate_speed_linked_variation=False,
+                prostate_variation_fade_seconds=0.05)
+            engine.receive_l0(0.2, 0, 0.0)
+            engine.receive_l0(0.8, 0, 0.5)
+            engine.receive_prostate_axis(0.2, 0, 0.0)
+            engine.receive_prostate_axis(0.8, 0, 0.5)
+            now[0] = 0.25
+            engine.step(0.25, 0.4)
+            return sent[-1]
+
+        still = run(0.0)
+        moving = run(0.2)
+        self.assertAlmostEqual(still.output_l0, moving.output_l0, places=4)
+        self.assertGreater(abs(still.alpha_prostate - moving.alpha_prostate), 0.01)
 
 
 if __name__ == "__main__":

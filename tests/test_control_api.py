@@ -1,0 +1,341 @@
+"""Tests for the embedded Vector control API (stdlib HTTP + WS)."""
+
+from __future__ import annotations
+
+import json
+import socket
+import threading
+import time
+import unittest
+import urllib.error
+import urllib.request
+
+from vector1a.control_api import (
+    ACTIONS,
+    DESKTOP_ONLY_FIELDS,
+    ControlApiServer,
+    accept_key,
+    encode_text,
+    try_decode_frame,
+    writable_fields,
+)
+
+
+class FakeBackend:
+    def __init__(self) -> None:
+        self.state = {
+            "version": "test",
+            "settings": {"volume": 0.7, "dynamic_volume": True},
+            "status": {"mfp_status": "Disconnected"},
+            "diagnostics": {"raw_l0": 0.5},
+            "meters": {"e1": 0.5, "e2": 0.5, "e3": 0.5, "e4": 0.5},
+        }
+        self.actions: list[str] = []
+        self.state_calls = 0
+
+    def control_schema(self) -> dict:
+        return {
+            "version": 1,
+            "writable": ["volume", "dynamic_volume"],
+            "actions": list(ACTIONS),
+        }
+
+    def control_state(self) -> dict:
+        self.state_calls += 1
+        return self.state
+
+    def control_patch(self, patch: dict) -> dict:
+        settings = patch.get("settings", patch)
+        applied = []
+        for key, value in settings.items():
+            if key in ("volume", "dynamic_volume"):
+                self.state["settings"][key] = value
+                applied.append(key)
+        return {"ok": True, "applied": applied, "unknown": [], "state": self.state}
+
+    def control_action(self, name: str) -> dict:
+        self.actions.append(name)
+        if name not in ACTIONS:
+            return {"ok": False, "error": f"unknown action: {name}"}
+        return {"ok": True, "action": name, "state": self.state}
+
+
+def _free_port() -> int:
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+def _http_json(method: str, url: str, body: dict | None = None) -> tuple[int, dict]:
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Content-Type": "application/json"} if body is not None else {})
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+class WritableFieldsTests(unittest.TestCase):
+    def test_excludes_desktop_only_and_adds_meta(self):
+        fields = writable_fields((
+            "volume", "mfp_launch_target", "events_file_path", "four_phase_host",
+        ))
+        self.assertIn("volume", fields)
+        self.assertIn("control_api_enabled", fields)
+        self.assertIn("control_api_host", fields)
+        self.assertIn("control_api_port", fields)
+        for name in DESKTOP_ONLY_FIELDS:
+            self.assertNotIn(name, fields)
+
+
+class ControlApiHttpTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.backend = FakeBackend()
+        self.port = _free_port()
+        self.server = ControlApiServer(self.backend, "127.0.0.1", self.port, stream_hz=20.0)
+        self.server.start()
+        self.base = f"http://127.0.0.1:{self.port}"
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                _http_json("GET", f"{self.base}/v1/state")
+                break
+            except OSError:
+                time.sleep(0.02)
+
+    def tearDown(self) -> None:
+        self.server.stop()
+
+    def test_get_state_and_schema(self):
+        status, state = _http_json("GET", f"{self.base}/v1/state")
+        self.assertEqual(status, 200)
+        self.assertEqual(state["settings"]["volume"], 0.7)
+        status, schema = _http_json("GET", f"{self.base}/v1/schema")
+        self.assertEqual(status, 200)
+        self.assertIn("volume", schema["writable"])
+        self.assertIn("neutral", schema["actions"])
+
+    def test_cors_preflight(self):
+        request = urllib.request.Request(
+            f"{self.base}/v1/state", method="OPTIONS")
+        with urllib.request.urlopen(request, timeout=3) as response:
+            self.assertEqual(response.status, 204)
+            self.assertEqual(response.headers.get("Access-Control-Allow-Origin"), "*")
+
+    def test_post_state_patch(self):
+        status, body = _http_json("POST", f"{self.base}/v1/state", {"volume": 0.42})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertIn("volume", body["applied"])
+        self.assertEqual(self.backend.state["settings"]["volume"], 0.42)
+
+    def test_actions(self):
+        status, body = _http_json("POST", f"{self.base}/v1/actions/neutral")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(self.backend.actions, ["neutral"])
+        status, body = _http_json("POST", f"{self.base}/v1/actions/not-a-thing")
+        self.assertEqual(status, 400)
+        self.assertFalse(body["ok"])
+
+    def test_idle_broadcast_skips_state_when_no_clients(self):
+        # setUp already did one GET /v1/state. With no WS clients the 20 Hz
+        # stream loop must not keep calling control_state.
+        before = self.backend.state_calls
+        time.sleep(0.25)
+        self.assertEqual(self.backend.state_calls, before)
+
+    def test_websocket_stream_sends_snapshot(self):
+        key = "dGhlIHNhbXBsZSBub25jZQ=="
+        request = (
+            f"GET /v1/stream HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{self.port}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        ).encode("ascii")
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=3)
+        try:
+            sock.sendall(request)
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = sock.recv(4096)
+                self.assertTrue(chunk)
+                response += chunk
+            self.assertIn(b"101", response.split(b"\r\n", 1)[0])
+            self.assertIn(accept_key(key).encode("ascii"), response)
+            buffer = bytearray(response.split(b"\r\n\r\n", 1)[1])
+            deadline = time.monotonic() + 2.0
+            message = None
+            while time.monotonic() < deadline and message is None:
+                frame, consumed = try_decode_frame(buffer)
+                if frame is None:
+                    sock.settimeout(0.2)
+                    try:
+                        buffer.extend(sock.recv(4096))
+                    except TimeoutError:
+                        continue
+                    continue
+                del buffer[:consumed]
+                opcode, payload = frame
+                if opcode == 0x1:
+                    message = json.loads(payload.decode("utf-8"))
+            self.assertIsNotNone(message)
+            self.assertEqual(message["type"], "snapshot")
+            self.assertEqual(message["state"]["settings"]["volume"], 0.7)
+        finally:
+            sock.close()
+
+
+class FrameHelperTests(unittest.TestCase):
+    def test_round_trip_text_frame_unmasked(self):
+        raw = encode_text('{"ok":true}')
+        buffer = bytearray(raw)
+        frame, consumed = try_decode_frame(buffer)
+        self.assertIsNotNone(frame)
+        opcode, payload = frame
+        self.assertEqual(opcode, 0x1)
+        self.assertEqual(payload, b'{"ok":true}')
+        self.assertEqual(consumed, len(raw))
+
+
+class ControlApiMutationBusyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+        class SlowBackend(FakeBackend):
+            def control_patch(inner_self, patch: dict) -> dict:
+                self.started.set()
+                self.release.wait(2.0)
+                return FakeBackend.control_patch(inner_self, patch)
+
+        self.backend = SlowBackend()
+        self.port = _free_port()
+        self.server = ControlApiServer(self.backend, "127.0.0.1", self.port, stream_hz=5.0)
+        self.server.start()
+        self.base = f"http://127.0.0.1:{self.port}"
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                _http_json("GET", f"{self.base}/v1/state")
+                break
+            except OSError:
+                time.sleep(0.02)
+
+    def tearDown(self) -> None:
+        self.release.set()
+        self.server.stop()
+
+    def test_concurrent_patch_returns_429_busy(self):
+        results: list[tuple[int, dict]] = []
+
+        def first() -> None:
+            results.append(_http_json("POST", f"{self.base}/v1/state", {"volume": 0.1}))
+
+        thread = threading.Thread(target=first, daemon=True)
+        thread.start()
+        self.assertTrue(self.started.wait(1.0))
+        status, body = _http_json("POST", f"{self.base}/v1/state", {"volume": 0.2})
+        self.assertEqual(status, 429)
+        self.assertFalse(body.get("ok", True))
+        self.assertEqual(body.get("error"), "busy")
+        self.release.set()
+        thread.join(timeout=2.0)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][0], 200)
+
+
+class _Var:
+    def __init__(self, value) -> None:
+        self._value = value
+
+    def get(self):
+        return self._value
+
+    def set(self, value) -> None:
+        self._value = value
+
+
+class ControlAckAndConnectTests(unittest.TestCase):
+    """VectorApp helpers used by remote mutation / connect paths."""
+
+    def test_ack_state_skips_full_meter_rebuild(self):
+        from vector1a.app import VectorApp
+        from vector1a import __version__
+
+        app = VectorApp.__new__(VectorApp)
+        app.volume = _Var(0.55)
+        app._writable_control_fields = lambda: ("volume",)
+        app.mfp_status = _Var("Listening")
+        for name in (
+            "restim_status", "prostate_status", "session_ready_status",
+            "controller_status", "variety_status", "events_status",
+            "media_ramp_status", "timeline_status", "startup_status",
+            "control_api_status", "preset_status",
+        ):
+            setattr(app, name, _Var(""))
+        app._preset_active = None
+        app._preset_slots = {}
+        app.preset_a_name = _Var("A")
+        app.preset_b_name = _Var("B")
+        app.preset_transition_seconds = _Var(0.2)
+        app._control_state_cache_lock = threading.Lock()
+        app._control_state_cache = {
+            "version": __version__,
+            "settings": {"volume": 0.7},
+            "status": {},
+            "diagnostics": {"raw_l0": 0.12},
+            "meters": {"e1": 0.9},
+            "presets": {},
+        }
+        app._control_state_dirty = False
+        called = {"full": 0}
+
+        def fail_full() -> dict:
+            called["full"] += 1
+            raise AssertionError("_control_state_ui must not run on mutation ACK")
+
+        app._control_state_ui = fail_full  # type: ignore[method-assign]
+        state = VectorApp._control_ack_state_ui(app)
+        self.assertEqual(called["full"], 0)
+        self.assertEqual(state["settings"]["volume"], 0.55)
+        self.assertEqual(state["diagnostics"]["raw_l0"], 0.12)
+        self.assertEqual(state["meters"]["e1"], 0.9)
+        self.assertTrue(app._control_state_dirty)
+
+    def test_connect_restim_returns_before_socket_work_finishes(self):
+        from vector1a.app import VectorApp
+
+        entered = threading.Event()
+        release = threading.Event()
+        statuses: list[str] = []
+
+        class SlowRestim:
+            def connect(self, host, port) -> None:
+                entered.set()
+                release.wait(2.0)
+
+        app = VectorApp.__new__(VectorApp)
+        app.restim_host = _Var("127.0.0.1")
+        app.restim_port = _Var(12346)
+        app.restim = SlowRestim()
+        app._set_restim_status = statuses.append
+        started = time.monotonic()
+        VectorApp.connect_restim(app)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.2)
+        self.assertIn("Connecting…", statuses)
+        self.assertTrue(entered.wait(1.0))
+        release.set()
+
+
+if __name__ == "__main__":
+    unittest.main()

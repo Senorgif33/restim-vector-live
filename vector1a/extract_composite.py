@@ -17,9 +17,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 # Default SCD span: Relentless start → end of pleasure overload (Ch2).
 EXTRACT_BASE_MS = 265367
 EXTRACT_MIN_MS = 60_000
+# Beat-sync siblings can be shorter (tempo from L0; less need for full SCD arc).
+EXTRACT_BEAT_MIN_MS = 25_000
 
 EXTRACT_SCD_EVENTS = frozenset({"mcb_extract", "mcb_extract_4p"})
-EXTRACT_BEAT_EVENTS = frozenset({"mcb_extract_beat", "mcb_extract_4p_beat"})
+EXTRACT_BEAT_EVENTS = frozenset({
+    "mcb_extract_beat",
+    "mcb_extract_4p_beat",
+})
 EXTRACT_EVENTS = EXTRACT_SCD_EVENTS | EXTRACT_BEAT_EVENTS
 
 # Soft glide ≈ SCD thetaLag 0.9s (capped per dwell).
@@ -27,7 +32,7 @@ _SOFT_LAG_MS = 900
 
 # L0 turnaround beats: skip chatter closer than this.
 _MIN_BEAT_INTERVAL_MS = 80
-# Advance to next pole/pad on every Nth L0 beat.
+# Advance to next pole on every Nth L0 beat (hub–spoke beat siblings).
 _BEAT_EVERY_N = 2
 
 # poles @ ρ=1 → α/β with α=(x+1)/2, β=(y+1)/2 from ρ·(cos θ, sin θ)
@@ -144,15 +149,15 @@ def _pick_spoke(
     return rng.choice(choices)
 
 
-def detect_l0_beats(
+def detect_l0_extrema(
     times_s: Union[Sequence[float], List[float]],
     values: Union[Sequence[float], List[float]],
     t0_ms: int,
     t1_ms: int,
     *,
     min_interval_ms: int = _MIN_BEAT_INTERVAL_MS,
-) -> List[int]:
-    """Detect L0 turnarounds in [t0_ms, t1_ms); return offsets ms from t0_ms."""
+) -> List[Tuple[int, str]]:
+    """Detect L0 peaks/valleys in [t0_ms, t1_ms); offsets ms from t0_ms."""
     if t1_ms <= t0_ms:
         return []
 
@@ -172,27 +177,46 @@ def detect_l0_beats(
     xs = x[i0 : i1 + 1]
     ys = y[i0 : i1 + 1]
 
-    raw: List[int] = []
+    raw: List[Tuple[int, str]] = []
     for i in range(1, len(ys) - 1):
         left = ys[i] - ys[i - 1]
         right = ys[i + 1] - ys[i]
-        is_peak = left > 0 and right <= 0
-        is_valley = left < 0 and right >= 0
-        if not (is_peak or is_valley):
+        if left > 0 and right <= 0:
+            kind = "peak"
+        elif left < 0 and right >= 0:
+            kind = "valley"
+        else:
             continue
         off = int(round((xs[i] - t0_s) * 1000.0))
         if 0 <= off < (t1_ms - t0_ms):
-            raw.append(off)
+            raw.append((off, kind))
 
     if not raw:
         return []
 
-    raw.sort()
+    raw.sort(key=lambda item: item[0])
     filtered = [raw[0]]
-    for b in raw[1:]:
-        if b - filtered[-1] >= min_interval_ms:
-            filtered.append(b)
+    for item in raw[1:]:
+        if item[0] - filtered[-1][0] >= min_interval_ms:
+            filtered.append(item)
     return filtered
+
+
+def detect_l0_beats(
+    times_s: Union[Sequence[float], List[float]],
+    values: Union[Sequence[float], List[float]],
+    t0_ms: int,
+    t1_ms: int,
+    *,
+    min_interval_ms: int = _MIN_BEAT_INTERVAL_MS,
+) -> List[int]:
+    """Detect L0 turnarounds in [t0_ms, t1_ms); return offsets ms from t0_ms."""
+    return [
+        off
+        for off, _kind in detect_l0_extrema(
+            times_s, values, t0_ms, t1_ms, min_interval_ms=min_interval_ms
+        )
+    ]
 
 
 def every_nth_beat(beats: Sequence[int], n: int = _BEAT_EVERY_N) -> List[int]:
@@ -310,10 +334,15 @@ def derive_extract_params(final_params: dict, event_name: str) -> None:
             f"Event '{event_name}': invalid duration_ms: {e}"
         ) from e
 
-    if duration_ms < EXTRACT_MIN_MS:
+    min_ms = (
+        EXTRACT_BEAT_MIN_MS
+        if event_name in EXTRACT_BEAT_EVENTS
+        else EXTRACT_MIN_MS
+    )
+    if duration_ms < min_ms:
         raise ValueError(
             f"Event '{event_name}': duration_ms ({duration_ms:g}) must be at least "
-            f"{EXTRACT_MIN_MS} ms."
+            f"{min_ms} ms."
         )
 
     final_params["pulse_width"] = float(final_params.get("pulse_width", 65))
@@ -342,7 +371,7 @@ def build_extract_motion_steps(
     l0_values: Optional[Sequence[float]] = None,
     event_start_ms: int = 0,
 ) -> List[Dict[str, Any]]:
-    """Bake hub–spoke overwrite steps for the full duration (Apply/expand-time RNG)."""
+    """Bake hub–spoke overwrite steps (Apply/expand-time)."""
     if event_name not in EXTRACT_EVENTS:
         return []
 

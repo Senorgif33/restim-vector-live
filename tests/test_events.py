@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from vector1a.events import (
+    VOLUME_HEADROOM_CAP,
     EventEngine,
     EventError,
     _derive_orgasm_countdown_params,
@@ -16,6 +17,7 @@ from vector1a.events import (
     expand_user_events,
     normalize_value,
     parse_yaml_subset,
+    scale_volume_for_event_headroom,
 )
 from vector1a.extract_composite import (
     EXTRACT_BASE_MS,
@@ -704,6 +706,92 @@ class TestExtractCompositeEvents(unittest.TestCase):
         self.assertEqual(warnings, [])
         alpha = [s for s in steps if s.axis == "alpha"]
         self.assertTrue(any(s.start_time_ms == 1000 for s in alpha))
+
+    def test_beat_min_duration_25s(self):
+        ok = {"duration_ms": 25000}
+        derive_extract_params(ok, "mcb_extract_4p_beat")
+        self.assertIn("hz_pulse_0", ok)
+        with self.assertRaises(ValueError):
+            derive_extract_params({"duration_ms": 24999}, "mcb_extract_beat")
+        with self.assertRaises(ValueError):
+            derive_extract_params({"duration_ms": 25000}, "mcb_extract")
+
+
+class EventVolumeHeadroomTests(unittest.TestCase):
+    """Auto headroom scan over bundled definitions, plus the volume scale."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmpdir.name)
+        self.engine = EventEngine()
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _headroom(self, body: str) -> tuple[float, str | None]:
+        path = self.root / "clip.events.yml"
+        path.write_text(body, encoding="utf-8")
+        self.engine.load_events_file(path)
+        return self.engine.file_volume_headroom()
+
+    def test_scale_reserves_headroom(self):
+        self.assertAlmostEqual(scale_volume_for_event_headroom(1.0, 0.30), 0.70)
+        self.assertAlmostEqual(scale_volume_for_event_headroom(0.5, 0.0), 0.5)
+
+    def test_scale_clamps_to_unit_range(self):
+        self.assertAlmostEqual(scale_volume_for_event_headroom(2.0, 0.0), 1.0)
+        self.assertAlmostEqual(scale_volume_for_event_headroom(-1.0, 0.2), 0.0)
+        # Negative headroom must not amplify.
+        self.assertAlmostEqual(scale_volume_for_event_headroom(0.8, -0.5), 0.8)
+
+    def test_edge_defaults_sum_offset_and_amplitude(self):
+        value, name = self._headroom("events:\n  - time: 0\n    name: edge\n")
+        self.assertAlmostEqual(value, 0.22)
+        self.assertEqual(name, "edge")
+
+    def test_cum_wins_and_reports_name(self):
+        value, name = self._headroom(
+            "events:\n  - time: 0\n    name: edge\n"
+            "  - time: 20000\n    name: cum\n")
+        self.assertAlmostEqual(value, 0.30)
+        self.assertEqual(name, "cum")
+
+    def test_per_event_param_override_counts(self):
+        value, name = self._headroom(
+            "events:\n  - time: 0\n    name: fast\n"
+            "    params:\n      volume_boost: 0.15\n")
+        self.assertGreaterEqual(value, 0.15)
+        self.assertEqual(name, "fast")
+
+    def test_test_slaps_is_ignored(self):
+        value, name = self._headroom("events:\n  - time: 0\n    name: test_slaps\n")
+        self.assertEqual(value, 0.0)
+        self.assertIsNone(name)
+
+    def test_overwrite_only_event_needs_no_headroom(self):
+        # 'ruin' overwrites volume to 0 rather than adding to it.
+        value, _ = self._headroom("events:\n  - time: 0\n    name: ruin\n")
+        self.assertEqual(value, 0.0)
+
+    def test_no_file_is_zero(self):
+        self.assertEqual(self.engine.file_volume_headroom(), (0.0, None))
+
+    def test_headroom_is_capped(self):
+        value, _ = self._headroom(
+            "events:\n  - time: 0\n    name: cum\n"
+            "    params:\n      volume_boost: 2.0\n")
+        self.assertAlmostEqual(value, VOLUME_HEADROOM_CAP)
+
+    def test_named_scan_skips_unknown_definitions(self):
+        value, name = self.engine.volume_headroom_for_names(
+            ("cum", "not_a_real_event"))
+        self.assertAlmostEqual(value, 0.30)
+        self.assertEqual(name, "cum")
+
+    def test_named_scan_applies_param_overrides(self):
+        value, _ = self.engine.volume_headroom_for_names(
+            ("cum",), {"cum": {"volume_boost": 0.0, "buzz_intensity": 0.05}})
+        self.assertAlmostEqual(value, 0.05)
 
 
 if __name__ == "__main__":

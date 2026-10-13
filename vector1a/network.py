@@ -11,16 +11,23 @@ import time
 from collections import deque
 from typing import Callable
 
-from .tcode import format_command, parse_message
+from .tcode import (
+    EvtTrigger, format_command, is_evt_line, is_path_line, parse_evt_line,
+    parse_path_line, parse_message,
+)
 from .websocket_input import WebSocketInput
 
 
 class MFPListener:
     """TCP/WebSocket (shared port) and UDP input with one stream client at a time."""
     def __init__(self, on_l0: Callable[[float, int, float], None], status: Callable[[str], None],
-                 on_command: Callable[[object, float], None] | None = None) -> None:
+                 on_command: Callable[[object, float], None] | None = None,
+                 on_evt: Callable[[EvtTrigger, float], None] | None = None,
+                 on_path: Callable[[str, float], None] | None = None) -> None:
         self.on_l0, self.status = on_l0, status
         self.on_command = on_command
+        self.on_evt = on_evt
+        self.on_path = on_path
         self._run = threading.Event()
         self._threads: list[threading.Thread] = []
         self._sockets: list[socket.socket] = []
@@ -100,12 +107,43 @@ class MFPListener:
 
     def _handle(self, text: str, transport: str = "?") -> None:
         received_at = time.monotonic()
+        stripped = text.strip()
+        if is_evt_line(stripped):
+            with self._raw_lock:
+                self._raw_packets.append({
+                    "time": received_at,
+                    "transport": transport.upper(),
+                    "raw": stripped,
+                    "axes": ["EVT"],
+                })
+            try:
+                trigger = parse_evt_line(stripped)
+            except ValueError:
+                return
+            if self.on_evt is not None:
+                self.on_evt(trigger, received_at)
+            return
+        if is_path_line(stripped):
+            with self._raw_lock:
+                self._raw_packets.append({
+                    "time": received_at,
+                    "transport": transport.upper(),
+                    "raw": stripped,
+                    "axes": ["PATH"],
+                })
+            try:
+                media_path = parse_path_line(stripped)
+            except ValueError:
+                return
+            if self.on_path is not None:
+                self.on_path(media_path, received_at)
+            return
         commands = parse_message(text)
         with self._raw_lock:
             self._raw_packets.append({
                 "time": received_at,
                 "transport": transport.upper(),
-                "raw": text.strip(),
+                "raw": stripped,
                 "axes": [command.axis for command in commands],
             })
         for command in commands:
@@ -187,7 +225,7 @@ class MFPListener:
             while self._run.is_set():
                 try: data, _ = udp.recvfrom(65535)
                 except socket.timeout: continue
-                self._handle(data.decode("ascii", errors="ignore"), "udp")
+                self._handle(data.decode("utf-8", errors="replace"), "udp")
         finally:
             self._track(udp, False); udp.close()
 
@@ -294,6 +332,10 @@ class LatestFrameDispatcher:
 
 
 class _ReconnectClient:
+    MAX_RECONNECT_ATTEMPTS = 5
+    RECONNECT_RETRY_SECONDS = 2.0
+    CONNECT_TIMEOUT = 2.0
+
     def __init__(self, status: Callable[[str], None]) -> None:
         self.status, self._socket = status, None
         self._lock = threading.Lock()
@@ -306,6 +348,7 @@ class _ReconnectClient:
         self._send_failures = 0
         self._reconnect_attempts = 0
         self._reconnect_successes = 0
+        self._consecutive_failures = 0
         self._closed = threading.Event()
         self._monitor = threading.Thread(target=self._monitor_connection,
                                          name="restim-reconnect", daemon=True)
@@ -338,52 +381,135 @@ class _ReconnectClient:
         self.disconnect(False)
         self._target = (host, port)
         self._manual_disconnect = False
+        self._consecutive_failures = 0
         try:
             with self._lock:
-                self._connect_now()
+                message = self._connect_locked()
+                self._consecutive_failures = 0
         except OSError:
-            self._retry_at = time.monotonic() + 1.0
+            self._retry_at = time.monotonic() + min(1.0, self.RECONNECT_RETRY_SECONDS)
             raise
+        if message:
+            self.status(message)
 
     def disconnect(self, manual: bool = True) -> None:
         with self._lock:
-            if self._socket:
-                try: self._socket.close()
-                except OSError: pass
-            self._socket = None
+            self._drop_socket_locked()
         self._manual_disconnect = manual
-        if manual: self._target = None
+        if manual:
+            self._target = None
         self.status("Disconnected")
 
-    def _ensure_connected(self) -> bool:
-        if self._socket: return True
-        if self._manual_disconnect or not self._target or time.monotonic() < self._retry_at: return False
-        try:
+    def _drop_socket_locked(self) -> None:
+        """Close the live socket. Caller must hold ``_lock``."""
+        if self._socket:
+            try:
+                self._socket.close()
+            except OSError:
+                pass
+        self._socket = None
+
+    def _fail_locked(self, exc: Exception) -> str:
+        """Drop the socket after an I/O failure. Caller must hold ``_lock``.
+
+        Returns a status string; never call ``status`` while the lock is held —
+        that deadlocks the UI when the status callback touches Tk.
+        """
+        self._drop_socket_locked()
+        self._retry_at = time.monotonic() + min(1.0, self.RECONNECT_RETRY_SECONDS)
+        self._send_failures += 1
+        return f"Disconnected; reconnecting: {exc}"
+
+    def _give_up_locked(self) -> str:
+        """Stop auto-reconnect until the user hits Connect. Caller holds ``_lock``."""
+        self._drop_socket_locked()
+        self._manual_disconnect = True
+        self._target = None
+        return f"Disconnected (gave up after {self.MAX_RECONNECT_ATTEMPTS} attempts)"
+
+    def _note_reconnect_failure_locked(self) -> str | None:
+        """Count a failed attempt. Returns give-up status text, or None to keep retrying."""
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self.MAX_RECONNECT_ATTEMPTS:
+            return self._give_up_locked()
+        self._retry_at = time.monotonic() + self.RECONNECT_RETRY_SECONDS
+        return None
+
+    def _connect_locked(self) -> str:
+        """Establish a new socket. Caller must hold ``_lock``. Returns status text."""
+        raise NotImplementedError
+
+    def _try_reconnect(self) -> None:
+        """Reconnect without holding the lock across status callbacks."""
+        with self._lock:
+            if self._manual_disconnect or not self._target or self._socket is not None:
+                return
+            if time.monotonic() < self._retry_at:
+                return
             self._reconnect_attempts += 1
-            self.status(f"Reconnect attempt {self._reconnect_attempts}")
-            self._connect_now()
-            self._reconnect_successes += 1
-            self.status(f"Reconnect succeeded ({self._reconnect_successes})")
+            attempt = self._reconnect_attempts
+        self.status(f"Reconnect attempt {attempt}")
+        try:
+            with self._lock:
+                if self._manual_disconnect or not self._target or self._socket is not None:
+                    return
+                message = self._connect_locked()
+                self._reconnect_successes += 1
+                self._consecutive_failures = 0
+                success = self._reconnect_successes
+            self.status(f"Reconnect succeeded ({success})")
+            if message:
+                self.status(message)
         except OSError as exc:
-            self._retry_at = time.monotonic() + 2.0
-            self.status(f"Reconnecting: {exc}")
-        return self._socket is not None
+            with self._lock:
+                gave_up = self._note_reconnect_failure_locked()
+            self.status(gave_up or f"Reconnecting: {exc}")
+
+    def _ensure_connected_locked(self) -> tuple[bool, list[str]]:
+        """Ensure a live socket. Caller must hold ``_lock``.
+
+        Returns ``(ok, status_messages)``. Status is emitted by the caller
+        *after* releasing the lock.
+        """
+        if self._socket:
+            return True, []
+        if self._manual_disconnect or not self._target or time.monotonic() < self._retry_at:
+            return False, []
+        messages: list[str] = []
+        self._reconnect_attempts += 1
+        messages.append(f"Reconnect attempt {self._reconnect_attempts}")
+        try:
+            messages.append(self._connect_locked())
+            self._reconnect_successes += 1
+            self._consecutive_failures = 0
+            messages.append(f"Reconnect succeeded ({self._reconnect_successes})")
+            return True, messages
+        except OSError as exc:
+            gave_up = self._note_reconnect_failure_locked()
+            messages.append(gave_up or f"Reconnecting: {exc}")
+            return False, messages
 
     def _monitor_connection(self) -> None:
         """Reconnect independently of output flow and notice silent peer closure."""
         while not self._closed.wait(0.5):
+            status_message: str | None = None
+            need_reconnect = False
             with self._lock:
                 if self._manual_disconnect or not self._target:
                     continue
                 if self._socket is None:
-                    self._ensure_connected()
-                    continue
-                try:
-                    readable, _, _ = select.select([self._socket], [], [], 0)
-                    if readable and self._socket.recv(1, socket.MSG_PEEK) == b"":
-                        raise ConnectionResetError("ReStim closed the connection")
-                except (OSError, ValueError) as exc:
-                    self._failed(exc)
+                    need_reconnect = True
+                else:
+                    try:
+                        readable, _, _ = select.select([self._socket], [], [], 0)
+                        if readable and self._socket.recv(1, socket.MSG_PEEK) == b"":
+                            raise ConnectionResetError("ReStim closed the connection")
+                    except (OSError, ValueError) as exc:
+                        status_message = self._fail_locked(exc)
+            if status_message:
+                self.status(status_message)
+            if need_reconnect:
+                self._try_reconnect()
 
     def close(self) -> None:
         self._closed.set()
@@ -391,55 +517,77 @@ class _ReconnectClient:
         if self._monitor is not threading.current_thread():
             self._monitor.join(timeout=1.0)
 
-    def _failed(self, exc: Exception) -> None:
-        if self._socket:
-            try: self._socket.close()
-            except OSError: pass
-        self._socket = None; self._retry_at = time.monotonic() + 1.0
-        self._send_failures += 1
-        self.status(f"Disconnected; reconnecting: {exc}")
+
+# Position-like axes get sample-period I suffixes so Restim can interpolate.
+_RESTIM_POSITION_AXES = frozenset({"L0", "L1", "E1", "E2", "E3", "E4"})
+
+
+def _format_restim_axis(axis: str, value: float, interval_ms: int = 0) -> str:
+    """Format one T-code axis; attach I only on position axes when interval_ms > 0."""
+    if interval_ms > 0 and axis.upper() in _RESTIM_POSITION_AXES:
+        return format_command(axis, value, interval_ms)
+    return format_command(axis, value)
 
 
 class ReStimClient(_ReconnectClient):
-    def _connect_now(self) -> None:
+    def _connect_locked(self) -> str:
         assert self._target
         host, port = self._target
-        sock = socket.create_connection((host, port), timeout=2.0); sock.settimeout(2.0)
-        self._socket = sock; self.status(f"Connected to {host}:{port}")
+        sock = socket.create_connection((host, port), timeout=self.CONNECT_TIMEOUT)
+        sock.settimeout(self.CONNECT_TIMEOUT)
+        self._socket = sock
+        return f"Connected to {host}:{port}"
 
     def send(self, alpha: float, beta: float, volume: float, frequency=None,
-             pulse_frequency=None, pulse_rise_time=None, pulse_width=None) -> None:
-        commands = [format_command("L0", alpha), format_command("L1", beta), format_command("V0", volume)]
+             pulse_frequency=None, pulse_rise_time=None, pulse_width=None,
+             interval_ms: int = 0) -> None:
+        commands = [_format_restim_axis("L0", alpha, interval_ms),
+                    _format_restim_axis("L1", beta, interval_ms),
+                    format_command("V0", volume)]
         for axis, value in (("C0", frequency), ("P0", pulse_frequency),
                             ("P3", pulse_rise_time), ("P1", pulse_width)):
             if value is not None: commands.append(format_command(axis, value))
+        messages: list[str] = []
         with self._lock:
-            if not self._ensure_connected(): return
-            try: self._socket.sendall((" ".join(commands) + "\n").encode("ascii"))
-            except OSError as exc: self._failed(exc)
+            ok, messages = self._ensure_connected_locked()
+            if not ok:
+                pass
+            else:
+                try:
+                    self._socket.sendall((" ".join(commands) + "\n").encode("ascii"))
+                except OSError as exc:
+                    messages.append(self._fail_locked(exc))
+        for message in messages:
+            if message:
+                self.status(message)
 
 
 class ReStimWebSocketClient(_ReconnectClient):
     """Dependency-free RFC 6455 client for ReStim's /tcode endpoint."""
-    def _connect_now(self) -> None:
+    def _connect_locked(self) -> str:
         assert self._target
         host, port = self._target
-        sock = socket.create_connection((host, port), timeout=2.0); sock.settimeout(2.0)
+        sock = socket.create_connection((host, port), timeout=self.CONNECT_TIMEOUT)
+        sock.settimeout(self.CONNECT_TIMEOUT)
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         request = (f"GET /tcode HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
                    f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
-        sock.sendall(request.encode("ascii")); response = b""
+        sock.sendall(request.encode("ascii"))
+        response = b""
         while b"\r\n\r\n" not in response and len(response) < 16384:
             chunk = sock.recv(4096)
-            if not chunk: break
+            if not chunk:
+                break
             response += chunk
-        expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
+        expected = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
         if not response.startswith(b"HTTP/1.1 101") or expected.lower() not in response.lower():
-            sock.close(); raise OSError("ReStim rejected the WebSocket handshake")
+            sock.close()
+            raise OSError("ReStim rejected the WebSocket handshake")
         self._socket = sock
         self._needs_neutral = getattr(self, "_has_connected", False)
         self._has_connected = True
-        self.status(f"Connected to ws://{host}:{port}/tcode")
+        return f"Connected to ws://{host}:{port}/tcode"
 
     @staticmethod
     def _frame(message: str) -> bytes:
@@ -449,27 +597,41 @@ class ReStimWebSocketClient(_ReconnectClient):
         return bytes(header) + mask + bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
 
     def _send_message(self, message: str, neutral: str) -> bool:
+        status_messages: list[str] = []
+        successful = False
         with self._lock:
-            if not self._ensure_connected():
-                return False
-            try:
-                if getattr(self, "_needs_neutral", False):
-                    self._socket.sendall(self._frame(neutral))
-                    self._needs_neutral = False
-                    self.status("Recovered safely; output resumed")
-                self._socket.sendall(self._frame(message))
-                self._sent()
-                return True
-            except OSError as exc:
-                self._failed(exc)
-                return False
+            ok, status_messages = self._ensure_connected_locked()
+            if ok:
+                try:
+                    if getattr(self, "_needs_neutral", False):
+                        self._socket.sendall(self._frame(neutral))
+                        self._needs_neutral = False
+                        status_messages.append("Recovered safely; output resumed")
+                    self._socket.sendall(self._frame(message))
+                    self._sent()
+                    successful = True
+                except OSError as exc:
+                    status_messages.append(self._fail_locked(exc))
+                    successful = False
+        for text in status_messages:
+            if text:
+                self.status(text)
+        return successful
 
     def send_prostate(self, alpha, beta, volume, frequency, pulse_frequency,
-                      pulse_width, pulse_rise_time) -> bool:
-        message = " ".join((format_command("L0", alpha), format_command("L1", beta),
-                            format_command("V0", volume), format_command("F0", frequency),
-                            format_command("P0", pulse_frequency), format_command("P1", pulse_width),
-                            format_command("P3", pulse_rise_time)))
+                      pulse_width, pulse_rise_time, interval_ms: int = 0,
+                      s1: float | None = None) -> bool:
+        commands = [
+            _format_restim_axis("L0", alpha, interval_ms),
+            _format_restim_axis("L1", beta, interval_ms),
+            format_command("V0", volume), format_command("F0", frequency),
+            format_command("P0", pulse_frequency), format_command("P1", pulse_width),
+            format_command("P3", pulse_rise_time),
+        ]
+        # Same sensor value as primary. Omit when primary has no S1 this frame.
+        if s1 is not None:
+            commands.append(_format_restim_axis("S1", min(1.0, max(0.0, s1))))
+        message = " ".join(commands)
         neutral = " ".join((format_command("L0", .5), format_command("L1", .5),
                             format_command("V0", 0.0)))
         return self._send_message(message, neutral)
@@ -478,7 +640,8 @@ class ReStimWebSocketClient(_ReconnectClient):
                      electrodes: tuple[float, float, float, float], volume: float,
                      frequency: float, pulse_frequency: float,
                      pulse_rise_time: float, pulse_width: float,
-                     overrides: dict[str, float] | None = None) -> bool:
+                     overrides: dict[str, float] | None = None,
+                     interval_ms: int = 0) -> bool:
         values = {
             "L0": alpha, "L1": beta,
             "E1": electrodes[0], "E2": electrodes[1],
@@ -493,7 +656,9 @@ class ReStimWebSocketClient(_ReconnectClient):
                            "V0", "C0", "P0", "P3", "P1")
         ordered_axes = list(preferred_order)
         ordered_axes.extend(sorted(axis for axis in values if axis not in preferred_order))
-        commands = [format_command(axis, values[axis]) for axis in ordered_axes]
+        commands = [_format_restim_axis(axis, values[axis], interval_ms)
+                    for axis in ordered_axes]
+        # Neutral/recovery settles instantly — never attach I suffixes.
         neutral = " ".join([format_command("L0", .5), format_command("L1", .5)] +
                            [format_command(axis, .5) for axis in ("E1", "E2", "E3", "E4")] +
                            [format_command("V0", 0.0)])
@@ -503,8 +668,9 @@ class ReStimWebSocketClient(_ReconnectClient):
                         volume: float | None = None, frequency: float | None = None,
                         pulse_frequency: float | None = None,
                         pulse_rise_time: float | None = None,
-                        pulse_width: float | None = None) -> bool:
-        commands = [format_command(axis, value)
+                        pulse_width: float | None = None,
+                        interval_ms: int = 0) -> bool:
+        commands = [_format_restim_axis(axis, value, interval_ms)
                     for axis, value in zip(("E1", "E2", "E3", "E4"), values)]
         if volume is not None:
             commands.append(format_command("V0", volume))

@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 import heapq
 from collections import deque
 import math
+import re
 import threading
 import time
 from typing import Callable
@@ -11,6 +12,19 @@ from typing import Callable
 from .motion import MotionCalculator, MotionMode, MotionParameters, SegmentState
 from .variety import speed_linked_depth
 from .modifier import ModifierValues, interpolate, transform_segment
+
+_AXIS_NAME = re.compile(r"^[A-Za-z][0-9]$")
+PROSTATE_TEAR_MODE = "Teardrop"
+
+
+def normalize_prostate_stroke_axis(axis: str | None) -> str:
+    """Return uppercased T-code axis, or '' for follow-primary."""
+    if not axis:
+        return ""
+    text = str(axis).strip().upper()
+    if not text or text == "L0" or not _AXIS_NAME.match(text):
+        return ""
+    return text
 
 
 @dataclass(frozen=True)
@@ -36,6 +50,12 @@ class OutputSample:
     stroke_progress: float = 0.5
     variation_depth: float = 0.0
     prostate_bounds_known: bool = False
+    pulse_frequency_prostate: float = 0.0
+    pulse_rise_time_prostate: float = 0.0
+    pulse_width_prostate: float = 0.0
+    reversal_distance_prostate: float = math.inf
+    prostate_stroke_direction: int = 0
+    variation_depth_prostate: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -63,6 +83,96 @@ class Diagnostics:
     reversal_distance_seconds: float = math.inf
     stroke_progress: float = 0.5
     variation_depth: float = 0.0
+    prostate_source: str = "Follow primary L0"
+    pulse_frequency_prostate: float = 0.0
+    pulse_rise_time_prostate: float = 0.0
+    pulse_width_prostate: float = 0.0
+
+
+class StrokeTracker:
+    """Stroke detection and completed-segment history for one positional axis."""
+
+    def __init__(self, now: float) -> None:
+        self.segment = SegmentState(0, now, now, 0.5, 0.5)
+        self.raw = 0.5
+        self.last_input_time = now
+        self.last_input_position = 0.5
+        self.velocity_history: deque[tuple[float, float]] = deque()
+        self.speed_peak_history: deque[tuple[float, float]] = deque()
+        self.stroke_start_time = now
+        self.stroke_start_position = 0.5
+        self.stroke_direction = 0
+        self.stroke_sequence = 0
+        self.completed_strokes: deque[SegmentState] = deque(maxlen=256)
+        self.input_count = 0
+
+    def receive(self, value: float, interval_ms: int, now: float) -> SegmentState | None:
+        value = min(1.0, max(0.0, value))
+        current = self.segment.position(now)
+        if interval_ms > 0:
+            duration = interval_ms / 1000.0
+            velocity = abs(value - current) / max(duration, 1e-6)
+            start_time, end_time = now, now + duration
+            start_position = current
+        else:
+            # MFP's fixed-update outputs normally send sampled positions without
+            # T-code interval fields. Reconstruct the just-observed segment from
+            # consecutive arrival timestamps instead of treating every sample as
+            # a zero-duration stroke.
+            duration = max(1e-6, now - self.last_input_time)
+            velocity = abs(value - self.last_input_position) / duration
+            start_time, end_time = self.last_input_time, now
+            start_position = self.last_input_position
+
+        self.velocity_history.append((now, velocity))
+        while self.velocity_history and self.velocity_history[0][0] < now - 5.0:
+            self.velocity_history.popleft()
+        rolling_velocity = (
+            sum(item[1] for item in self.velocity_history) / len(self.velocity_history))
+        self.speed_peak_history.append((now, rolling_velocity))
+        while self.speed_peak_history and self.speed_peak_history[0][0] < now - 30.0:
+            self.speed_peak_history.popleft()
+        rolling_peak = max((item[1] for item in self.speed_peak_history), default=0.0)
+        normalized_speed = (
+            100.0 * rolling_velocity / rolling_peak if rolling_peak > 1e-9 else 0.0)
+        self.input_count += 1
+        self.raw = value
+        delta = value - self.last_input_position
+        new_direction = 1 if delta > 0.00005 else (-1 if delta < -0.00005 else 0)
+        completed_stroke = None
+        if new_direction and self.stroke_direction and new_direction != self.stroke_direction:
+            self.stroke_sequence += 1
+            completed_stroke = SegmentState(
+                self.stroke_sequence, self.stroke_start_time, self.last_input_time,
+                self.stroke_start_position, self.last_input_position, normalized_speed,
+            )
+            self.completed_strokes.append(completed_stroke)
+            self.stroke_start_time = self.last_input_time
+            self.stroke_start_position = self.last_input_position
+        if new_direction:
+            self.stroke_direction = new_direction
+        self.segment = SegmentState(
+            self.input_count, start_time, end_time, start_position, value,
+            normalized_speed,
+        )
+        self.last_input_time = now
+        self.last_input_position = value
+        return completed_stroke
+
+    def stroke_for_time(self, scheduled_at: float) -> SegmentState:
+        for stroke in reversed(self.completed_strokes):
+            if stroke.start_time <= scheduled_at <= stroke.end_time:
+                return stroke
+        # Provisional current stroke. It will be rewritten on the next reversal.
+        return SegmentState(
+            1_000_000_000 + self.stroke_sequence + 1, self.stroke_start_time,
+            max(scheduled_at, self.last_input_time), self.stroke_start_position,
+            self.last_input_position, self.segment.speed_percent,
+        )
+
+    def nearest_reversal_distance(self, at_time: float) -> float:
+        return min((abs(at_time - stroke.end_time)
+                    for stroke in self.completed_strokes), default=math.inf)
 
 
 class VectorEngine:
@@ -81,18 +191,10 @@ class VectorEngine:
         self.calculator = MotionCalculator()
         self._lock = threading.RLock()
         now = clock()
-        self._segment = SegmentState(0, now, now, 0.5, 0.5)
-        self._raw_l0 = 0.5
-        self._last_input_time = now
-        self._last_input_position = 0.5
-        self._velocity_history: deque[tuple[float, float]] = deque()
+        self._primary = StrokeTracker(now)
+        self._prostate = StrokeTracker(now)
+        self.prostate_stroke_axis = ""
         self._signal_history: deque[tuple[float, float, float]] = deque()
-        self._speed_peak_history: deque[tuple[float, float]] = deque()
-        self._stroke_start_time = now
-        self._stroke_start_position = 0.5
-        self._stroke_direction = 0
-        self._stroke_sequence = 0
-        self._completed_strokes: deque[SegmentState] = deque(maxlen=256)
         self._known_stroke_bounds: tuple[float, float] | None = None
         self.dynamic_volume = True
         self.volume_rest_level = 0.4
@@ -116,6 +218,23 @@ class VectorEngine:
         self.pulse_width_max = 0.45
         self._width_was_active = False
         self._width_active_since = now
+        self._prostate_pulse_was_active = False
+        self._prostate_pulse_active_since = now
+        self._prostate_width_was_active = False
+        self._prostate_width_active_since = now
+        self.prostate_motion_mode = PROSTATE_TEAR_MODE
+        self.prostate_params = MotionParameters()
+        self.prostate_calculator = MotionCalculator()
+        self.prostate_jitter_enabled = False
+        self.prostate_jitter_amplitude = 0.02
+        self.prostate_jitter_cycle_seconds = 1.0
+        self.prostate_speed_linked_variation = True
+        self.prostate_variation_full_speed_percent = 35.0
+        self.prostate_variation_fade_seconds = 0.75
+        self.prostate_spatial_curve = "Linear"
+        self.prostate_spatial_blend = 0.0
+        self._prostate_variation_depth = 0.0
+        self._prostate_variation_updated_at = now
         self.prostate_narrow_ratio = 1.0
         self.prostate_arc_depth = 0.25
         self.prostate_stroke_threshold = 0.25
@@ -132,7 +251,6 @@ class VectorEngine:
         self.spatial_blend = 0.0
         self._variation_depth = 0.0
         self._variation_updated_at = now
-        self._input_count = 0
         self._output_count = 0
         self._sequence = 0
         self._queue: list[tuple[float, int, OutputSample]] = []
@@ -146,6 +264,59 @@ class VectorEngine:
         self._modifier_target = ModifierValues()
         self._modifier_transition_started_at = now
         self._modifier_transition_seconds = 0.2
+
+    # Compatibility aliases used by existing tests and diagnostics.
+    @property
+    def _segment(self) -> SegmentState:
+        return self._primary.segment
+
+    @_segment.setter
+    def _segment(self, value: SegmentState) -> None:
+        self._primary.segment = value
+
+    @property
+    def _raw_l0(self) -> float:
+        return self._primary.raw
+
+    @_raw_l0.setter
+    def _raw_l0(self, value: float) -> None:
+        self._primary.raw = value
+
+    @property
+    def _last_input_time(self) -> float:
+        return self._primary.last_input_time
+
+    @_last_input_time.setter
+    def _last_input_time(self, value: float) -> None:
+        self._primary.last_input_time = value
+
+    @property
+    def _last_input_position(self) -> float:
+        return self._primary.last_input_position
+
+    @_last_input_position.setter
+    def _last_input_position(self, value: float) -> None:
+        self._primary.last_input_position = value
+
+    @property
+    def _input_count(self) -> int:
+        return self._primary.input_count
+
+    @_input_count.setter
+    def _input_count(self, value: int) -> None:
+        self._primary.input_count = value
+
+    @property
+    def _completed_strokes(self) -> deque[SegmentState]:
+        return self._primary.completed_strokes
+
+    @property
+    def _stroke_direction(self) -> int:
+        return self._primary.stroke_direction
+
+    @_stroke_direction.setter
+    def _stroke_direction(self, value: int) -> None:
+        self._primary.stroke_direction = value
 
     def configure(self, *, rate_hz: int, lookahead_seconds: float, volume: float,
                   mode: MotionMode, params: MotionParameters,
@@ -169,13 +340,26 @@ class VectorEngine:
                   prostate_volume_multiplier: float = 1.5,
                   prostate_rest_level: float = 0.7,
                   prostate_phase_degrees: float = 0.0,
+                  prostate_stroke_axis: str = "",
                   jitter_enabled: bool = False, jitter_amplitude: float = 0.02,
                   jitter_cycle_seconds: float = 1.0,
                   speed_linked_variation: bool = True,
                   variation_full_speed_percent: float = 35.0,
                   variation_fade_seconds: float = .75,
                   spatial_curve: str = "Linear",
-                  spatial_blend: float = 0.0) -> None:
+                  spatial_blend: float = 0.0,
+                  prostate_motion_mode: str = PROSTATE_TEAR_MODE,
+                  prostate_minimum_radius: float = 0.1,
+                  prostate_speed_threshold: float = 50.0,
+                  prostate_direction_probability: float = 0.1,
+                  prostate_jitter_enabled: bool = False,
+                  prostate_jitter_amplitude: float = 0.02,
+                  prostate_jitter_cycle_seconds: float = 1.0,
+                  prostate_speed_linked_variation: bool = True,
+                  prostate_variation_full_speed_percent: float = 35.0,
+                  prostate_variation_fade_seconds: float = 0.75,
+                  prostate_spatial_curve: str = "Linear",
+                  prostate_spatial_blend: float = 0.0) -> None:
         with self._lock:
             mode_changed = mode != self.mode
             self.rate_hz = max(1, min(200, int(rate_hz)))
@@ -207,6 +391,7 @@ class VectorEngine:
             self.prostate_volume_multiplier = min(3.0, max(1.0, float(prostate_volume_multiplier)))
             self.prostate_rest_level = min(1.0, max(0.0, float(prostate_rest_level)))
             self.prostate_phase_degrees = min(90.0, max(-90.0, float(prostate_phase_degrees)))
+            self.prostate_stroke_axis = normalize_prostate_stroke_axis(prostate_stroke_axis)
             self.jitter_enabled = bool(jitter_enabled)
             self.jitter_amplitude = min(.20, max(0.0, float(jitter_amplitude)))
             self.jitter_cycle_seconds = min(30.0, max(.05, float(jitter_cycle_seconds)))
@@ -216,6 +401,27 @@ class VectorEngine:
             self.variation_fade_seconds = min(10.0, max(.05, float(variation_fade_seconds)))
             self.spatial_curve = str(spatial_curve)
             self.spatial_blend = min(1.0, max(0.0, float(spatial_blend)))
+            mode_name = str(prostate_motion_mode)
+            if mode_name in (PROSTATE_TEAR_MODE, "Tear"):
+                mode_name = PROSTATE_TEAR_MODE
+            else:
+                mode_name = MotionMode(mode_name).value
+            self.prostate_motion_mode = mode_name
+            self.prostate_params = MotionParameters(
+                min_distance_from_center=min(0.9, max(0.0, float(prostate_minimum_radius))),
+                speed_threshold_percent=min(100.0, max(0.0, float(prostate_speed_threshold))),
+                direction_change_probability=min(1.0, max(0.0, float(prostate_direction_probability))))
+            self.prostate_jitter_enabled = bool(prostate_jitter_enabled)
+            self.prostate_jitter_amplitude = min(.20, max(0.0, float(prostate_jitter_amplitude)))
+            self.prostate_jitter_cycle_seconds = min(
+                30.0, max(.05, float(prostate_jitter_cycle_seconds)))
+            self.prostate_speed_linked_variation = bool(prostate_speed_linked_variation)
+            self.prostate_variation_full_speed_percent = min(
+                100.0, max(1.0, float(prostate_variation_full_speed_percent)))
+            self.prostate_variation_fade_seconds = min(
+                10.0, max(.05, float(prostate_variation_fade_seconds)))
+            self.prostate_spatial_curve = str(prostate_spatial_curve)
+            self.prostate_spatial_blend = min(1.0, max(0.0, float(prostate_spatial_blend)))
             if mode_changed and self._state in ("Buffering", "Running"):
                 # Never release samples calculated by a previously selected
                 # geometry under a newly-labelled UI state.
@@ -265,6 +471,20 @@ class VectorEngine:
     def _modified_segment(self, segment: SegmentState, at_time: float) -> SegmentState:
         return transform_segment(segment, self._modifier_values(at_time))
 
+    def prostate_axis_configured(self) -> bool:
+        return bool(self.prostate_stroke_axis)
+
+    def prostate_axis_live(self, at_time: float | None = None) -> bool:
+        del at_time
+        return self.prostate_axis_configured()
+
+    def prostate_source_label(self, at_time: float | None = None) -> str:
+        del at_time
+        axis = self.prostate_stroke_axis
+        if not axis:
+            return "Follow primary L0"
+        return f"{axis} live"
+
     def receive_l0(self, value: float, interval_ms: int = 0,
                    received_at: float | None = None,
                    stroke_bounds: tuple[float, float] | None = None) -> None:
@@ -277,67 +497,35 @@ class VectorEngine:
                 low, high = sorted((min(1.0, max(0.0, float(stroke_bounds[0]))),
                                     min(1.0, max(0.0, float(stroke_bounds[1])))))
                 self._known_stroke_bounds = (low, high)
-            current = self._segment.position(now)
-            if interval_ms > 0:
-                duration = interval_ms / 1000.0
-                velocity = abs(value - current) / max(duration, 1e-6)
-                start_time, end_time = now, now + duration
-                start_position = current
-            else:
-                # MFP's fixed-update outputs normally send sampled positions without
-                # T-code interval fields. Reconstruct the just-observed segment from
-                # consecutive arrival timestamps instead of treating every sample as
-                # a zero-duration stroke.
-                duration = max(1e-6, now - self._last_input_time)
-                velocity = abs(value - self._last_input_position) / duration
-                start_time, end_time = self._last_input_time, now
-                start_position = self._last_input_position
-
-            self._velocity_history.append((now, velocity))
-            while self._velocity_history and self._velocity_history[0][0] < now - 5.0:
-                self._velocity_history.popleft()
+            completed_stroke = self._primary.receive(value, interval_ms, now)
+            velocity = (self._primary.velocity_history[-1][1]
+                        if self._primary.velocity_history else 0.0)
             self._signal_history.append((now, value, velocity))
             while self._signal_history and self._signal_history[0][0] < now - 10.0:
                 self._signal_history.popleft()
-            rolling_velocity = sum(item[1] for item in self._velocity_history) / len(self._velocity_history)
-            self._speed_peak_history.append((now, rolling_velocity))
-            while self._speed_peak_history and self._speed_peak_history[0][0] < now - 30.0:
-                self._speed_peak_history.popleft()
-            rolling_peak = max((item[1] for item in self._speed_peak_history), default=0.0)
-            normalized_speed = 100.0 * rolling_velocity / rolling_peak if rolling_peak > 1e-9 else 0.0
-            self._input_count += 1
-            self._raw_l0 = value
-            delta = value - self._last_input_position
-            new_direction = 1 if delta > 0.00005 else (-1 if delta < -0.00005 else 0)
-            completed_stroke = None
-            if new_direction and self._stroke_direction and new_direction != self._stroke_direction:
-                self._stroke_sequence += 1
-                completed_stroke = SegmentState(
-                    self._stroke_sequence, self._stroke_start_time, self._last_input_time,
-                    self._stroke_start_position, self._last_input_position, normalized_speed,
-                )
-                self._completed_strokes.append(completed_stroke)
-                self._stroke_start_time = self._last_input_time
-                self._stroke_start_position = self._last_input_position
-            if new_direction:
-                self._stroke_direction = new_direction
-            self._segment = SegmentState(
-                self._input_count, start_time, end_time, start_position, value,
-                normalized_speed,
-            )
-            self._last_input_time = now
-            self._last_input_position = value
             if completed_stroke is not None:
-                self._rewrite_completed_stroke(completed_stroke)
+                self._rewrite_primary_stroke(completed_stroke)
 
-    def _rewrite_completed_stroke(self, stroke: SegmentState) -> None:
-        """Apply a discovered reversal endpoint to samples still in look-ahead.
+    def receive_prostate_axis(self, value: float, interval_ms: int = 0,
+                              received_at: float | None = None) -> None:
+        """Ingest the configured secondary prostate stroke axis (e.g. L3)."""
+        if not self.prostate_axis_configured():
+            return
+        now = self.clock() if received_at is None else received_at
+        with self._lock:
+            completed_stroke = self._prostate.receive(value, interval_ms, now)
+            if completed_stroke is not None:
+                self._rewrite_prostate_stroke(completed_stroke)
+
+    def _rewrite_primary_stroke(self, stroke: SegmentState) -> None:
+        """Apply a discovered L0 reversal to samples still in look-ahead.
 
         MFP sends interpolated positions, not original funscript keyframes. The
         reversal identifies the equivalent RFP stroke endpoint. Since calculated
         samples are held for one second, ordinary strokes can be corrected before
         they are released to ReStim.
         """
+        follow_primary_prostate = not self.prostate_axis_configured()
         rewritten: list[tuple[float, int, OutputSample]] = []
         for due_at, sequence, sample in self._queue:
             sample = replace(
@@ -362,20 +550,42 @@ class VectorEngine:
                 )
                 sample = replace(sample, output_l0=position, speed_percent=speed,
                                  alpha=alpha, beta=beta)
+            # A selected prostate axis never follows L0. Known generated bounds
+            # keep their own prostate path.
+            if (not sample.prostate_bounds_known
+                    and stroke.start_time <= sample.calculated_at <= stroke.end_time):
+                use_primary_prostate = follow_primary_prostate
+                if use_primary_prostate:
+                    pa, pb = self._calculate_prostate(
+                        self._jitter_segment(
+                            self._modified_segment(stroke, sample.calculated_at),
+                            sample.variation_depth),
+                        sample.calculated_at)
+                    sample = replace(sample, alpha_prostate=pa, beta_prostate=pb)
+            rewritten.append((due_at, sequence, sample))
+        self._queue = rewritten
+        heapq.heapify(self._queue)
+
+    def _rewrite_prostate_stroke(self, stroke: SegmentState) -> None:
+        """Rewrite queued prostate alpha/beta after a secondary-axis reversal."""
+        rewritten: list[tuple[float, int, OutputSample]] = []
+        for due_at, sequence, sample in self._queue:
             if (not sample.prostate_bounds_known
                     and stroke.start_time <= sample.calculated_at <= stroke.end_time):
                 pa, pb = self._calculate_prostate(
-                    self._jitter_segment(
-                        self._modified_segment(stroke, sample.calculated_at), sample.variation_depth),
+                    self._jitter_segment(stroke, sample.variation_depth),
                     sample.calculated_at)
                 sample = replace(sample, alpha_prostate=pa, beta_prostate=pb)
             rewritten.append((due_at, sequence, sample))
         self._queue = rewritten
         heapq.heapify(self._queue)
 
+    def _rewrite_completed_stroke(self, stroke: SegmentState) -> None:
+        """Backward-compatible alias for primary stroke rewrite."""
+        self._rewrite_primary_stroke(stroke)
+
     def _nearest_reversal_distance(self, at_time: float) -> float:
-        return min((abs(at_time - stroke.end_time)
-                    for stroke in self._completed_strokes), default=math.inf)
+        return self._primary.nearest_reversal_distance(at_time)
 
     @staticmethod
     def _stroke_progress(stroke: SegmentState, at_time: float) -> float:
@@ -385,15 +595,12 @@ class VectorEngine:
         return min(1.0, max(0.0, (at_time - stroke.start_time) / duration))
 
     def _stroke_for_time(self, scheduled_at: float) -> SegmentState:
-        for stroke in reversed(self._completed_strokes):
-            if stroke.start_time <= scheduled_at <= stroke.end_time:
-                return stroke
-        # Provisional current stroke. It will be rewritten on the next reversal.
-        return SegmentState(
-            1_000_000_000 + self._stroke_sequence + 1, self._stroke_start_time,
-            max(scheduled_at, self._last_input_time), self._stroke_start_position,
-            self._last_input_position, self._segment.speed_percent,
-        )
+        return self._primary.stroke_for_time(scheduled_at)
+
+    def _prostate_stroke_for_time(self, scheduled_at: float) -> SegmentState:
+        if self.prostate_axis_live(scheduled_at):
+            return self._prostate.stroke_for_time(scheduled_at)
+        return self._primary.stroke_for_time(scheduled_at)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -622,16 +829,55 @@ class VectorEngine:
             pulse_frequency = self._calculate_pulse_frequency(scheduled_at, speed, alpha)
             pulse_rise_time = self._calculate_pulse_rise_time(speed)
             pulse_width = self._calculate_pulse_width(scheduled_at, speed, output_l0)
-            prostate_segment = self._jitter_segment(
-                self._modified_segment(self._stroke_for_time(scheduled_at), scheduled_at), variation_depth)
-            known_bounds = self._known_stroke_bounds
-            if known_bounds is None:
-                alpha_prostate, beta_prostate = self._calculate_prostate(
-                    prostate_segment, scheduled_at)
+            prostate_live = self.prostate_axis_live(scheduled_at)
+            prostate_tracker = self._prostate if prostate_live else self._primary
+            prostate_depth = 0.0
+            reversal_prostate = math.inf
+            prostate_direction = 0
+            if prostate_live:
+                raw_prostate = prostate_tracker.stroke_for_time(scheduled_at)
+                prostate_speed = raw_prostate.speed_percent
+                prostate_depth = self._update_prostate_variation_depth(
+                    scheduled_at, prostate_speed)
+                prostate_segment = self._jitter_prostate_segment(raw_prostate, prostate_depth)
+                known_bounds = None
+                alpha_prostate, beta_prostate, prostate_position = self._prostate_pose(
+                    prostate_segment, scheduled_at, prostate_depth)
+                pulse_frequency_prostate = self._calculate_pulse_frequency(
+                    scheduled_at, prostate_speed, alpha_prostate,
+                    idle_at=prostate_tracker.last_input_time,
+                    rest_level=self.prostate_rest_level,
+                    latch_was="_prostate_pulse_was_active",
+                    latch_since="_prostate_pulse_active_since")
+                pulse_rise_prostate = self._calculate_pulse_rise_time(prostate_speed)
+                pulse_width_prostate = self._calculate_pulse_width(
+                    scheduled_at, prostate_speed, prostate_position,
+                    idle_at=prostate_tracker.last_input_time,
+                    rest_level=self.prostate_rest_level,
+                    latch_was="_prostate_width_was_active",
+                    latch_since="_prostate_width_active_since")
+                reversal_prostate = prostate_tracker.nearest_reversal_distance(scheduled_at)
+                prostate_direction = self._segment_direction(raw_prostate)
             else:
-                alpha_prostate, beta_prostate = self._calculate_known_prostate(
-                    scheduled_at, variation_depth, known_bounds)
-            volume_prostate = self._calculate_prostate_volume(scheduled_at, speed)
+                prostate_segment = self._jitter_segment(
+                    self._modified_segment(
+                        self._stroke_for_time(scheduled_at), scheduled_at),
+                    variation_depth)
+                known_bounds = self._known_stroke_bounds
+                if known_bounds is None:
+                    alpha_prostate, beta_prostate = self._calculate_prostate(
+                        prostate_segment, scheduled_at)
+                else:
+                    alpha_prostate, beta_prostate = self._calculate_known_prostate(
+                        scheduled_at, variation_depth, known_bounds)
+                prostate_speed = speed
+                pulse_frequency_prostate = pulse_frequency
+                pulse_rise_prostate = pulse_rise_time
+                pulse_width_prostate = pulse_width
+            volume_prostate = self._calculate_prostate_volume(
+                scheduled_at, prostate_speed,
+                idle_reference_time=prostate_tracker.last_input_time)
+            primary_stroke = self._stroke_for_time(scheduled_at)
             self._sequence += 1
             sample = OutputSample(
                 self._sequence, scheduled_at, scheduled_at + self.lookahead_seconds,
@@ -642,9 +888,15 @@ class VectorEngine:
                 pulse_width,
                 alpha_prostate, beta_prostate, volume_prostate,
                 self._nearest_reversal_distance(scheduled_at),
-                self._stroke_progress(prostate_segment, scheduled_at),
+                self._stroke_progress(primary_stroke, scheduled_at),
                 variation_depth,
                 known_bounds is not None,
+                pulse_frequency_prostate,
+                pulse_rise_prostate,
+                pulse_width_prostate,
+                reversal_prostate,
+                prostate_direction,
+                prostate_depth,
             )
             heapq.heappush(self._queue, (sample.due_at, sample.sequence, sample))
 
@@ -658,6 +910,17 @@ class VectorEngine:
         if target <= 1e-9 and self._variation_depth < 1e-4:
             self._variation_depth = 0.0
         return min(1.0, max(0.0, self._variation_depth))
+
+    def _update_prostate_variation_depth(self, at_time: float, speed_percent: float) -> float:
+        target = (speed_linked_depth(speed_percent, self.prostate_variation_full_speed_percent)
+                  if self.prostate_speed_linked_variation else 1.0)
+        elapsed = max(0.0, at_time - self._prostate_variation_updated_at)
+        self._prostate_variation_updated_at = at_time
+        blend = 1.0 - math.exp(-elapsed / self.prostate_variation_fade_seconds)
+        self._prostate_variation_depth += (target - self._prostate_variation_depth) * blend
+        if target <= 1e-9 and self._prostate_variation_depth < 1e-4:
+            self._prostate_variation_depth = 0.0
+        return min(1.0, max(0.0, self._prostate_variation_depth))
 
     def _jitter_offset(self, at_time: float, depth: float = 1.0) -> float:
         """Deterministic band-limited texture; never alters input stroke detection."""
@@ -680,6 +943,41 @@ class VectorEngine:
                            + self._jitter_offset(segment.end_time, depth)))
         return replace(segment, start_position=start, end_position=end)
 
+    def _jitter_prostate_segment(self, segment: SegmentState, depth: float) -> SegmentState:
+        if not self.prostate_jitter_enabled or self.prostate_jitter_amplitude <= 0.0:
+            return segment
+        scale = self.prostate_jitter_amplitude * min(1.0, max(0.0, depth))
+
+        def shift(at_time: float, position: float) -> float:
+            phase = 2.0 * math.pi * at_time / self.prostate_jitter_cycle_seconds
+            wave = .65 * math.sin(phase) + .35 * math.sin(phase / .57 + 1.7)
+            return min(1.0, max(0.0, position + scale * wave))
+
+        return replace(
+            segment,
+            start_position=shift(segment.start_time, segment.start_position),
+            end_position=shift(segment.end_time, segment.end_position))
+
+    def _prostate_pose(self, segment: SegmentState, at_time: float,
+                       depth: float) -> tuple[float, float, float]:
+        """Teardrop stays on the inverted stroke. Other modes use prostate motion knobs."""
+        if self.prostate_motion_mode == PROSTATE_TEAR_MODE:
+            alpha, beta = self._calculate_prostate(segment, at_time)
+            return alpha, beta, segment.position(at_time)
+        alpha, beta, position, _speed = self.prostate_calculator.calculate(
+            MotionMode(self.prostate_motion_mode), segment, at_time, self.prostate_params,
+            self.prostate_spatial_curve, self.prostate_spatial_blend * depth)
+        return alpha, beta, position
+
+    @staticmethod
+    def _segment_direction(segment: SegmentState) -> int:
+        delta = segment.end_position - segment.start_position
+        if delta > 1e-9:
+            return 1
+        if delta < -1e-9:
+            return -1
+        return 0
+
     def _release_due(self, now: float) -> None:
         due: list[OutputSample] = []
         with self._lock:
@@ -687,6 +985,7 @@ class VectorEngine:
                 due.append(heapq.heappop(self._queue)[2])
             if due and self._output_enabled and self._state == "Buffering":
                 self._state = "Running"
+            source_label = self.prostate_source_label(now)
         for sample in due:
             self.send_sample(sample)
             actual = self.clock() - sample.calculated_at
@@ -705,6 +1004,10 @@ class VectorEngine:
                     sample.reversal_distance_seconds,
                     sample.stroke_progress,
                     sample.variation_depth,
+                    source_label,
+                    sample.pulse_frequency_prostate,
+                    sample.pulse_rise_time_prostate,
+                    sample.pulse_width_prostate,
                 )
         with self._lock:
             if not due:
@@ -712,6 +1015,7 @@ class VectorEngine:
                     self._diag, raw_l0=self._raw_l0,
                     buffer_fill=len(self._queue), lookahead_seconds=self.lookahead_seconds,
                     input_samples=self._input_count, state=self._state,
+                    prostate_source=self.prostate_source_label(now),
                 )
 
     def step(self, scheduled_at: float, release_at: float | None = None) -> None:
@@ -748,23 +1052,29 @@ class VectorEngine:
             (self.frequency_ramp_level * (ratio - 1.0) + speed) / ratio))
 
     def _calculate_pulse_frequency(self, at_time: float, speed_percent: float,
-                                   alpha: float) -> float:
-        active = ((at_time - self._last_input_time) <= self.volume_idle_seconds
+                                   alpha: float, *,
+                                   idle_at: float | None = None,
+                                   rest_level: float | None = None,
+                                   latch_was: str = "_pulse_was_active",
+                                   latch_since: str = "_pulse_active_since") -> float:
+        reference = self._last_input_time if idle_at is None else idle_at
+        rest = self.volume_rest_level if rest_level is None else rest_level
+        active = ((at_time - reference) <= self.volume_idle_seconds
                   and speed_percent > 0.5 and alpha > 1e-6)
         speed = min(1.0, max(0.0, speed_percent / 100.0))
         ratio = self.pulse_frequency_ratio
         combined = (speed * (ratio - 1.0) + min(1.0, max(0.0, alpha))) / ratio
         if not active:
-            self._pulse_was_active = False
-            combined *= self.volume_rest_level
+            setattr(self, latch_was, False)
+            combined *= rest
         else:
-            if not self._pulse_was_active:
-                self._pulse_active_since = at_time
-                self._pulse_was_active = True
+            if not getattr(self, latch_was):
+                setattr(self, latch_since, at_time)
+                setattr(self, latch_was, True)
             if self.volume_ramp_up_seconds > 0:
                 progress = min(1.0, max(0.0,
-                    (at_time - self._pulse_active_since) / self.volume_ramp_up_seconds))
-                combined *= self.volume_rest_level + (1.0 - self.volume_rest_level) * progress
+                    (at_time - getattr(self, latch_since)) / self.volume_ramp_up_seconds))
+                combined *= rest + (1.0 - rest) * progress
         return self.pulse_frequency_min + combined * (
             self.pulse_frequency_max - self.pulse_frequency_min)
 
@@ -777,8 +1087,14 @@ class VectorEngine:
             self.pulse_rise_max - self.pulse_rise_min)
 
     def _calculate_pulse_width(self, at_time: float, speed_percent: float,
-                               output_l0: float) -> float:
-        active = ((at_time - self._last_input_time) <= self.volume_idle_seconds
+                               output_l0: float, *,
+                               idle_at: float | None = None,
+                               rest_level: float | None = None,
+                               latch_was: str = "_width_was_active",
+                               latch_since: str = "_width_active_since") -> float:
+        reference = self._last_input_time if idle_at is None else idle_at
+        rest = self.volume_rest_level if rest_level is None else rest_level
+        active = ((at_time - reference) <= self.volume_idle_seconds
                   and speed_percent > 0.5)
         speed = min(1.0, max(0.0, speed_percent / 100.0))
         inverted_l0 = 1.0 - min(1.0, max(0.0, output_l0))
@@ -786,16 +1102,16 @@ class VectorEngine:
         ratio = self.pulse_width_ratio
         combined = (speed * (ratio - 1.0) + limited) / ratio
         if not active:
-            self._width_was_active = False
-            combined *= self.volume_rest_level
+            setattr(self, latch_was, False)
+            combined *= rest
             return min(self.pulse_width_max, max(self.pulse_width_min, combined))
-        if not self._width_was_active:
-            self._width_active_since = at_time
-            self._width_was_active = True
+        if not getattr(self, latch_was):
+            setattr(self, latch_since, at_time)
+            setattr(self, latch_was, True)
         if self.volume_ramp_up_seconds > 0:
             progress = min(1.0, max(0.0,
-                (at_time - self._width_active_since) / self.volume_ramp_up_seconds))
-            combined *= self.volume_rest_level + (1.0 - self.volume_rest_level) * progress
+                (at_time - getattr(self, latch_since)) / self.volume_ramp_up_seconds))
+            combined *= rest + (1.0 - rest) * progress
         # Unlike upstream's intermediate input limit, Vector exposes Min/Max as
         # a live controller-adjustable output range. Enforce it after blending
         # so the actual P1 command always remains inside the displayed range.
@@ -822,7 +1138,7 @@ class VectorEngine:
         if stroke_range >= self.prostate_stroke_threshold:
             going_up = end > start
             bulge = min(stroke_range / 2.0, 0.5) * self.prostate_arc_depth
-            # A true tear occupies opposite sides of beta=0.5. Because the
+            # A true teardrop occupies opposite sides of beta=0.5. Because the
             # working position is inverted L0, going_up here is the source
             # downstroke: beta is positive on the way down and negative on the
             # way up. Side arc depth keeps both deviations deliberately small.
@@ -856,11 +1172,14 @@ class VectorEngine:
         return self._calculate_prostate(
             synthetic, min(1.0, max(0.0, progress)))
 
-    def _calculate_prostate_volume(self, at_time: float, speed_percent: float) -> float:
+    def _calculate_prostate_volume(self, at_time: float, speed_percent: float,
+                                   idle_reference_time: float | None = None) -> float:
         ratio = min(40.0, self.volume_ramp_speed_ratio * self.prostate_volume_multiplier)
         speed = min(1.0, max(0.0, speed_percent / 100.0))
         generated = ((ratio - 1.0) + speed) / ratio
-        active = ((at_time - self._last_input_time) <= self.volume_idle_seconds
+        idle_at = (self._last_input_time
+                   if idle_reference_time is None else idle_reference_time)
+        active = ((at_time - idle_at) <= self.volume_idle_seconds
                   and speed_percent > 0.5)
         if not active:
             generated *= self.prostate_rest_level

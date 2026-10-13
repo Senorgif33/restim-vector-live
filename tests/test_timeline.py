@@ -166,6 +166,197 @@ def test_direct_clock_marks_repeated_playing_position_stale(tmp_path, monkeypatc
     assert snap['clock_authoritative'] is False
 
 
+def test_media_position_ignores_missing_funscript_and_pattern_match():
+    from vector1a.media_clock import MediaSnapshot
+    c = FakeClock()
+    t = FunscriptTimeline(clock=c)
+    t.set_clock_mode(FunscriptTimeline.CLOCK_VLC)
+    t._media_snapshot = MediaSnapshot(
+        'VLC', True, 'playing', 12.5, 100.0, 1.0, r'E:\clip.mp4', 'clip.mp4')
+    t._media_snapshot_received_at = c()
+    t._media_clock_health = 'live'
+    t._match_position = 99.0
+    assert t.position_seconds() is None
+    assert t.media_position_seconds() == 12.5
+    assert t.events_media_path() == r'E:\clip.mp4'
+    c.advance(1.0)
+    assert abs(t.media_position_seconds() - 13.5) < 1e-6
+    t._media_snapshot = MediaSnapshot(
+        'VLC', True, 'paused', 12.5, 100.0, 1.0, r'E:\clip.mp4', 'clip.mp4')
+    t._media_snapshot_received_at = c()
+    c.advance(4.0)
+    assert t.media_position_seconds() == 12.5
+
+
+def test_stale_media_position_holds_player_sample():
+    from vector1a.media_clock import MediaSnapshot
+    c = FakeClock()
+    t = FunscriptTimeline(clock=c)
+    t.set_clock_mode(FunscriptTimeline.CLOCK_AUTO)
+    t._media_snapshot = MediaSnapshot(
+        'VLC', True, 'playing', 8.0, 100.0, 2.0, r'E:\clip.mp4', 'clip.mp4')
+    t._media_snapshot_received_at = c()
+    t._media_clock_health = 'stale'
+    t._match_position = 40.0
+    c.advance(3.0)
+    assert t.media_position_seconds() == 8.0
+    t.set_clock_mode(FunscriptTimeline.CLOCK_MFP)
+    assert t.media_position_seconds() is None
+    assert t.events_media_path() is None
+
+
+def test_auto_prefers_playing_potplayer_over_paused_mpc():
+    from vector1a.media_clock import MediaSnapshot
+    from vector1a.timeline import choose_auto_player
+    vlc = MediaSnapshot("VLC", False, error="down")
+    mpc = MediaSnapshot("MPC", True, "paused", 1.0, 10.0, 1.0, r"E:\old.mp4", "old.mp4")
+    pot = MediaSnapshot("PotPlayer", True, "playing", 12.5, 100.0, 1.0, r"E:\clip.m4v", "clip.m4v")
+    assert choose_auto_player([vlc, mpc, pot]).player == "PotPlayer"
+    mpc_play = MediaSnapshot("MPC", True, "playing", 4.0, 10.0, 1.0, r"E:\old.mp4", "old.mp4")
+    assert choose_auto_player([vlc, mpc_play, pot]).player == "MPC"
+    assert choose_auto_player([vlc, mpc, MediaSnapshot("PotPlayer", False)]).player == "MPC"
+
+
+def test_media_clock_returns_position_and_duration_without_funscript():
+    from vector1a.media_clock import MediaSnapshot
+    c = FakeClock()
+    t = FunscriptTimeline(clock=c)
+    t.set_clock_mode(FunscriptTimeline.CLOCK_POT)
+    t._media_snapshot = MediaSnapshot(
+        "PotPlayer", True, "playing", 25.0, 100.0, 1.0, r"E:\clip.m4v", "clip.m4v")
+    t._media_snapshot_received_at = c()
+    t._media_clock_health = "live"
+    assert t.media_clock() == (25.0, 100.0)
+    t.set_clock_mode(FunscriptTimeline.CLOCK_MFP)
+    assert t.media_clock() == (None, None)
+
+
+def test_ramp_gain_uses_player_clock():
+    from vector1a.app import VectorApp
+    from vector1a.media_timeline import RampWaypoint
+    app = object.__new__(VectorApp)
+    app._send_cfg = {
+        "media_volume_ramp_enabled": True,
+        "media_volume_ramp_waypoints_enabled": True,
+        "media_volume_ramp_curve": "Linear",
+        "media_volume_ramp_floor": 0.0,
+        "media_volume_ramp_ceiling": 1.0,
+        "media_volume_ramp_floor2": 0.4,
+        "media_volume_ramp_ceiling2": 1.0,
+        "media_volume_ramp_floor3": 0.4,
+        "media_volume_ramp_ceiling3": 1.0,
+    }
+    app._media_ramp_waypoints = [
+        RampWaypoint(0.0, "floor1", "Linear"),
+        RampWaypoint(100.0, "ceiling1", "Linear"),
+    ]
+    app.timeline = type("TL", (), {"media_clock": lambda self: (10.0, 100.0)})()
+    gain = VectorApp._media_volume_gain_at(app, 0.0)
+    assert abs(gain - 0.1) < 1e-9
+    app._send_cfg["media_volume_ramp_waypoints_enabled"] = False
+    app.timeline = type("TL", (), {"media_clock": lambda self: (25.0, 100.0)})()
+    simple = VectorApp._media_volume_gain_at(app, 0.0)
+    assert abs(simple - 0.25) < 1e-9
+
+
+def _ramp_app(clock):
+    from vector1a.app import VectorApp
+
+    class Var:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    app = object.__new__(VectorApp)
+    app.media_ramp_auto_load = Var(True)
+    app.media_volume_ramp_curve = Var("Linear")
+    app.media_volume_ramp_waypoints_enabled = Var(False)
+    app.timeline_script_libraries = Var("")
+    app._media_ramp_waypoints = []
+    app._media_ramp_source_path = ""
+    app._last_ramp_auto_loaded_for_media = None
+    app._ramp_seed_pending = None
+    app._ramp_seeded_for = None
+    app._media_ramp_auto_load_note = None
+    app._mfp_media_path = None
+    app.timeline = type("TL", (), {"media_clock": lambda self: clock()})()
+    app._events_auto_load_media_path = lambda: r"E:\clip.m4v"
+    app._refresh_send_config_cache = lambda: None
+    app._refresh_media_ramp_waypoint_tree = lambda: None
+    app._refresh_extra_level_controls = lambda: None
+    app._redraw_media_ramp_curve_preview = lambda: None
+    app._save_settings = lambda: None
+    app._clear_media_ramp_waypoints = VectorApp._clear_media_ramp_waypoints.__get__(app, VectorApp)
+    return app
+
+
+def test_missing_ramp_seeds_floor_and_end_ceiling(monkeypatch):
+    from vector1a.app import VectorApp
+    from vector1a import app as app_module
+    monkeypatch.setattr(app_module, "find_matching_ramp_file", lambda *_a, **_k: None)
+    app = _ramp_app(lambda: (0.0, 100.0))
+    VectorApp._maybe_auto_load_ramp_file(app)
+    assert [(p.time_s, p.level) for p in app._media_ramp_waypoints] == [
+        (0.0, "floor1"), (100.0, "ceiling1")]
+    assert app._media_ramp_source_path == ""
+    assert app.media_volume_ramp_waypoints_enabled.get() is True
+    assert app._ramp_seeded_for == r"E:\clip.m4v"
+
+
+def test_missing_duration_defers_default_ramp_until_known(monkeypatch):
+    from vector1a.app import VectorApp
+    from vector1a import app as app_module
+    monkeypatch.setattr(app_module, "find_matching_ramp_file", lambda *_a, **_k: None)
+    clock = {"value": (1.0, None)}
+    app = _ramp_app(lambda: clock["value"])
+    VectorApp._maybe_auto_load_ramp_file(app)
+    assert app._media_ramp_waypoints == []
+    assert app._ramp_seed_pending == r"E:\clip.m4v"
+    clock["value"] = (1.0, 100.0)
+    VectorApp._maybe_seed_default_ramp(app)
+    assert app._media_ramp_waypoints[-1].time_s == 100.0
+    app._media_ramp_waypoints = []
+    VectorApp._maybe_seed_default_ramp(app)
+    assert app._media_ramp_waypoints == []
+
+
+def test_saved_ramp_file_is_not_replaced_by_default_pair(monkeypatch):
+    from vector1a.app import VectorApp
+    from vector1a import app as app_module
+    from vector1a.media_timeline import RampWaypoint
+    monkeypatch.setattr(app_module, "find_matching_ramp_file", lambda *_a, **_k: r"E:\clip.ramp.json")
+    app = _ramp_app(lambda: (0.0, 100.0))
+
+    def load(path):
+        app._media_ramp_source_path = path
+        app._media_ramp_waypoints = [RampWaypoint(12.0, "ceiling1", "Linear")]
+
+    app._load_media_ramp_file = load
+    VectorApp._maybe_auto_load_ramp_file(app)
+    assert app._media_ramp_source_path == r"E:\clip.ramp.json"
+    assert [(p.time_s, p.level) for p in app._media_ramp_waypoints] == [(12.0, "ceiling1")]
+
+
+def test_potplayer_poll_drives_events_clock(monkeypatch):
+    from vector1a import timeline as timeline_module
+    from vector1a.media_clock import MediaSnapshot
+    c = FakeClock()
+    monkeypatch.setattr(timeline_module, "poll_potplayer", lambda: MediaSnapshot(
+        "PotPlayer", True, "playing", 12.5, 100.0, 1.0, r"E:\clip.m4v", "clip.m4v"))
+    t = FunscriptTimeline(clock=c)
+    t.set_clock_mode(FunscriptTimeline.CLOCK_POT)
+    t._media_poll_worker(FunscriptTimeline.CLOCK_POT, "127.0.0.1", 8080, "", 13579)
+    assert t.media_position_seconds() == 12.5
+    assert t.events_media_path() == r"E:\clip.m4v"
+    c.advance(1.0)
+    assert abs(t.media_position_seconds() - 13.5) < 1e-6
+
+
 def test_sample_position_reads_authored_future_without_moving_clock(tmp_path):
     import json
     from vector1a.timeline import FunscriptTimeline

@@ -6,12 +6,12 @@ ordinary positional `L0` stream, Vector remains the deterministic motion generat
 MFP supplies a clearly authored ReStim axis set, Vector can automatically pass those axes
 through on the same delayed timeline and generate only the missing axes.
 
-Current development build: **1.6.0-alpha78**.
+Current development build: **1.6.0-alpha79**.
 
 **Upgrading from alpha49?** Read [Changes since alpha49](RELEASE_NOTES_1.6.0-alpha76.md)
 for the accumulated features, compatibility notes and new MFP WebSocket setup.
-For the latest transition refinements, see [Alpha78](RELEASE_NOTES_1.6.0-alpha78.md).
-The curated custom-event addition is documented in [Alpha77](RELEASE_NOTES_1.6.0-alpha77.md).
+This fork build is [Alpha79](RELEASE_NOTES_1.6.0-alpha79.md), on top of
+[Alpha78](RELEASE_NOTES_1.6.0-alpha78.md).
 
 > [!CAUTION]
 > Commission with ReStim's graphical display and stimulation hardware
@@ -34,7 +34,7 @@ dependency of the core application.
 
 ```mermaid
 flowchart LR
-    MFP["MultiFunPlayer<br/>L0 stream<br/>offset -2.00 s"] -->|"TCP / UDP / WebSocket :12345"| V["Vector 1A<br/>50 Hz calculation<br/>2.00 s deterministic queue"]
+    MFP["MultiFunPlayer<br/>L0 stream<br/>offset -2.00 s"] -->|"TCP / UDP / WebSocket :12345"| V["Vector 1A<br/>120 Hz calculation<br/>2.00 s deterministic queue"]
     V -->|"WebSocket /tcode<br/>L0 L1 E1 E2 E3 E4 V0 C0 P0 P1 P3"| R1["Primary ReStim<br/>3-phase or 4-phase"]
     V -->|"WebSocket :12350/tcode<br/>L0 L1 V0 F0 P0 P1 P3"| R2["Prostate ReStim"]
 ```
@@ -44,6 +44,13 @@ input cadence. For phase-shifted prostate motion, two seconds of look-ahead is
 recommended because slow strokes may reveal their reversal more than one
 second after they begin.
 
+**Restim I-suffix (smooth viz)** is off by default. When it is on, outbound
+Restim frames attach a sample-period T-code `I` suffix on position axes
+(`L0`, `L1`, `E1`–`E4`) so Restim can interpolate between Vector samples.
+The interval tracks **Points per second** (120 Hz → `I8`; e.g. `I20` at 50 Hz,
+`I10` at 100 Hz). Volume and pulse axes stay without `I`; reconnect neutrals
+settle instantly. The Motion slider still allows 1–200 Hz.
+
 ## Features
 
 - MFP input accepts TCP, UDP and WebSocket on the configured input port.
@@ -52,14 +59,41 @@ second after they begin.
   and gain, script awareness, bounded modifiers and deterministic generated-motion plans.
   The API is disabled by default; no companion application is required.
 - Optional curated Director custom events layer temporary named recipes over the live
-  output. It has a separate operator opt-in, a fixed allowlist, bounded 2–30 second
-  duration, reduced Director amplitudes, live state reporting and immediate cancellation.
+  output. It has a separate operator opt-in. The catalogue is every bundled recipe
+  except `tranquil` and `test_slaps`, duration is 2–600 seconds, and some recipes
+  use reduced amplitudes. Live state reporting and immediate cancellation stay.
 - Script modifiers provide Stroke Range (0.30–1.50), Position Bias (±0.35),
   Curve Smoothing and temporary tempo windows with restoration. Accelerated authored
   tempo requires a loaded and synchronized funscript timeline.
 - Optional funscript timeline with VLC/MPC media clocks, automatic script discovery,
   MFP pattern matching and manual preview. Timeline observation by itself does not
   replace incoming MFP motion.
+- Custom events `position_ms` and the optional media volume ramp use the VLC, MPC,
+  or PotPlayer clock. Pattern sync and manual preview do not drive that clock.
+  Axes `T0` and `T1`, if MultiFunPlayer still sends them, are blocked from ReStim
+  authored pass-through, as is the prostate stroke axis when set.
+- Optional LAN Remote control API (toolbar toggle; separate from Director API) for
+  trusted-network companion UIs. Disabled by default.
+- Event volume headroom reserves room for additive event volume by scaling post-ramp
+  volume by `1 - headroom` before events apply. **Auto event volume headroom** (default on)
+  derives the value from the loaded `.events.yml` — the largest upward additive volume
+  delta of any single event, ignoring `test_slaps` and overwrite steps, clamped to 0.50.
+  With custom events off and Director events on it scans the Director allowlist instead.
+  Clear the checkbox to set the value by hand. The media volume ramp floor/ceiling range
+  is unchanged (0.0–1.0).
+- **Auto-load matching events file** (default on) watches UDP `PATH` on the MFP
+  listener (not VLC/MPC). It loads `<video stem>.events.yml` /
+  `.events.yaml` beside the media (then funscript script libraries). If the new video
+  has no match, Vector clears the previous events file and shows a warning at most
+  once every 30 seconds, so a flapping path cannot stack dialogs.
+  No `PATH` yet leaves auto-load idle. An empty `PATH` clears leftovers.
+- **Auto-load matching ramp file** (default on) does the same for media volume ramps:
+  `<video stem>.ramp.funscript` or `.ramp.json` (not the L0 `.funscript`). A missing
+  match clears leftover waypoints; a warning pops only if a ramp was actually loaded.
+  Export suggests that sidecar name when a media file is known.
+- Optional media-stamped send capture (**Custom events → Capture send log**) records the
+  primary values Restim receives against media `position_ms`, so event sessions can be
+  compared against a `.events.yml` timeline.
 - Independent ReStim output workers discard stale pending frames after a dropout
   instead of delaying the other output or replaying a backlog.
 - Authored-axis routing discovers MFP T-code axes at runtime and supports two policies.
@@ -273,7 +307,8 @@ Commission visually with stimulation hardware disconnected before connected use.
 | Primary ReStim | C0 | Frequency |
 | Primary ReStim | P0 / P1 / P3 | Pulse frequency / width / rise time |
 | Prostate ReStim | L0 / L1 / V0 | Alpha-prostate / beta-prostate / volume-prostate |
-| Prostate ReStim | F0 / P0 / P1 / P3 | Shared frequency and pulse controls |
+| Prostate ReStim | F0 | Same carrier command as primary C0 |
+| Prostate ReStim | P0 / P1 / P3 | Pulse from the prostate script when an MFP axis is selected. Follow primary copies the main pulse |
 
 ## Controller mapping
 
@@ -314,6 +349,19 @@ Create the source-based Windows release ZIP by running `build-release.bat`, or:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build-release.ps1
 ```
+
+Create a Windows exe ZIP by running `build-exe.bat`, or:
+
+```powershell
+python -m pip install pyinstaller
+powershell -ExecutionPolicy Bypass -File .\build-exe.ps1
+```
+
+That ZIP contains `Vector1A-<version>.exe` plus editable `event_definitions.yml` and
+`director_event_allowlist.yml` in the same folder. The exe reads those files
+there. A definitions path set in the Events panel still overrides
+`event_definitions.yml`. Install PyInstaller only on the machine that builds
+the ZIP. Users who run the exe do not need Python.
 
 ## Algorithm and protocol baseline
 
@@ -442,11 +490,35 @@ The Director API can now request `narrower`, `wider`, or `restore` through `/v1/
 
 ## Alpha77 — curated Director custom events
 
-Alpha77 ports the fork's deterministic custom-event runtime and bundled recipe catalogue,
-then exposes ten reviewed recipes through the loopback Director API. Open **Director** and
-enable **Allow curated Director custom events** before a companion can trigger them.
+Alpha77 added the opt-in Director custom-event path. The current catalogue,
+duration bounds, and amplitudes are in [Alpha79](RELEASE_NOTES_1.6.0-alpha79.md).
+Open **Director** and enable **Allow curated Director custom events** before a
+companion can trigger them. Cancel, Neutral, and Stop still clear active events.
 
-Vector accepts only the published allowlist, enforces a 2–30 second duration, uses reduced
-amplitudes for the stronger volume-modulation recipes, reports active/recent events in
-`GET /v1/state`, and clears every event on Cancel, Neutral or Stop. The countdown, extract,
-hard-stop, test and other experimental definitions remain unavailable to the Director API.
+## Media-stamped send capture
+
+**Custom events → Capture send log** writes one line per primary Restim send, stamped with
+the media `position_ms` the events engine resolved from the player clock. That media time
+is the tether to a `.events.yml` timeline. A wall-clock frame log cannot be aligned to
+events, and it keeps recording while media is paused.
+
+Logs land in `%LOCALAPPDATA%\Vector1A\send-capture\session-YYYYMMDD-HHMMSS.log` (use
+**Open folder**). A session file is created when the checkbox is enabled and closed when it
+is disabled or Vector exits; every line is flushed immediately. Each line carries the final
+`V0`, `P0`, `P1` and `S1` placed in the outbound primary overrides plus `Vp`, the
+post-event prostate volume for dual-channel recipes:
+
+```
+2026-10-03 14:02:01.123  media_ms=754321  events_on=1  active=CH_edge  V0=0.8123 P0=0.4100 P1=0.5520 S1=0.5000 Vp=0.8000
+```
+
+`media_ms=-` means no usable player position, and
+`S1=-` means no suppression value was present in the overrides. Media time is resolved
+independently of the custom-events toggle, so capturing with events off still produces
+media-keyed lines. Position repeats across a pause rather than being special-cased.
+
+To measure what live events contribute, enable **Capture send log**, load the chapter
+`.events.yml` and play through with custom events on, then record a second session over the
+same media and settings with events off. Aligning the two logs on `media_ms` gives the live
+event delta per axis, which can be compared against baked axis funscripts over the same
+windows.

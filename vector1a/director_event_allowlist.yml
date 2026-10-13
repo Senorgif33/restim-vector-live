@@ -1,0 +1,34 @@
+# Director API event allowlist policy.
+#
+# Every recipe in event_definitions.yml is allowed except those listed under
+# exclude. Edit this file to change what companions may trigger — no code
+# change required. Restart Vector (or reload event definitions) after edits.
+#
+# duration_seconds bounds apply when a companion supplies duration_seconds.
+# Omitted duration uses each recipe's default_params.duration_ms.
+
+exclude:
+  - tranquil
+  - test_slaps
+
+duration_seconds:
+  minimum: 2.0
+  maximum: 600.0
+
+# Optional Director-facing param overrides merged over recipe defaults.
+param_overrides:
+  mcb_tease:
+    tease_amplitude: 0.08
+  mcb_throb:
+    throb_amplitude: 0.10
+  mcb_calm:
+    calm_amplitude: 0.07
+  mcb_intensity_build:
+    end_boost: 0.08
+  mcb_release:
+    volume_drop: -0.10
+  clutch_tranquil:
+    calm_amplitude: 0.08
+  volume_shift:
+    shift_start: 0.05
+    shift_end: 0.05
