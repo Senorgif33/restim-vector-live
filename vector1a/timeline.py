@@ -10,7 +10,27 @@ import threading
 import time
 from typing import Callable
 
-from .media_clock import MediaSnapshot, find_matching_funscript, poll_mpc, poll_vlc
+from .media_clock import (
+    MediaSnapshot, find_matching_funscript, poll_mpc, poll_potplayer, poll_vlc)
+
+
+def choose_auto_player(snaps: list[MediaSnapshot]) -> MediaSnapshot:
+    """Pick VLC, then MPC, then PotPlayer. A playing player beats a paused one."""
+    def state_of(snap: MediaSnapshot) -> str:
+        return str(snap.state or "").strip().lower()
+
+    def usable(snap: MediaSnapshot, states: set[str]) -> bool:
+        return (snap.connected and snap.position_seconds is not None
+                and state_of(snap) in states)
+
+    for states in ({"playing", "play"}, {"paused", "pause"}):
+        for snap in snaps:
+            if usable(snap, states):
+                return snap
+    for snap in snaps:
+        if snap.connected and snap.position_seconds is not None:
+            return snap
+    return snaps[-1]
 
 
 @dataclass(frozen=True)
@@ -30,8 +50,10 @@ class FunscriptTimeline:
     CLOCK_AUTO = "Auto media player"
     CLOCK_VLC = "VLC direct"
     CLOCK_MPC = "MPC direct"
+    CLOCK_POT = "PotPlayer"
     CLOCK_MFP = "MFP pattern sync"
     CLOCK_MANUAL = "Manual preview"
+    PLAYER_CLOCKS = (CLOCK_AUTO, CLOCK_VLC, CLOCK_MPC, CLOCK_POT)
 
     def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         self.clock = clock
@@ -181,7 +203,7 @@ class FunscriptTimeline:
 
     def request_media_poll(self) -> None:
         with self._lock:
-            if self._clock_mode not in (self.CLOCK_AUTO, self.CLOCK_VLC, self.CLOCK_MPC):
+            if self._clock_mode not in self.PLAYER_CLOCKS:
                 return
             now = self.clock()
             if self._media_poll_inflight or now - self._last_media_poll_at < 0.45:
@@ -203,9 +225,14 @@ class FunscriptTimeline:
                 snap = poll_vlc(host, vlc_port, password)
             elif mode == self.CLOCK_MPC:
                 snap = poll_mpc(host, mpc_port)
+            elif mode == self.CLOCK_POT:
+                snap = poll_potplayer()
             else:
-                vlc = poll_vlc(host, vlc_port, password)
-                snap = vlc if vlc.connected else poll_mpc(host, mpc_port)
+                snap = choose_auto_player([
+                    poll_vlc(host, vlc_port, password),
+                    poll_mpc(host, mpc_port),
+                    poll_potplayer(),
+                ])
             auto_candidate = None
             with self._lock:
                 received_at = self.clock()
@@ -262,7 +289,7 @@ class FunscriptTimeline:
                 self._media_poll_inflight = False
 
     def set_clock_mode(self, mode: str) -> None:
-        if mode not in (self.CLOCK_AUTO, self.CLOCK_VLC, self.CLOCK_MPC, self.CLOCK_MFP, self.CLOCK_MANUAL):
+        if mode not in (*self.PLAYER_CLOCKS, self.CLOCK_MFP, self.CLOCK_MANUAL):
             raise ValueError("unknown timeline clock source")
         with self._lock:
             current = self.position_seconds()
@@ -401,21 +428,67 @@ class FunscriptTimeline:
                 return None
             if self._clock_mode == self.CLOCK_MANUAL:
                 return self._manual_current_locked()
-            if self._clock_mode in (self.CLOCK_AUTO, self.CLOCK_VLC, self.CLOCK_MPC):
-                snap = self._media_snapshot
-                if self._clock_mode == self.CLOCK_AUTO and self._media_clock_health == "stale" and self._match_position is not None:
+            if self._clock_mode in self.PLAYER_CLOCKS:
+                if (self._clock_mode == self.CLOCK_AUTO
+                        and self._media_clock_health == "stale"
+                        and self._match_position is not None):
                     return self._match_position
-                if snap and snap.connected and snap.position_seconds is not None:
-                    pos = float(snap.position_seconds)
-                    state = str(snap.state or '').strip().lower()
-                    if state in {'playing', 'play'} and self._media_snapshot_received_at is not None:
-                        elapsed = max(0.0, self.clock() - self._media_snapshot_received_at)
-                        pos += elapsed * max(0.0, float(snap.rate or 1.0))
-                    if snap.duration_seconds is not None:
-                        pos = min(float(snap.duration_seconds), pos)
-                    return pos
-                return None
+                return self._snapshot_position_locked(freeze_when_stale=False)
             return self._match_position
+
+    def uses_player_clock(self) -> bool:
+        """True when the selected clock is Auto, VLC, MPC, or PotPlayer."""
+        with self._lock:
+            return self._clock_mode in self.PLAYER_CLOCKS
+
+    def media_position_seconds(self) -> float | None:
+        """Player position for events. Ignores funscript load and pattern sync.
+
+        A stale playing poll holds the last player sample. It does not advance
+        and it does not fall back to the L0 match.
+        """
+        position, _duration = self.media_clock()
+        return position
+
+    def media_clock(self) -> tuple[float | None, float | None]:
+        """Player position and duration. Pattern sync and manual preview return nothing."""
+        with self._lock:
+            if self._clock_mode not in self.PLAYER_CLOCKS:
+                return None, None
+            snap = self._media_snapshot
+            duration = None
+            if (snap is not None and snap.connected
+                    and snap.duration_seconds is not None
+                    and float(snap.duration_seconds) > 0):
+                duration = float(snap.duration_seconds)
+            return self._snapshot_position_locked(freeze_when_stale=True), duration
+
+    def events_media_path(self) -> str | None:
+        """Connected player path, or None when this clock should not auto-load events."""
+        with self._lock:
+            if self._clock_mode not in self.PLAYER_CLOCKS:
+                return None
+            snap = self._media_snapshot
+            if snap is None or not snap.connected or not snap.media_path:
+                return None
+            path = str(snap.media_path).strip()
+            return path or None
+
+    def _snapshot_position_locked(self, *, freeze_when_stale: bool) -> float | None:
+        snap = self._media_snapshot
+        if snap is None or not snap.connected or snap.position_seconds is None:
+            return None
+        pos = float(snap.position_seconds)
+        state = str(snap.state or "").strip().lower()
+        playing = state in {"playing", "play"}
+        stale = self._media_clock_health == "stale"
+        if (playing and not (freeze_when_stale and stale)
+                and self._media_snapshot_received_at is not None):
+            elapsed = max(0.0, self.clock() - self._media_snapshot_received_at)
+            pos += elapsed * max(0.0, float(snap.rate or 1.0))
+        if snap.duration_seconds is not None:
+            pos = min(float(snap.duration_seconds), pos)
+        return pos
 
     @staticmethod
     def _band(score: float) -> str:
@@ -530,9 +603,9 @@ class FunscriptTimeline:
                 "position_seconds": round(pos, 3),
                 "remaining_seconds": round(max(0.0, self._duration - pos), 3),
                 "sync_confidence": (1.0 if self._clock_mode == self.CLOCK_MANUAL or
-                                      (self._clock_mode in (self.CLOCK_AUTO, self.CLOCK_VLC, self.CLOCK_MPC) and self._media_clock_health != "stale")
+                                      (self._clock_mode in self.PLAYER_CLOCKS and self._media_clock_health != "stale")
                                       else None if self._match_score is None else round(self._match_score, 3)),
-                "clock_authoritative": (self._clock_mode in (self.CLOCK_AUTO, self.CLOCK_VLC, self.CLOCK_MPC) and
+                "clock_authoritative": (self._clock_mode in self.PLAYER_CLOCKS and
                                         self._media_clock_health != "stale"),
                 "now": now,
                 "next_10_seconds": near,

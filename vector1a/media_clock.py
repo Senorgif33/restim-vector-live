@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import base64
+import ctypes
 import html
 import json
 import os
@@ -226,24 +227,182 @@ def poll_mpc(host: str = "127.0.0.1", port: int = 13579) -> MediaSnapshot:
         return MediaSnapshot("MPC", False, error=str(exc))
 
 
-def find_matching_funscript(media_path: str | None, library_dirs: list[str] | tuple[str, ...] = ()) -> str | None:
-    if not media_path:
+_POT_GET_TOTAL_TIME = 0x5002
+_POT_GET_CURRENT_TIME = 0x5004
+_POT_GET_PLAY_STATUS = 0x5006
+_POT_GET_FILENAME = 0x6020
+_WM_USER = 0x0400
+_WM_COPYDATA = 0x004A
+
+
+def _potplayer_snapshot(
+    position_ms: int, duration_ms: int, state_code: int, media_path: str | None,
+) -> MediaSnapshot:
+    """Map PotPlayer window-message results into a media snapshot.
+
+    Play status is 0 stopped, 1 paused, 2 playing. ``-1`` means nothing is loaded.
+    Times are milliseconds. A non-positive duration is omitted so it cannot clamp
+    position to zero.
+    """
+    if state_code < 0:
+        return MediaSnapshot("PotPlayer", False, state="stopped", error="no media")
+    state = {0: "stopped", 1: "paused", 2: "playing"}.get(int(state_code), "unknown")
+    pos = float(position_ms) / 1000.0 if position_ms >= 0 else None
+    dur = float(duration_ms) / 1000.0 if duration_ms > 0 else None
+    path = (str(media_path).strip() or None) if media_path else None
+    title = os.path.basename(path) if path else None
+    return MediaSnapshot(
+        "PotPlayer", pos is not None, state, pos, dur, 1.0, path, title,
+        raw_position=str(position_ms), raw_duration=str(duration_ms),
+        position_source="position_ms")
+
+
+def poll_potplayer() -> MediaSnapshot:
+    """Read PotPlayer position, duration, state, and path via window messages."""
+    if os.name != "nt":
+        return MediaSnapshot("PotPlayer", False, error="PotPlayer clock requires Windows")
+    try:
+        queried = _query_potplayer()
+    except OSError as exc:
+        return MediaSnapshot("PotPlayer", False, error=str(exc))
+    if queried is None:
+        return MediaSnapshot("PotPlayer", False, error="PotPlayer window not found")
+    position_ms, duration_ms, state_code, media_path = queried
+    return _potplayer_snapshot(position_ms, duration_ms, state_code, media_path)
+
+
+def _potplayer_user32():
+    user32 = ctypes.windll.user32
+    user32.SendMessageW.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+    user32.DefWindowProcW.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+    user32.DefWindowProcW.restype = ctypes.c_ssize_t
+    return user32
+
+
+def _query_potplayer() -> tuple[int, int, int, str | None] | None:
+    user32 = _potplayer_user32()
+    hwnd = user32.FindWindowW("PotPlayer64", None) or user32.FindWindowW("PotPlayer", None)
+    if not hwnd:
+        return None
+    position_ms = int(user32.SendMessageW(hwnd, _WM_USER, _POT_GET_CURRENT_TIME, 0))
+    duration_ms = int(user32.SendMessageW(hwnd, _WM_USER, _POT_GET_TOTAL_TIME, 0))
+    state_code = int(user32.SendMessageW(hwnd, _WM_USER, _POT_GET_PLAY_STATUS, 0))
+    path = _potplayer_filename(user32, hwnd)
+    return position_ms, duration_ms, state_code, path
+
+
+_potplayer_path_box: dict[str, str] = {}
+_WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t)
+
+
+@_WNDPROC
+def _potplayer_wndproc(hwnd, msg, wparam, lparam):
+    if msg == _WM_COPYDATA and lparam:
+        data = ctypes.cast(lparam, ctypes.POINTER(_COPYDATASTRUCT)).contents
+        if int(data.dwData or 0) == _POT_GET_FILENAME and data.lpData and data.cbData:
+            raw = ctypes.string_at(data.lpData, int(data.cbData))
+            text = _decode_potplayer_path(raw)
+            if text:
+                _potplayer_path_box["path"] = text
+        return 1
+    return _potplayer_user32().DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+def _potplayer_filename(user32, pot_hwnd: int) -> str | None:
+    """Ask PotPlayer for the media path. It replies with WM_COPYDATA."""
+    _potplayer_path_box.clear()
+    listener = _potplayer_listener(user32)
+    if not listener:
+        return None
+    try:
+        user32.SendMessageW(pot_hwnd, _WM_USER, _POT_GET_FILENAME, int(listener))
+    finally:
+        user32.DestroyWindow(listener)
+    return _potplayer_path_box.get("path")
+
+
+class _COPYDATASTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("dwData", ctypes.c_void_p),
+        ("cbData", ctypes.c_uint32),
+        ("lpData", ctypes.c_void_p),
+    ]
+
+
+def _decode_potplayer_path(raw: bytes) -> str | None:
+    if len(raw) >= 4 and raw[1] == 0 and raw[3] == 0:
+        text = raw.decode("utf-16-le", errors="replace")
+    else:
+        text = raw.decode("utf-8", errors="replace")
+    text = text.split("\x00", 1)[0].strip()
+    return text or None
+
+
+_potplayer_class_ready = False
+
+
+def _potplayer_listener(user32) -> int:
+    global _potplayer_class_ready
+    class_name = "Vector1APotPlayerClock"
+    if not _potplayer_class_ready:
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [
+                ("style", ctypes.c_uint),
+                ("lpfnWndProc", ctypes.c_void_p),
+                ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int),
+                ("hInstance", ctypes.c_void_p),
+                ("hIcon", ctypes.c_void_p),
+                ("hCursor", ctypes.c_void_p),
+                ("hbrBackground", ctypes.c_void_p),
+                ("lpszMenuName", ctypes.c_wchar_p),
+                ("lpszClassName", ctypes.c_wchar_p),
+            ]
+        wndclass = WNDCLASSW()
+        wndclass.lpfnWndProc = ctypes.cast(_potplayer_wndproc, ctypes.c_void_p)
+        wndclass.lpszClassName = class_name
+        atom = user32.RegisterClassW(ctypes.byref(wndclass))
+        if not atom and ctypes.get_last_error() not in (0, 1410):
+            return 0
+        _potplayer_class_ready = True
+        _potplayer_listener._wndclass = wndclass
+    hwnd_message = ctypes.c_void_p(-3)
+    user32.CreateWindowExW.argtypes = [
+        ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    user32.CreateWindowExW.restype = ctypes.c_void_p
+    hwnd = user32.CreateWindowExW(
+        0, class_name, "Vector1A", 0, 0, 0, 0, 0, hwnd_message, None, None, None)
+    return int(hwnd or 0)
+
+
+def _find_matching_named_files(
+    media_path: str | None,
+    exact_names: tuple[str, ...] | list[str],
+    library_dirs: list[str] | tuple[str, ...] = (),
+) -> str | None:
+    if not media_path or not exact_names:
         return None
     media = Path(media_path)
-    basename = media.stem
-    exact_name = basename + ".funscript"
+    names = tuple(exact_names)
     candidates: list[Path] = []
     if media.parent:
-        candidates.append(media.parent / exact_name)
+        for name in names:
+            candidates.append(media.parent / name)
     for folder in library_dirs:
         if not folder:
             continue
         root = Path(os.path.expanduser(folder))
-        candidates.append(root / exact_name)
+        for name in names:
+            candidates.append(root / name)
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate.resolve())
-    # Library fallback: exact basename anywhere below the configured roots.
     for folder in library_dirs:
         if not folder:
             continue
@@ -251,9 +410,93 @@ def find_matching_funscript(media_path: str | None, library_dirs: list[str] | tu
         if not root.is_dir():
             continue
         try:
-            for match in root.rglob(exact_name):
-                if match.is_file():
-                    return str(match.resolve())
+            for name in names:
+                for match in root.rglob(name):
+                    if match.is_file():
+                        return str(match.resolve())
         except OSError:
             continue
     return None
+
+
+def find_matching_funscript(media_path: str | None, library_dirs: list[str] | tuple[str, ...] = ()) -> str | None:
+    if not media_path:
+        return None
+    return _find_matching_named_files(
+        media_path, (Path(media_path).stem + ".funscript",), library_dirs)
+
+
+def find_matching_events_file(
+    media_path: str | None,
+    library_dirs: list[str] | tuple[str, ...] = (),
+) -> str | None:
+    """Resolve ``{stem}.events.yml`` / ``.events.yaml`` beside media or in libraries."""
+    if not media_path:
+        return None
+    stem = Path(media_path).stem
+    return _find_matching_named_files(
+        media_path, (f"{stem}.events.yml", f"{stem}.events.yaml"), library_dirs)
+
+
+def find_matching_ramp_file(
+    media_path: str | None,
+    library_dirs: list[str] | tuple[str, ...] = (),
+) -> str | None:
+    """Resolve Vector volume-ramp sidecar (not the L0 ``{stem}.funscript``)."""
+    if not media_path:
+        return None
+    stem = Path(media_path).stem
+    return _find_matching_named_files(
+        media_path,
+        (f"{stem}.ramp.funscript", f"{stem}.ramp.json"),
+        library_dirs,
+    )
+
+
+def events_auto_load_decision(
+    media_path: str | None,
+    last_handled_media: str | None,
+    current_events_path: str,
+    matched_events_path: str | None,
+) -> tuple[bool, str | None, bool]:
+    """Decide whether to load/clear events for a new media path.
+
+    Returns ``(media_changed, events_path_to_apply, should_warn)``:
+    - ``media_changed`` False when media is ``None`` (no PATH yet) or unchanged.
+    - ``events_path_to_apply`` is a path to load, ``""`` to clear, or ``None``
+      when the current events path is already correct.
+    - ``should_warn`` is True only when media changed and no match was found.
+    """
+    if media_path is None or media_path == last_handled_media:
+        return False, None, False
+    if matched_events_path:
+        current = (current_events_path or "").strip()
+        try:
+            same = (
+                bool(current)
+                and Path(current).resolve() == Path(matched_events_path).resolve()
+            )
+        except OSError:
+            same = current == matched_events_path
+        if same:
+            return True, None, False
+        return True, matched_events_path, False
+    return True, "", True
+
+
+MISSING_FILE_WARN_COOLDOWN_SECONDS = 30.0
+
+
+def missing_file_warn_due(
+    last_warn_at: float | None,
+    now: float,
+    cooldown_seconds: float = MISSING_FILE_WARN_COOLDOWN_SECONDS,
+) -> bool:
+    """True when another missing-file dialog may be shown.
+
+    The first warning is always due. Later ones wait until ``cooldown_seconds``
+    have passed, so a flapping media path cannot stack dialogs.
+    """
+    if last_warn_at is None:
+        return True
+    return (now - last_warn_at) >= cooldown_seconds

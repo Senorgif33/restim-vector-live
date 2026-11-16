@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from vector1a.events import (
+    VOLUME_HEADROOM_CAP,
     EventEngine,
     EventError,
     _derive_orgasm_countdown_params,
@@ -16,13 +17,17 @@ from vector1a.events import (
     expand_user_events,
     normalize_value,
     parse_yaml_subset,
+    scale_volume_for_event_headroom,
 )
 from vector1a.extract_composite import (
     EXTRACT_BASE_MS,
+    _build_3p_motion,
+    _build_4p_motion,
     build_extract_motion_steps,
     derive_extract_params,
     detect_l0_beats,
     every_nth_beat,
+    resolve_extract_segments,
     switch_offsets_to_segments,
 )
 
@@ -571,16 +576,16 @@ class TestOrgasmCountdownEvents(unittest.TestCase):
 class TestExtractCompositeEvents(unittest.TestCase):
     def test_bundled_extract_names(self):
         engine = EventEngine()
-        self.assertIn("mcb_extract", engine.definitions)
-        self.assertIn("mcb_extract_4p", engine.definitions)
-        self.assertIn("mcb_extract_beat", engine.definitions)
-        self.assertIn("mcb_extract_4p_beat", engine.definitions)
-        self.assertNotIn("mcb_extract_additive", engine.definitions)
-        self.assertNotIn("mcb_extract_4p_additive", engine.definitions)
+        self.assertIn("mcb_extract_dual", engine.definitions)
+        self.assertIn("mcb_extract_beat_dual", engine.definitions)
+        for old in ("mcb_extract", "mcb_extract_4p",
+                    "mcb_extract_beat", "mcb_extract_4p_beat",
+                    "mcb_extract_additive", "mcb_extract_4p_additive"):
+            self.assertNotIn(old, engine.definitions)
 
     def test_default_pulse_amp_offsets(self):
         params = {"duration_ms": EXTRACT_BASE_MS}
-        derive_extract_params(params, "mcb_extract")
+        derive_extract_params(params, "mcb_extract_dual")
         self.assertEqual(params["offset_pulse_0_ms"], 0)
         self.assertEqual(params["hz_pulse_0"], 60.0)
         self.assertEqual(params["hz_pulse_4"], 120.0)
@@ -593,7 +598,7 @@ class TestExtractCompositeEvents(unittest.TestCase):
 
     def test_half_duration_scales(self):
         params = {"duration_ms": EXTRACT_BASE_MS // 2}
-        derive_extract_params(params, "mcb_extract_4p")
+        derive_extract_params(params, "mcb_extract_dual")
         self.assertEqual(
             params["offset_pulse_1_ms"],
             int(round((EXTRACT_BASE_MS // 2) * 0.353)),
@@ -601,24 +606,27 @@ class TestExtractCompositeEvents(unittest.TestCase):
 
     def test_too_short_raises(self):
         with self.assertRaises(ValueError):
-            derive_extract_params({"duration_ms": 59999}, "mcb_extract")
+            derive_extract_params({"duration_ms": 59999}, "mcb_extract_dual")
 
-    def test_motion_3p_seeded_axes(self):
+    def test_motion_dual_both_geometries(self):
         import random
         params = {"duration_ms": 60000, "ramp_ms": 500, "seed": 1}
-        steps = build_extract_motion_steps(
-            params, "mcb_extract", rng=random.Random(1))
+        steps = build_extract_motion_steps(params, "mcb_extract_dual")
         self.assertGreater(len(steps), 10)
         axes = {step["axis"] for step in steps}
-        self.assertEqual(axes, {"alpha", "beta"})
-
-    def test_motion_4p_seeded_axes(self):
-        import random
-        params = {"duration_ms": 60000, "ramp_ms": 500}
-        steps = build_extract_motion_steps(
-            params, "mcb_extract_4p", rng=random.Random(2))
-        self.assertEqual({step["axis"] for step in steps},
-                         {"e1", "e2", "e3", "e4"})
+        self.assertTrue({"alpha", "beta", "e1", "e2", "e3", "e4"} <= axes)
+        segments = resolve_extract_segments(dict(params), "mcb_extract_dual")
+        solo3 = _build_3p_motion(60000, random.Random(1), params, segments)
+        solo4 = _build_4p_motion(60000, random.Random(1), params, segments)
+        e_axes = {"e1", "e2", "e3", "e4"}
+        self.assertEqual(
+            [s for s in steps if s["axis"] not in e_axes],
+            solo3,
+        )
+        self.assertEqual(
+            [s for s in steps if s["axis"] in e_axes],
+            solo4,
+        )
 
     def test_other_events_untouched(self):
         params = {"duration_ms": 1000}
@@ -629,7 +637,7 @@ class TestExtractCompositeEvents(unittest.TestCase):
     def test_expand_includes_shell_and_motion(self):
         engine = EventEngine()
         steps, warnings = expand_named_event(
-            "mcb_extract",
+            "mcb_extract_dual",
             {"duration_ms": 60000, "seed": 7},
             engine.definitions,
         )
@@ -637,7 +645,7 @@ class TestExtractCompositeEvents(unittest.TestCase):
         axes = {step.axis for step in steps}
         self.assertTrue(
             {"pulse_width", "pulse_frequency", "volume", "volume-prostate",
-             "alpha", "beta"}.issubset(axes))
+             "alpha", "beta", "e1", "e2", "e3", "e4"}.issubset(axes))
         pulse = [
             s for s in steps
             if s.axis == "pulse_frequency" and s.start_time_ms == 0
@@ -647,16 +655,15 @@ class TestExtractCompositeEvents(unittest.TestCase):
     def test_seed_makes_expand_deterministic(self):
         engine = EventEngine()
         params = {"duration_ms": 60000, "seed": 42}
-        a, _ = expand_named_event("mcb_extract", params, engine.definitions)
-        b, _ = expand_named_event("mcb_extract", params, engine.definitions)
+        a, _ = expand_named_event("mcb_extract_dual", params, engine.definitions)
+        b, _ = expand_named_event("mcb_extract_dual", params, engine.definitions)
         key = lambda s: (s.axis, s.start_time_ms, s.duration_ms,
                          s.params.get("start_value"), s.params.get("end_value"))
         self.assertEqual([key(s) for s in a], [key(s) for s in b])
 
     def test_extract_s1_edge_mute_full_duration(self):
         engine = EventEngine()
-        for name in ("mcb_extract", "mcb_extract_4p",
-                     "mcb_extract_beat", "mcb_extract_4p_beat"):
+        for name in ("mcb_extract_dual", "mcb_extract_beat_dual"):
             steps, _ = expand_named_event(
                 name, {"duration_ms": 60000, "seed": 1}, engine.definitions)
             s1 = [s for s in steps if s.axis == "sensor_suppression"]
@@ -685,15 +692,18 @@ class TestExtractCompositeEvents(unittest.TestCase):
             "switch_offsets_ms": [0, 2000, 4000, 8000, 16000, 32000],
         }
         steps = build_extract_motion_steps(
-            params, "mcb_extract_4p_beat", rng=random.Random(3))
-        self.assertEqual({s["axis"] for s in steps}, {"e1", "e2", "e3", "e4"})
-        motion = [s for s in steps if s["axis"] == "e1"]
-        self.assertTrue(any(s["start_offset"] == 2000 for s in motion))
+            params, "mcb_extract_beat_dual", rng=random.Random(3))
+        axes = {s["axis"] for s in steps}
+        self.assertTrue({"alpha", "beta", "e1", "e2", "e3", "e4"} <= axes)
+        self.assertTrue(any(
+            s["start_offset"] == 2000 and s["axis"] == "alpha" for s in steps))
+        self.assertTrue(any(
+            s["start_offset"] == 2000 and s["axis"] == "e1" for s in steps))
 
     def test_expand_beat_with_switch_offsets(self):
         engine = EventEngine()
         steps, warnings = expand_named_event(
-            "mcb_extract_beat",
+            "mcb_extract_beat_dual",
             {
                 "duration_ms": 60000,
                 "seed": 1,
@@ -704,6 +714,92 @@ class TestExtractCompositeEvents(unittest.TestCase):
         self.assertEqual(warnings, [])
         alpha = [s for s in steps if s.axis == "alpha"]
         self.assertTrue(any(s.start_time_ms == 1000 for s in alpha))
+
+    def test_beat_min_duration_25s(self):
+        ok = {"duration_ms": 25000}
+        derive_extract_params(ok, "mcb_extract_beat_dual")
+        self.assertIn("hz_pulse_0", ok)
+        with self.assertRaises(ValueError):
+            derive_extract_params({"duration_ms": 24999}, "mcb_extract_beat_dual")
+        with self.assertRaises(ValueError):
+            derive_extract_params({"duration_ms": 25000}, "mcb_extract_dual")
+
+
+class EventVolumeHeadroomTests(unittest.TestCase):
+    """Auto headroom scan over bundled definitions, plus the volume scale."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmpdir.name)
+        self.engine = EventEngine()
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _headroom(self, body: str) -> tuple[float, str | None]:
+        path = self.root / "clip.events.yml"
+        path.write_text(body, encoding="utf-8")
+        self.engine.load_events_file(path)
+        return self.engine.file_volume_headroom()
+
+    def test_scale_reserves_headroom(self):
+        self.assertAlmostEqual(scale_volume_for_event_headroom(1.0, 0.30), 0.70)
+        self.assertAlmostEqual(scale_volume_for_event_headroom(0.5, 0.0), 0.5)
+
+    def test_scale_clamps_to_unit_range(self):
+        self.assertAlmostEqual(scale_volume_for_event_headroom(2.0, 0.0), 1.0)
+        self.assertAlmostEqual(scale_volume_for_event_headroom(-1.0, 0.2), 0.0)
+        # Negative headroom must not amplify.
+        self.assertAlmostEqual(scale_volume_for_event_headroom(0.8, -0.5), 0.8)
+
+    def test_edge_defaults_sum_offset_and_amplitude(self):
+        value, name = self._headroom("events:\n  - time: 0\n    name: edge\n")
+        self.assertAlmostEqual(value, 0.22)
+        self.assertEqual(name, "edge")
+
+    def test_cum_wins_and_reports_name(self):
+        value, name = self._headroom(
+            "events:\n  - time: 0\n    name: edge\n"
+            "  - time: 20000\n    name: cum\n")
+        self.assertAlmostEqual(value, 0.30)
+        self.assertEqual(name, "cum")
+
+    def test_per_event_param_override_counts(self):
+        value, name = self._headroom(
+            "events:\n  - time: 0\n    name: fast\n"
+            "    params:\n      volume_boost: 0.15\n")
+        self.assertGreaterEqual(value, 0.15)
+        self.assertEqual(name, "fast")
+
+    def test_test_slaps_is_ignored(self):
+        value, name = self._headroom("events:\n  - time: 0\n    name: test_slaps\n")
+        self.assertEqual(value, 0.0)
+        self.assertIsNone(name)
+
+    def test_overwrite_only_event_needs_no_headroom(self):
+        # 'ruin' overwrites volume to 0 rather than adding to it.
+        value, _ = self._headroom("events:\n  - time: 0\n    name: ruin\n")
+        self.assertEqual(value, 0.0)
+
+    def test_no_file_is_zero(self):
+        self.assertEqual(self.engine.file_volume_headroom(), (0.0, None))
+
+    def test_headroom_is_capped(self):
+        value, _ = self._headroom(
+            "events:\n  - time: 0\n    name: cum\n"
+            "    params:\n      volume_boost: 2.0\n")
+        self.assertAlmostEqual(value, VOLUME_HEADROOM_CAP)
+
+    def test_named_scan_skips_unknown_definitions(self):
+        value, name = self.engine.volume_headroom_for_names(
+            ("cum", "not_a_real_event"))
+        self.assertAlmostEqual(value, 0.30)
+        self.assertEqual(name, "cum")
+
+    def test_named_scan_applies_param_overrides(self):
+        value, _ = self.engine.volume_headroom_for_names(
+            ("cum",), {"cum": {"volume_boost": 0.0, "buzz_intensity": 0.05}})
+        self.assertAlmostEqual(value, 0.05)
 
 
 if __name__ == "__main__":

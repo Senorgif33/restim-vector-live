@@ -12,16 +12,23 @@ from collections import deque
 from contextlib import contextmanager
 from typing import Callable
 
-from .tcode import format_command, parse_message
+from .tcode import (
+    EvtTrigger, format_command, is_evt_line, is_path_line, parse_evt_line,
+    parse_path_line, parse_message,
+)
 from .websocket_input import WebSocketInput
 
 
 class MFPListener:
     """TCP/WebSocket (shared port) and UDP input with one stream client at a time."""
     def __init__(self, on_l0: Callable[[float, int, float], None], status: Callable[[str], None],
-                 on_command: Callable[[object, float], None] | None = None) -> None:
+                 on_command: Callable[[object, float], None] | None = None,
+                 on_evt: Callable[[EvtTrigger, float], None] | None = None,
+                 on_path: Callable[[str, float], None] | None = None) -> None:
         self.on_l0, self.status = on_l0, status
         self.on_command = on_command
+        self.on_evt = on_evt
+        self.on_path = on_path
         self._run = threading.Event()
         self._threads: list[threading.Thread] = []
         self._sockets: list[socket.socket] = []
@@ -115,12 +122,43 @@ class MFPListener:
 
     def _handle(self, text: str, transport: str = "?") -> None:
         received_at = time.monotonic()
+        stripped = text.strip()
+        if is_evt_line(stripped):
+            with self._raw_lock:
+                self._raw_packets.append({
+                    "time": received_at,
+                    "transport": transport.upper(),
+                    "raw": stripped,
+                    "axes": ["EVT"],
+                })
+            try:
+                trigger = parse_evt_line(stripped)
+            except ValueError:
+                return
+            if self.on_evt is not None:
+                self.on_evt(trigger, received_at)
+            return
+        if is_path_line(stripped):
+            with self._raw_lock:
+                self._raw_packets.append({
+                    "time": received_at,
+                    "transport": transport.upper(),
+                    "raw": stripped,
+                    "axes": ["PATH"],
+                })
+            try:
+                media_path = parse_path_line(stripped)
+            except ValueError:
+                return
+            if self.on_path is not None:
+                self.on_path(media_path, received_at)
+            return
         commands = parse_message(text)
         with self._raw_lock:
             self._raw_packets.append({
                 "time": received_at,
                 "transport": transport.upper(),
-                "raw": text.strip(),
+                "raw": stripped,
                 "axes": [command.axis for command in commands],
             })
         for command in commands:

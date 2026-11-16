@@ -1,8 +1,9 @@
-import asyncio,unittest
+import asyncio,sys,unittest
 from unittest.mock import patch
 from vector1a.civet import Civet,decode_pressure
 
 class CivetDependencyTests(unittest.TestCase):
+ @unittest.skipUnless(sys.platform.startswith('win'), 'WinRT bleak backend is Windows-only')
  def test_bundled_backend_imports_without_scanning(self):
   from bleak import BleakClient,BleakScanner
   from bleak.backends.winrt.client import BleakClientWinRT

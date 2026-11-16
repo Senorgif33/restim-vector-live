@@ -4,7 +4,7 @@ Stdlib-only YAML subset loader (no PyYAML). Matches offline Event Builder
 semantics for supported axes: volume, volume-prostate, pulse_frequency,
 pulse_width, frequency, alpha, beta, e1–e4, sensor_suppression. Extract
 composites bake hub–spoke motion at expand time via extract_composite
-(SCD ~dur or L0 beat-sync siblings).
+(SCD ~dur, or L0 beat-sync siblings).
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 import json
 import math
 from pathlib import Path
+import sys
 import threading
 from typing import Any, Sequence
 
@@ -58,7 +59,35 @@ DEFAULT_NORMALIZATION = {
     "sensor_suppression": {"max": 100.0},
 }
 
-_BUNDLED_DEFINITIONS = Path(__file__).with_name("event_definitions.yml")
+_DEFINITIONS_NAME = "event_definitions.yml"
+_ALLOWLIST_NAME = "director_event_allowlist.yml"
+_DEFAULT_DIRECTOR_EXCLUDE = ("tranquil", "test_slaps")
+_DEFAULT_DIRECTOR_MIN_SECONDS = 2.0
+_DEFAULT_DIRECTOR_MAX_SECONDS = 600.0
+
+
+def resolve_bundled_config(name: str, module_dir: Path, frozen: bool,
+                           executable: Path) -> Path:
+    """Return the YAML file Vector should read for *name*.
+
+    A frozen exe prefers *name* beside *executable* when that file exists, so
+    the release zip can ship an editable copy. Otherwise use the copy next to
+    this module: the source tree, or the copy packed inside the exe.
+    """
+    if frozen:
+        beside_exe = executable.with_name(name)
+        if beside_exe.is_file():
+            return beside_exe
+    return module_dir / name
+
+
+def bundled_config_path(name: str) -> Path:
+    return resolve_bundled_config(
+        name,
+        module_dir=Path(__file__).resolve().parent,
+        frozen=bool(getattr(sys, "frozen", False)),
+        executable=Path(sys.executable),
+    )
 
 
 class EventError(Exception):
@@ -418,7 +447,7 @@ class ScheduledTrigger:
 
 def load_definitions(path: Path | None = None
                      ) -> tuple[dict[str, Any], dict[str, dict[str, float]]]:
-    definitions_path = Path(path) if path else _BUNDLED_DEFINITIONS
+    definitions_path = Path(path) if path else bundled_config_path(_DEFINITIONS_NAME)
     data = load_yaml_file(definitions_path)
     if not isinstance(data, dict) or "definitions" not in data:
         raise EventError(
@@ -435,6 +464,101 @@ def load_definitions(path: Path | None = None
         if isinstance(value, dict):
             merged[key] = {**merged.get(key, {}), **value}
     return definitions, merged
+
+
+def _humanize_director_event_id(event_id: str) -> str:
+    return str(event_id).replace("_", " ").replace("-", " ")
+
+
+def load_director_event_policy(
+        definitions_path: Path | str | None = None,
+        allowlist_path: Path | str | None = None,
+) -> tuple[dict[str, tuple[str, str, float]], dict[str, dict[str, Any]], float, float]:
+    """Build the Director event catalogue from definitions minus an exclude list.
+
+    Returns ``(catalog, param_overrides, min_seconds, max_seconds)`` where
+    ``catalog`` maps event id → ``(label, description, default_duration_seconds)``.
+    """
+    definitions, _normalization = load_definitions(
+        Path(definitions_path) if definitions_path else None)
+    policy_path = (
+        Path(allowlist_path) if allowlist_path else bundled_config_path(_ALLOWLIST_NAME))
+    if policy_path.is_file():
+        raw = load_yaml_file(policy_path)
+        if raw is None:
+            data: dict[str, Any] = {}
+        elif not isinstance(raw, dict):
+            raise EventError(
+                "Director event allowlist must be a YAML mapping.")
+        else:
+            data = raw
+    else:
+        data = {
+            "exclude": list(_DEFAULT_DIRECTOR_EXCLUDE),
+            "duration_seconds": {
+                "minimum": _DEFAULT_DIRECTOR_MIN_SECONDS,
+                "maximum": _DEFAULT_DIRECTOR_MAX_SECONDS,
+            },
+        }
+
+    exclude_raw = data.get("exclude") or []
+    if not isinstance(exclude_raw, list):
+        raise EventError("Director allowlist 'exclude' must be a list.")
+    exclude = {str(name).strip() for name in exclude_raw if str(name).strip()}
+
+    duration = data.get("duration_seconds") or {}
+    if duration and not isinstance(duration, dict):
+        raise EventError("Director allowlist 'duration_seconds' must be a mapping.")
+    try:
+        min_seconds = float(duration.get("minimum", _DEFAULT_DIRECTOR_MIN_SECONDS))
+        max_seconds = float(duration.get("maximum", _DEFAULT_DIRECTOR_MAX_SECONDS))
+    except (TypeError, ValueError) as exc:
+        raise EventError(
+            f"Director allowlist duration bounds are invalid: {exc}") from exc
+    if not (0 < min_seconds <= max_seconds):
+        raise EventError(
+            "Director allowlist duration minimum must be > 0 and ≤ maximum.")
+
+    overrides_raw = data.get("param_overrides") or {}
+    if not isinstance(overrides_raw, dict):
+        raise EventError("Director allowlist 'param_overrides' must be a mapping.")
+    param_overrides: dict[str, dict[str, Any]] = {}
+    for event_id, params in overrides_raw.items():
+        if isinstance(params, dict):
+            param_overrides[str(event_id)] = dict(params)
+
+    meta_raw = data.get("events") or {}
+    if meta_raw and not isinstance(meta_raw, dict):
+        raise EventError("Director allowlist 'events' must be a mapping.")
+
+    catalog: dict[str, tuple[str, str, float]] = {}
+    for event_id, definition in definitions.items():
+        name = str(event_id)
+        if name in exclude or not isinstance(definition, dict):
+            continue
+        default_params = definition.get("default_params") or {}
+        if not isinstance(default_params, dict):
+            default_params = {}
+        try:
+            default_seconds = float(default_params.get("duration_ms", 10_000)) / 1000.0
+        except (TypeError, ValueError):
+            default_seconds = 10.0
+        default_seconds = min(max_seconds, max(min_seconds, default_seconds))
+
+        meta = meta_raw.get(name) if isinstance(meta_raw, dict) else None
+        if not isinstance(meta, dict):
+            meta = {}
+        label = str(meta.get("label") or _humanize_director_event_id(name))
+        description = str(meta.get("description") or "")
+        if "default_duration_seconds" in meta:
+            try:
+                default_seconds = float(meta["default_duration_seconds"])
+            except (TypeError, ValueError):
+                pass
+            default_seconds = min(max_seconds, max(min_seconds, default_seconds))
+        catalog[name] = (label, description, default_seconds)
+
+    return catalog, param_overrides, min_seconds, max_seconds
 
 
 def _append_resolved_step(
@@ -796,11 +920,91 @@ def evaluate_step(base: float, position_ms: int, step: ActiveStep,
     return base
 
 
+# ---------------------------------------------------------------------------
+# Event volume headroom
+# ---------------------------------------------------------------------------
+
+VOLUME_HEADROOM_AXES = frozenset({"volume", "volume-prostate"})
+VOLUME_HEADROOM_IGNORED_EVENTS = frozenset({"test_slaps"})
+VOLUME_HEADROOM_CAP = 0.5
+#: Fallback when the Director allowlist yields nothing to scan (``cum`` peak).
+VOLUME_HEADROOM_DIRECTOR_FALLBACK = 0.30
+
+
+def _param_float(params: dict[str, Any], key: str, default: float = 0.0) -> float:
+    try:
+        value = params.get(key, default)
+        return default if value is None else float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def peak_additive_volume_delta(
+        step: ActiveStep,
+        normalization: dict[str, dict[str, float]] | None = None) -> float:
+    """Largest upward additive volume contribution *step* can reach.
+
+    Overwrite steps replace the base rather than adding to it, so they need no
+    reserved room and score 0.
+    """
+    if step.axis not in VOLUME_HEADROOM_AXES:
+        return 0.0
+    params = step.params
+    if str(params.get("mode", "additive")) != "additive":
+        return 0.0
+    norm = normalization or DEFAULT_NORMALIZATION
+    if step.operation == "apply_linear_change":
+        start = normalize_value(
+            step.axis, _param_float(params, "start_value"), norm)
+        end = normalize_value(
+            step.axis,
+            _param_float(params, "end_value", _param_float(params, "start_value")),
+            norm)
+        return max(0.0, start, end)
+    if step.operation == "apply_modulation":
+        offset = normalize_value(
+            step.axis, _param_float(params, "max_level_offset"), norm)
+        amplitude = normalize_value(
+            step.axis, _param_float(params, "amplitude"), norm)
+        return max(0.0, offset + abs(amplitude))
+    return 0.0
+
+
+def compute_event_volume_headroom(
+        steps: Sequence[ActiveStep],
+        *,
+        normalization: dict[str, dict[str, float]] | None = None,
+        ignore_names: frozenset[str] | set[str] = VOLUME_HEADROOM_IGNORED_EVENTS,
+        cap: float = VOLUME_HEADROOM_CAP,
+) -> tuple[float, str | None]:
+    """Max per-event additive volume delta across *steps*, with the winner name.
+
+    Overlapping windows are not summed; the single largest event wins.
+    """
+    best = 0.0
+    winner: str | None = None
+    for step in steps:
+        if step.event_name in ignore_names:
+            continue
+        delta = peak_additive_volume_delta(step, normalization)
+        if delta > best:
+            best = delta
+            winner = step.event_name
+    return min(cap, best), winner
+
+
+def scale_volume_for_event_headroom(volume: float, headroom: float) -> float:
+    """Shrink *volume* so additive events have ``headroom`` left to climb into."""
+    reserved = min(VOLUME_HEADROOM_CAP, max(0.0, float(headroom)))
+    return min(1.0, max(0.0, float(volume) * (1.0 - reserved)))
+
+
 class EventEngine:
     """Load definitions + `.events.yml` and evaluate supported axes per sample."""
 
     def __init__(self, definitions_path: Path | str | None = None) -> None:
-        self.definitions_path = Path(definitions_path) if definitions_path else _BUNDLED_DEFINITIONS
+        self.definitions_path = (
+            Path(definitions_path) if definitions_path else bundled_config_path(_DEFINITIONS_NAME))
         self.definitions: dict[str, Any] = {}
         self.normalization: dict[str, dict[str, float]] = dict(DEFAULT_NORMALIZATION)
         self.loaded = LoadedEvents()
@@ -871,6 +1075,35 @@ class EventEngine:
     def pending_trigger_count(self) -> int:
         with self._trigger_lock:
             return len(self._triggers)
+
+    def file_volume_headroom(self) -> tuple[float, str | None]:
+        """Auto headroom for the currently loaded ``.events.yml``."""
+        return compute_event_volume_headroom(
+            self.loaded.steps, normalization=self.normalization)
+
+    def volume_headroom_for_names(
+            self, names: Sequence[str],
+            params_by_name: dict[str, dict[str, Any]] | None = None,
+    ) -> tuple[float, str | None]:
+        """Auto headroom over named definitions (Director allowlist, no file)."""
+        if not self.definitions:
+            try:
+                self.reload_definitions()
+            except EventError:
+                return 0.0, None
+        steps: list[ActiveStep] = []
+        for name in names:
+            if name in VOLUME_HEADROOM_IGNORED_EVENTS or name not in self.definitions:
+                continue
+            params = (params_by_name or {}).get(name)
+            try:
+                expanded, _ = expand_named_event(
+                    name, dict(params or {}), self.definitions)
+            except EventError:
+                continue
+            steps.extend(expanded)
+        return compute_event_volume_headroom(
+            steps, normalization=self.normalization)
 
     def schedule_trigger(self, name: str, params: dict[str, Any] | None,
                          activate_at: float) -> bool:
